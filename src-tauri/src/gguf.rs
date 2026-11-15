@@ -47,6 +47,9 @@ pub struct GgufModelInfo {
     pub architecture: Option<String>,
     /// The transformer block count (`block_count`) declared by the model.
     pub layer_count: Option<u32>,
+    /// The model declares a sliding-window attention size, which is how hybrid
+    /// architectures describe their local-attention layers.
+    pub sliding_window: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -61,6 +64,7 @@ struct Metadata {
     layer_count: Option<u32>,
     name: Option<String>,
     chat_template: Option<String>,
+    sliding_window: bool,
 }
 
 /// Read only the metadata header of a GGUF model.
@@ -97,6 +101,7 @@ pub fn inspect(path: &str) -> AppResult<GgufModelInfo> {
         path: expanded.to_string_lossy().to_string(),
         architecture: metadata.architecture,
         layer_count: metadata.layer_count,
+        sliding_window: metadata.sliding_window,
     })
 }
 
@@ -104,6 +109,15 @@ pub fn inspect(path: &str) -> AppResult<GgufModelInfo> {
 /// missing model must not stop the rest of the settings from being persisted.
 pub fn layer_count(path: &str) -> Option<u32> {
     inspect(path).ok().and_then(|info| info.layer_count)
+}
+
+/// True when the model declares a sliding-window attention size. Hybrid
+/// architectures (Gemma 3, Qwen3-Next and similar) store a non-zero
+/// `<architecture>.attention.sliding_window`; the llama.cpp Vulkan backend
+/// cannot schedule that KV cache in a GPU buffer, so the launch adapter keeps
+/// it on the host.
+pub fn has_sliding_window(path: &str) -> bool {
+    inspect(path).map(|info| info.sliding_window).unwrap_or(false)
 }
 
 /// Read the small pieces of GGUF metadata the model-library badges need. A
@@ -176,6 +190,22 @@ fn read_metadata<R: Read + Seek>(reader: &mut R) -> Result<Metadata, String> {
                 metadata.chat_template = read_metadata_string(reader, MAX_CHAT_TEMPLATE_BYTES)?;
             } else {
                 skip_value(reader, value_type, 0)?;
+            }
+            continue;
+        }
+
+        if key == "sliding_window" || key.ends_with(".attention.sliding_window") {
+            match value_type {
+                TYPE_BOOL => {
+                    if read_u8(reader)? != 0 {
+                        metadata.sliding_window = true;
+                    }
+                }
+                other => {
+                    if read_unsigned_value(reader, other)?.unwrap_or(0) > 0 {
+                        metadata.sliding_window = true;
+                    }
+                }
             }
             continue;
         }
@@ -420,6 +450,31 @@ mod tests {
         assert_eq!(metadata.layer_count, Some(28));
         let template = metadata.chat_template.expect("chat template");
         assert!(template.contains("enable_thinking"));
+    }
+
+    #[test]
+    fn detects_sliding_window_attention() {
+        let mut bytes = header(2);
+        push_key(&mut bytes, "qwen3.block_count");
+        bytes.extend(TYPE_UINT32.to_le_bytes());
+        bytes.extend(28u32.to_le_bytes());
+        push_key(&mut bytes, "qwen3.attention.sliding_window");
+        bytes.extend(TYPE_UINT32.to_le_bytes());
+        bytes.extend(512u32.to_le_bytes());
+
+        let metadata = read_metadata(&mut Cursor::new(bytes)).unwrap();
+        assert!(metadata.sliding_window);
+    }
+
+    #[test]
+    fn full_attention_models_do_not_declare_sliding_window() {
+        let mut bytes = header(1);
+        push_key(&mut bytes, "llama.block_count");
+        bytes.extend(TYPE_UINT32.to_le_bytes());
+        bytes.extend(32u32.to_le_bytes());
+
+        let metadata = read_metadata(&mut Cursor::new(bytes)).unwrap();
+        assert!(!metadata.sliding_window);
     }
 
     #[test]

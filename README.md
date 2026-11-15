@@ -65,6 +65,18 @@ pub trait EngineRunner: Send + Sync {
 
 Before launch, the backend asynchronously runs `{binary} --version` and `{binary} --help`. `parse_build`, `first_version_line` and the `advertises` helpers select a flag layout from what the binary actually reports. If a build advertises an unknown layout, the app still launches with the safest common flags and emits `engine://adapter-warning`; the panel shows the warning instead of failing silently. Examples of adapted flags include `--flash-attn [on|off|auto]`, `--cache-type-k/v`, `--ctx-size` versus `--ctx`, and Janas's optional SSD streaming flags.
 
+#### Vulkan KV-cache guard
+
+llama.cpp's Vulkan backend cannot schedule the KV cache of a sliding-window (hybrid) model while that cache lives in a GPU buffer. Builds after b12236 abort inside the scheduler before the server binds its port:
+
+```text
+ggml-backend.cpp:1358: pre-allocated tensor (cache_k_l1 (view)) in a buffer (Vulkan0) that cannot run the operation (SET_ROWS)
+```
+
+The process dies with `SIGABRT`, which the app only sees as an immediate exit. Upstream issue #29082 tracks the regression. The probe therefore also runs `--list-devices` (skipped when the build does not advertise it), and the launch adapter falls back to CPU execution (`--device none`) when all of these hold: the build advertises `-nkvo`, a Vulkan device is available, GPU layers are requested, the build is newer than b12236, and the selected GGUF declares `<architecture>.attention.sliding_window`.
+
+`-nkvo` is not a free substitute here: it leaves attention on the CPU while the weights stay on the GPU. Measured on a Radeon 660M iGPU with a 4 B Q5_K_M sliding-window model, that split produced 6.7 tok/s against 14.2 tok/s for a full CPU launch and 17.1 tok/s for b12236 with GPU KV offload, so a CPU launch is the safer automatic default. The substitution emits an `engine://adapter-warning` that names the issue and both overrides: `-nkvo` in **Extra llama arguments** keeps the weights on the GPU with a host KV cache (better when the model is larger than RAM), and `-kvo` forces GPU KV offload back on. Any explicit `--device`, `-nkvo` or `-kvo` in the extra arguments disables the fallback. Full-attention models, CPU-only launches, CUDA/ROCm/Metal hosts and b12236 and older are untouched.
+
 ### Updates, backup and rollback
 
 `download_and_extract_binary(engine_type, download_url)` accepts only `https://` URLs (HTTP is allowed for loopback test servers), streams progress on `engine://binary-progress`, and rejects archives that contain absolute paths, parent traversal, symlinks, too many entries or more than 8 GiB extracted. It stages the download under `bin/.staging`, installs companion libraries, sets `0o755`, renames the current binary to `[binary_name].bak`, and runs the new binary's probe. Release archives express SONAME aliases such as `libllama.so.0` as symlinks; safe extraction skips those links, so the installer materializes the aliases as regular library files before probing. A failed probe restores both the `.bak` binary and its library snapshot automatically. `rollback_binary(engine_type)` performs the same verified swap in reverse; the UI exposes both actions in Settings.
@@ -301,7 +313,8 @@ New UI pieces: `chat/SessionsRail`, `chat/EnginePanel`, `chat/TelemetryPanel`,
 ## Verification performed
 
 - `tsc --noEmit && vite build` — production frontend bundle built successfully with the new workspace, hooks and views.
-- `cargo test` — 65 parser, streaming, tool-call, memory, search, lifecycle, path-safety, quantization, release-asset selection, library-SONAME alias, Janas install/restore, mock-runtime harness, failed-update rollback, sampling-capability discovery, context-error parsing, prompt-retry trimming, oversized-MCP-tool schema, Janas attention/KV environment and llama Direct CPU MoE tests pass. A network-marked live search smoke test is ignored unless explicitly requested.
+- `cargo test` — 69 parser, streaming, tool-call, memory, search, lifecycle, path-safety, quantization, release-asset selection, library-SONAME alias, Janas install/restore, mock-runtime harness, failed-update rollback, sampling-capability discovery, context-error parsing, prompt-retry trimming, oversized-MCP-tool schema, Janas attention/KV environment, GGUF sliding-window detection, llama Vulkan KV-cache guard and llama Direct CPU MoE tests pass.
+- The latest llama.cpp build (b12387) was reproduced aborting on the configured 4 B sliding-window GGUF with `pre-allocated tensor (cache_k_l1 (view)) in a buffer (Vulkan0) that cannot run the operation (SET_ROWS)`; b12236 with its own libraries serves the same model. `--device none` and `-nkvo` both load and answer `/v1/chat/completions`, while `--fit off`, `--no-kv-unified`, `--swa-full` and `--flash-attn off`/`on` still abort. A network-marked live search smoke test is ignored unless explicitly requested.
 - `npm run appimage` — release build and AppImage bundling completed (90,118,648 bytes / 85.94 MiB; SHA-256 `cfbc4ed2bd7a52ae017ca6c8ac1f24251b1d6cfca4005b440124a52e485fc67f`; build ID `7a307e6c008749df8d44f088bbafd66b368e749c`).
 - A live `janas-server` launched with `--ctx 16384` rejected a 30,011-token conversation with HTTP 400 `context_length_exceeded`, and the retry parser read the reported 16,384-token limit. The trimmer test keeps the rebuilt prompt under 7,680 estimated tokens while preserving the system instruction and current user turn.
 - A 229-tool MCP server was measured locally: its retained definitions were large enough to turn a fresh 16k-token chat into a 74k-token request on both engines. The proxy now omits MCP tool schemas when they do not fit the active window; the synthetic oversized-tool test covers that threshold.

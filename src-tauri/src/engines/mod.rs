@@ -874,10 +874,25 @@ pub async fn run_cli_probe(binary: &Path, lib_dir: Option<&Path>) -> AppResult<P
         .or_else(|| first_version_line(&help_text))
         .map(|line| truncate_line(&line, 180));
 
+    // `--list-devices` is the only reliable way to see which backend the build
+    // will really use: a universal archive can ship CUDA, ROCm and Vulkan
+    // plugins while only one of them has a usable device. It exits in tens of
+    // milliseconds without loading a model, and builds that do not advertise
+    // the flag are skipped.
+    let devices = if advertises(&help_text, "--list-devices") {
+        match run_flag(binary, "--list-devices", lib_dir).await {
+            Ok((text, _)) => text,
+            Err(_) => String::new(),
+        }
+    } else {
+        String::new()
+    };
+
     Ok(ProbeOutput {
         version_line,
         build,
         help_text,
+        devices,
     })
 }
 
@@ -886,6 +901,8 @@ pub struct ProbeOutput {
     pub version_line: Option<String>,
     pub build: Option<u64>,
     pub help_text: String,
+    /// Output of `--list-devices`; empty when the build does not support it.
+    pub devices: String,
 }
 
 async fn run_flag(
@@ -1021,6 +1038,13 @@ fn first_version_line(text: &str) -> Option<String> {
 /// True when `help` advertises an exact flag token. Substring checks are too
 /// loose: `-c` appears inside `--cache-type-k` and would otherwise select the
 /// wrong context flag.
+/// True when a probe's `--list-devices` output names a Vulkan device.
+pub(crate) fn reports_vulkan(devices: &str) -> bool {
+    devices
+        .lines()
+        .any(|line| line.to_ascii_lowercase().contains("vulkan"))
+}
+
 pub(crate) fn advertises(help: &str, flag: &str) -> bool {
     help.split(|character: char| {
         character.is_whitespace()
