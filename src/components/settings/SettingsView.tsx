@@ -17,6 +17,7 @@ import {
 
 import type { EngineController } from "../../hooks/useEngine";
 import { useSettings } from "../../hooks/useSettings";
+import { useTheme } from "../../hooks/useTheme";
 import { api, Events } from "../../lib/api";
 import { cn } from "../../lib/cn";
 import { errorMessage, formatBytes } from "../../lib/format";
@@ -32,6 +33,7 @@ import type {
 import { Button } from "../ui/Button";
 import { GpuOffloadControl } from "../ui/GpuOffloadControl";
 import { SetupPanel } from "./SetupPanel";
+import { ThemePicker } from "./ThemePicker";
 import { StatusPill } from "../ui/StatusPill";
 
 interface SettingsViewProps {
@@ -51,6 +53,7 @@ const LLAMA_KV_OPTIONS = [
 
 export function SettingsView({ engine }: SettingsViewProps) {
   const { settings, loading, save } = useSettings();
+  const { theme, setTheme } = useTheme();
   const [form, setForm] = useState<AppSettings | null>(null);
   const [models, setModels] = useState<LocalModel[]>([]);
   const [probe, setProbe] = useState<BinaryProbe | null>(null);
@@ -330,6 +333,13 @@ export function SettingsView({ engine }: SettingsViewProps) {
             </Button>
           </div>
         ) : null}
+
+        <Section
+          title="Appearance"
+          description="Skins the whole studio immediately and is remembered on this machine."
+        >
+          <ThemePicker theme={theme} onChange={setTheme} />
+        </Section>
 
         <SetupPanel />
 

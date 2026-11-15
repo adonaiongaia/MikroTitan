@@ -4,23 +4,25 @@ export default {
   theme: {
     extend: {
       colors: {
+        // Both scales resolve to the palette in src/index.css, so switching
+        // the data-theme attribute re-skins every Tailwind utility at once.
         ink: {
-          950: "#07080a",
-          900: "#0b0d11",
-          850: "#0f1218",
-          800: "#141821",
-          750: "#181d28",
-          700: "#1d2431",
-          600: "#2a3342",
-          500: "#3a4558",
+          950: "rgb(var(--ink-950) / <alpha-value>)",
+          900: "rgb(var(--ink-900) / <alpha-value>)",
+          850: "rgb(var(--ink-850) / <alpha-value>)",
+          800: "rgb(var(--ink-800) / <alpha-value>)",
+          750: "rgb(var(--ink-750) / <alpha-value>)",
+          700: "rgb(var(--ink-700) / <alpha-value>)",
+          600: "rgb(var(--ink-600) / <alpha-value>)",
+          500: "rgb(var(--ink-500) / <alpha-value>)",
         },
         acid: {
-          200: "#efffc2",
-          300: "#e2ff8f",
-          400: "#cdf75a",
-          500: "#b3e63c",
-          600: "#8fbf22",
-          700: "#6d9418",
+          200: "rgb(var(--accent-200) / <alpha-value>)",
+          300: "rgb(var(--accent-300) / <alpha-value>)",
+          400: "rgb(var(--accent-400) / <alpha-value>)",
+          500: "rgb(var(--accent-500) / <alpha-value>)",
+          600: "rgb(var(--accent-600) / <alpha-value>)",
+          700: "rgb(var(--accent-700) / <alpha-value>)",
         },
       },
       fontFamily: {
@@ -47,7 +49,7 @@ export default {
       },
       boxShadow: {
         panel: "0 18px 50px -24px rgba(0, 0, 0, 0.85)",
-        glow: "0 0 30px -8px rgba(205, 247, 90, 0.35)",
+        glow: "0 0 30px -8px rgb(var(--accent-400) / 0.35)",
       },
       keyframes: {
         "pulse-soft": {

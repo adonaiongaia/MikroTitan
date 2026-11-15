@@ -3,8 +3,64 @@
 @tailwind utilities;
 
 @layer base {
+  /* Palettes are plain RGB channels so Tailwind's opacity modifiers keep
+     working (bg-acid-400/10) while the theme swaps the channels underneath. */
   :root {
     color-scheme: dark;
+
+    --ink-950: 7 8 10;
+    --ink-900: 11 13 17;
+    --ink-850: 15 18 24;
+    --ink-800: 20 24 33;
+    --ink-750: 24 29 40;
+    --ink-700: 29 36 49;
+    --ink-600: 42 51 66;
+    --ink-500: 58 69 88;
+
+    --accent-200: 239 255 194;
+    --accent-300: 226 255 143;
+    --accent-400: 205 247 90;
+    --accent-500: 179 230 60;
+    --accent-600: 143 191 34;
+    --accent-700: 109 148 24;
+  }
+
+  /* Ember: copper on warm soot. */
+  html[data-theme="ember"] {
+    --ink-950: 11 8 6;
+    --ink-900: 18 16 13;
+    --ink-850: 23 19 15;
+    --ink-800: 29 24 19;
+    --ink-750: 36 29 23;
+    --ink-700: 45 36 28;
+    --ink-600: 59 46 35;
+    --ink-500: 77 59 45;
+
+    --accent-200: 255 226 209;
+    --accent-300: 255 192 154;
+    --accent-400: 255 122 51;
+    --accent-500: 242 95 22;
+    --accent-600: 200 73 14;
+    --accent-700: 152 55 11;
+  }
+
+  /* Tide: cyan on deep water. */
+  html[data-theme="tide"] {
+    --ink-950: 5 9 14;
+    --ink-900: 10 17 25;
+    --ink-850: 13 22 32;
+    --ink-800: 17 29 41;
+    --ink-750: 21 36 51;
+    --ink-700: 26 46 63;
+    --ink-600: 35 64 85;
+    --ink-500: 46 85 104;
+
+    --accent-200: 215 251 255;
+    --accent-300: 157 241 251;
+    --accent-400: 79 214 232;
+    --accent-500: 34 184 208;
+    --accent-600: 21 148 172;
+    --accent-700: 18 116 137;
   }
 
   html,
@@ -23,7 +79,7 @@
 
   * {
     scrollbar-width: thin;
-    scrollbar-color: #2a3342 transparent;
+    scrollbar-color: rgb(var(--ink-600)) transparent;
   }
 
   *::-webkit-scrollbar {
@@ -36,12 +92,12 @@
   }
 
   *::-webkit-scrollbar-thumb {
-    background-color: #2a3342;
+    background-color: rgb(var(--ink-600));
     border-radius: 9999px;
   }
 
   *::-webkit-scrollbar-thumb:hover {
-    background-color: #3a4558;
+    background-color: rgb(var(--ink-500));
   }
 
   @keyframes progress-slide {
@@ -91,9 +147,9 @@
     height: 16px;
     width: 16px;
     border-radius: 9999px;
-    background: #cdf75a;
-    border: 3px solid #0b0d11;
-    box-shadow: 0 0 0 1px rgba(205, 247, 90, 0.6);
+    background: rgb(var(--accent-400));
+    border: 3px solid rgb(var(--ink-900));
+    box-shadow: 0 0 0 1px rgb(var(--accent-400) / 0.6);
     transition: transform 140ms ease;
   }
 
@@ -105,9 +161,9 @@
     height: 16px;
     width: 16px;
     border-radius: 9999px;
-    background: #cdf75a;
-    border: 3px solid #0b0d11;
-    box-shadow: 0 0 0 1px rgba(205, 247, 90, 0.6);
+    background: rgb(var(--accent-400));
+    border: 3px solid rgb(var(--ink-900));
+    box-shadow: 0 0 0 1px rgb(var(--accent-400) / 0.6);
   }
 
   .progress-indeterminate {
@@ -151,7 +207,7 @@
   }
 
   .md li::marker {
-    color: #8fbf22;
+    color: rgb(var(--accent-600));
   }
 
   .md a {

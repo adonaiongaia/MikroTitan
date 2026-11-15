@@ -338,7 +338,7 @@ function HeatmapCard({
             style={{
               backgroundColor: cell.fromDisk
                 ? `rgba(56, 189, 248, ${0.12 + cell.activity * 0.8})`
-                : `rgba(205, 247, 90, ${0.12 + cell.activity * 0.8})`,
+                : `rgb(var(--accent-400) / ${0.12 + cell.activity * 0.8})`,
             }}
           />
         ))}
@@ -390,10 +390,15 @@ function Sparkline({ values, max }: { values: number[]; max: number }) {
       className="mt-1 h-8 w-full"
       aria-hidden="true"
     >
-      <path d={path} fill="none" stroke="#cdf75a" strokeWidth="1.4" />
+      <path
+        d={path}
+        fill="none"
+        style={{ stroke: "rgb(var(--accent-400))" }}
+        strokeWidth="1.4"
+      />
       <path
         d={`${path} L${width},${height} L0,${height} Z`}
-        fill="rgba(205,247,90,0.08)"
+        style={{ fill: "rgb(var(--accent-400) / 0.08)" }}
         stroke="none"
       />
     </svg>

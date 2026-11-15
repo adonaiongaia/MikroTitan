@@ -118,7 +118,7 @@ export function Composer({
       ? "#fb7185"
       : contextPercent > 0.7
         ? "#fbbf24"
-        : "#cdf75a";
+        : "rgb(var(--accent-400))";
 
   return (
     <div className="shrink-0 border-t border-white/5 bg-ink-950/80 px-6 py-3.5">
@@ -402,7 +402,7 @@ function ContextRing({
           cy="12"
           r={radius}
           fill="none"
-          stroke={color}
+          style={{ stroke: color }}
           strokeWidth="3"
           strokeLinecap="round"
           strokeDasharray={circumference}

@@ -16,12 +16,23 @@ export function Logo({ className = "h-9 w-9", withTile = true }: LogoProps) {
     >
       <defs>
         <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor="#e2ff8f" />
-          <stop offset="100%" stopColor="#8fbf22" />
+          <stop
+            offset="0%"
+            style={{ stopColor: "rgb(var(--accent-300))" }}
+          />
+          <stop
+            offset="100%"
+            style={{ stopColor: "rgb(var(--accent-600))" }}
+          />
         </linearGradient>
       </defs>
       {withTile ? (
-        <rect width="64" height="64" rx="16" fill="#0f1218" />
+        <rect
+          width="64"
+          height="64"
+          rx="16"
+          style={{ fill: "rgb(var(--ink-850))" }}
+        />
       ) : null}
       <rect
         x="18"
