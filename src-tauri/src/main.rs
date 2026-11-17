@@ -370,6 +370,8 @@ fn main() {
             agent::agent_resolve_approval,
             agent::agent_abort,
             agent::agent_undo,
+            agent::agent_undo_file,
+            agent::agent_run_changes,
             agent::agent_undo_availability,
         ])
         .build(tauri::generate_context!())

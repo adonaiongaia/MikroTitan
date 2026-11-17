@@ -107,9 +107,23 @@ struct RunMetadata {
     /// existed; those fall back to comparing against the final snapshot.
     #[serde(default)]
     attribution: Option<Vec<AttributedPath>>,
+    /// Paths that have already been restored by a selective undo. The
+    /// attribution list stays intact so the run's change summary remains
+    /// available after a partial restore.
+    #[serde(default)]
+    restored_paths: Vec<PathBuf>,
     /// Filled when a metadata file is read; never serialized.
     #[serde(skip, default)]
     path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunFileChange {
+    /// Workspace-relative path, using forward slashes for display.
+    pub path: String,
+    /// `created`, `modified` or `deleted`.
+    pub kind: String,
+    pub restored: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -215,6 +229,7 @@ impl CheckpointStore {
             changed_files: 0,
             status: MetadataStatus::Running,
             attribution: None,
+            restored_paths: Vec::new(),
             path: PathBuf::new(),
         };
 
@@ -255,15 +270,21 @@ impl CheckpointStore {
             .lock
             .lock()
             .map_err(|_| "The checkpoint store is locked.".to_string())?;
-        let metadata = self
+        let mut metadata = self
             .find_complete_locked(run_id)?
             .ok_or_else(|| {
                 "No undo checkpoint is available for that run. It may have been removed by cleanup."
                     .to_string()
             })?;
-        let outcome = self.undo_metadata_locked(&metadata)?;
-        self.delete_entry_locked(&metadata);
-        let _ = self.cleanup_locked(None);
+        let outcome = self.undo_metadata_locked(&mut metadata)?;
+        if outcome.skipped.is_empty() && !outcome.incomplete {
+            self.delete_entry_locked(&metadata);
+            let _ = self.cleanup_locked(None);
+        } else {
+            // Keep the un-restored files available for a retry after the user
+            // resolves the external edit or permission problem.
+            self.write_metadata_at(&metadata.path, &metadata)?;
+        }
         Ok(outcome)
     }
 
@@ -280,7 +301,7 @@ impl CheckpointStore {
             .iter()
             .filter(|metadata| {
                 metadata.status == MetadataStatus::Complete
-                    && metadata.changed_files > 0
+                    && metadata.changed_files > metadata.restored_paths.len() as u32
                     && metadata.post.is_some()
                     && metadata.workspace.is_dir()
                     && wanted.contains(metadata.run_id.as_str())
@@ -302,8 +323,39 @@ impl CheckpointStore {
         self.find_complete_locked(run_id)
             .ok()
             .flatten()
+            .map(|metadata| {
+                metadata.changed_files > metadata.restored_paths.len() as u32
+            })
+            .unwrap_or(false)
+    }
+
+    /// True when a completed checkpoint exists with attributed changes, even
+    /// if every file has already been restored. This keeps the in-memory
+    /// journal from making a fully restored run look undoable again, while a
+    /// checkpoint with no attributed changes still lets the journal fallback
+    /// cover built-in file edits.
+    pub fn has_record(&self, run_id: &str) -> bool {
+        let Ok(_guard) = self.lock.lock() else {
+            return false;
+        };
+        self.find_complete_locked(run_id)
+            .ok()
+            .flatten()
             .map(|metadata| metadata.changed_files > 0)
             .unwrap_or(false)
+    }
+
+    /// Every path the run changed, including paths already restored by a
+    /// selective undo. Restore protection lives in `undo_paths`.
+    pub fn changes(&self, run_id: &str) -> Result<Vec<RunFileChange>, String> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| "The checkpoint store is locked.".to_string())?;
+        let metadata = self
+            .find_complete_locked(run_id)?
+            .ok_or_else(|| "No change summary is available for that run.".to_string())?;
+        self.changes_locked(&metadata)
     }
 
     /// Workspace a completed checkpoint belongs to, used to keep an undo from
@@ -316,7 +368,7 @@ impl CheckpointStore {
             .map(|metadata| metadata.workspace)
     }
 
-    fn undo_metadata_locked(&self, metadata: &RunMetadata) -> Result<UndoOutcome, String> {
+    fn undo_metadata_locked(&self, metadata: &mut RunMetadata) -> Result<UndoOutcome, String> {
         let post = metadata
             .post
             .as_deref()
@@ -336,8 +388,12 @@ impl CheckpointStore {
                 .map(|path| (path.path.clone(), path.clone()))
                 .collect()
         });
+        let completed: HashSet<PathBuf> = metadata.restored_paths.iter().cloned().collect();
         let mut outcome = UndoOutcome::default();
         for entry in entries {
+            if completed.contains(&entry.path) {
+                continue;
+            }
             // With attribution, anything the run did not touch is left alone: it
             // was changed by something else while the run was active.
             let expected = match &attributed {
@@ -348,20 +404,144 @@ impl CheckpointStore {
                 None => None,
             };
             match self.restore_entry(&workspace, &entry, expected) {
-                Ok(RestoreKind::Restored) => outcome.restored += 1,
-                Ok(RestoreKind::Deleted) => outcome.deleted += 1,
+                Ok(RestoreKind::Restored) => {
+                    outcome.restored += 1;
+                    metadata.restored_paths.push(entry.path.clone());
+                }
+                Ok(RestoreKind::Deleted) => {
+                    outcome.deleted += 1;
+                    metadata.restored_paths.push(entry.path.clone());
+                }
                 Ok(RestoreKind::Skipped(reason)) => {
-                    outcome.skipped.push(format!("{}: {reason}", entry.path.display()));
+                    outcome
+                        .skipped
+                        .push(format!("{}: {reason}", relative_label(&entry.path)));
                 }
                 Err(error) => {
                     outcome.incomplete = true;
                     outcome
                         .skipped
-                        .push(format!("{}: {error}", entry.path.display()));
+                        .push(format!("{}: {error}", relative_label(&entry.path)));
                 }
             }
         }
         Ok(outcome)
+    }
+
+    /// Restore only the requested paths, leaving the checkpoint available for
+    /// the remaining files. Paths already restored are ignored.
+    pub fn undo_paths(
+        &self,
+        run_id: &str,
+        paths: &[PathBuf],
+    ) -> Result<UndoOutcome, String> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| "The checkpoint store is locked.".to_string())?;
+        let mut metadata = self
+            .find_complete_locked(run_id)?
+            .ok_or_else(|| {
+                "No undo checkpoint is available for that run. It may have been removed by cleanup."
+                    .to_string()
+            })?;
+        let requested: HashSet<PathBuf> = paths.iter().cloned().collect();
+        let outcome = self.undo_selected_locked(&mut metadata, &requested)?;
+        if outcome.restored > 0 || outcome.deleted > 0 {
+            self.write_metadata_at(&metadata.path, &metadata)?;
+        }
+        Ok(outcome)
+    }
+
+    fn undo_selected_locked(
+        &self,
+        metadata: &mut RunMetadata,
+        requested: &HashSet<PathBuf>,
+    ) -> Result<UndoOutcome, String> {
+        let Some(post) = metadata.post.as_deref() else {
+            return Err("This checkpoint has no post-run snapshot.".into());
+        };
+        let workspace = fs::canonicalize(&metadata.workspace)
+            .map_err(|error| format!("The checkpoint workspace is unavailable: {error}"))?;
+        if !workspace.is_dir() {
+            return Err(format!(
+                "The checkpoint workspace is not a directory: {}",
+                workspace.display()
+            ));
+        }
+        let entries = self.diff_locked(&metadata.pre, post)?;
+        let attributed: Option<HashMap<PathBuf, AttributedPath>> = metadata.attribution.as_ref().map(|paths| {
+            paths
+                .iter()
+                .map(|path| (path.path.clone(), path.clone()))
+                .collect()
+        });
+        let restored: HashSet<PathBuf> = metadata.restored_paths.iter().cloned().collect();
+        let mut outcome = UndoOutcome::default();
+        for entry in entries {
+            if !requested.contains(&entry.path) {
+                continue;
+            }
+            let expected = match &attributed {
+                Some(paths) => match paths.get(&entry.path) {
+                    Some(path) => Some(path),
+                    None => continue,
+                },
+                None => None,
+            };
+            if restored.contains(&entry.path) {
+                continue;
+            }
+            match self.restore_entry(&workspace, &entry, expected) {
+                Ok(RestoreKind::Restored) => {
+                    outcome.restored += 1;
+                    metadata.restored_paths.push(entry.path.clone());
+                }
+                Ok(RestoreKind::Deleted) => {
+                    outcome.deleted += 1;
+                    metadata.restored_paths.push(entry.path.clone());
+                }
+                Ok(RestoreKind::Skipped(reason)) => {
+                    outcome
+                        .skipped
+                        .push(format!("{}: {reason}", relative_label(&entry.path)));
+                }
+                Err(error) => {
+                    outcome.incomplete = true;
+                    outcome
+                        .skipped
+                        .push(format!("{}: {error}", relative_label(&entry.path)));
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
+    fn changes_locked(&self, metadata: &RunMetadata) -> Result<Vec<RunFileChange>, String> {
+        let Some(post) = metadata.post.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let entries = self.diff_locked(&metadata.pre, post)?;
+        let attributed: Option<HashSet<PathBuf>> = metadata.attribution.as_ref().map(|paths| {
+            paths.iter().map(|path| path.path.clone()).collect()
+        });
+        let restored: HashSet<PathBuf> = metadata.restored_paths.iter().cloned().collect();
+        let mut changes: Vec<RunFileChange> = entries
+            .into_iter()
+            .filter(|entry| {
+                attributed
+                    .as_ref()
+                    .map(|paths| paths.contains(&entry.path))
+                    .unwrap_or(true)
+            })
+            .map(|entry| RunFileChange {
+                path: relative_label(&entry.path),
+                kind: change_kind(&entry).to_string(),
+                restored: restored.contains(&entry.path),
+            })
+            .collect();
+        changes.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(changes)
     }
 
     fn restore_entry(
@@ -376,6 +556,9 @@ impl CheckpointStore {
         let path = workspace.join(&entry.path);
         if !path.starts_with(workspace) {
             return Err("The path escaped the workspace.".into());
+        }
+        if !parent_inside_workspace(workspace, &path) {
+            return Err("The path's parent directory escaped the workspace.".into());
         }
 
         // Compare with the version the agent left behind, not with the final
@@ -987,7 +1170,7 @@ impl RunCheckpoint {
     /// Mark the run complete and return the number of paths changed during it.
     /// The pre snapshot remains available if this fails, but it is not offered
     /// as an undo target because the workspace could have changed afterwards.
-    pub fn finish(self) -> Result<u32, String> {
+    pub fn finish(self) -> Result<Vec<RunFileChange>, String> {
         let store = self.store;
         let _guard = store
             .lock
@@ -1011,6 +1194,18 @@ impl RunCheckpoint {
                 .filter_map(|entry| tracked.get(entry.path.as_path()).map(|path| (*path).clone()))
                 .collect();
             let changed_files = kept.len() as u32;
+            let kept_paths: HashSet<PathBuf> =
+                kept.iter().map(|path| path.path.clone()).collect();
+            let mut changes: Vec<RunFileChange> = entries
+                .iter()
+                .filter(|entry| kept_paths.contains(&entry.path))
+                .map(|entry| RunFileChange {
+                    path: relative_label(&entry.path),
+                    kind: change_kind(entry).to_string(),
+                    restored: false,
+                })
+                .collect();
+            changes.sort_by(|left, right| left.path.cmp(&right.path));
             store.set_ref(&self.checkpoint_id, "post", &post)?;
 
             let mut metadata = store.read_metadata_path(&self.metadata_path)?;
@@ -1019,13 +1214,13 @@ impl RunCheckpoint {
             metadata.attribution = Some(kept);
             metadata.status = MetadataStatus::Complete;
             store.write_metadata_at(&self.metadata_path, &metadata)?;
-            Ok(changed_files)
+            Ok(changes)
         })();
 
         match result {
-            Ok(changed_files) => {
+            Ok(changes) => {
                 let _ = store.cleanup_locked(Some(&self.checkpoint_id));
-                Ok(changed_files)
+                Ok(changes)
             }
             Err(error) => {
                 if let Ok(mut metadata) = store.read_metadata_path(&self.metadata_path) {
@@ -1154,6 +1349,20 @@ fn oldest_removable(metadata: &[RunMetadata], keep: Option<&str>) -> Option<usiz
         .map(|(index, _)| index)
 }
 
+fn relative_label(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn change_kind(entry: &DiffEntry) -> &'static str {
+    if entry.old_mode == 0 {
+        "created"
+    } else if entry.new_mode == 0 {
+        "deleted"
+    } else {
+        "modified"
+    }
+}
+
 fn workspace_usage(root: &Path, exclude: Option<&Path>) -> Result<(u64, usize), String> {
     fn heavy(name: &str) -> bool {
         matches!(
@@ -1226,6 +1435,31 @@ fn safe_relative(path: &Path) -> bool {
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
+/// Resolve the nearest existing parent. A symlinked directory must not turn a
+/// restore into a write outside the workspace, while a genuinely missing
+/// parent is allowed (restore_regular creates it).
+fn parent_inside_workspace(workspace: &Path, path: &Path) -> bool {
+    let Some(mut ancestor) = path.parent() else {
+        return false;
+    };
+    loop {
+        match fs::symlink_metadata(ancestor) {
+            Ok(_) => {
+                return fs::canonicalize(ancestor)
+                    .map(|resolved| resolved.starts_with(workspace))
+                    .unwrap_or(false);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ancestor = match ancestor.parent() {
+                    Some(parent) => parent,
+                    None => return false,
+                };
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
 fn parse_mode(value: &str) -> Result<u32, String> {
     u32::from_str_radix(value, 8)
         .map_err(|error| format!("Git returned an invalid file mode: {error}"))
@@ -1260,6 +1494,15 @@ fn restore_regular(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
         fs::set_permissions(&temp, permissions)
             .map_err(|error| format!("could not set restored file permissions: {error}"))?;
     }
+    // On Unix, rename atomically replaces the verified regular file. Avoid a
+    // remove-then-rename window that could lose the only copy on failure.
+    #[cfg(unix)]
+    if path.exists() || fs::symlink_metadata(path).is_ok() {
+        return fs::rename(&temp, path).map_err(|error| {
+            let _ = fs::remove_file(&temp);
+            format!("could not restore the file: {error}")
+        });
+    }
     if path.exists() || fs::symlink_metadata(path).is_ok() {
         remove_current(path)?;
     }
@@ -1277,11 +1520,13 @@ fn restore_symlink(path: &Path, target: &[u8]) -> Result<(), String> {
         .ok_or_else(|| "could not resolve the parent directory".to_string())?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("could not create the parent directory: {error}"))?;
-    if path.exists() || fs::symlink_metadata(path).is_ok() {
-        remove_current(path)?;
-    }
-    std::os::unix::fs::symlink(OsString::from_vec(target.to_vec()), path)
-        .map_err(|error| format!("could not restore the symlink: {error}"))
+    let temp = parent.join(format!(".janas-undo-{}.tmp", Uuid::new_v4().simple()));
+    std::os::unix::fs::symlink(OsString::from_vec(target.to_vec()), &temp)
+        .map_err(|error| format!("could not create the restored symlink: {error}"))?;
+    fs::rename(&temp, path).map_err(|error| {
+        let _ = fs::remove_file(&temp);
+        format!("could not restore the symlink: {error}")
+    })
 }
 
 #[cfg(not(unix))]
@@ -1342,6 +1587,26 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn restore_parent_must_stay_inside_the_workspace() {
+        let root = temp_root("parent-guard");
+        let workspace = fs::canonicalize(root.join("ws")).expect("workspace");
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).expect("outside");
+        std::os::unix::fs::symlink(&outside, workspace.join("link")).expect("symlink");
+
+        assert!(!parent_inside_workspace(
+            &workspace,
+            &workspace.join("link/file.txt")
+        ));
+        assert!(parent_inside_workspace(
+            &workspace,
+            &workspace.join("new/file.txt")
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn checkpoint_undo_survives_a_new_store_and_skips_later_edits() {
         if !git_available() {
             eprintln!("Git is unavailable; skipping the checkpoint integration test.");
@@ -1372,12 +1637,13 @@ mod tests {
         }
         recorder.commit_step().expect("step");
         assert_eq!(
-            checkpoint.finish().expect("finish"),
+            checkpoint.finish().expect("finish").len(),
             if cfg!(unix) { 4 } else { 3 }
         );
 
         // A different store instance is what a restarted process sees.
         let reopened = Arc::new(CheckpointStore::new(root.join("checkpoints")));
+        assert!(reopened.has_record("run-1"));
         assert!(reopened.has_complete("run-1"));
         assert_eq!(
             reopened.available(&["run-1".to_string(), "missing".to_string()]),
@@ -1406,6 +1672,17 @@ mod tests {
         #[cfg(unix)]
         assert!(!workspace.join("shell.txt").exists());
         assert!(outcome.skipped.iter().any(|line| line.contains("keep.txt")));
+        assert!(
+            reopened.has_complete("run-1"),
+            "the externally edited file must remain undoable"
+        );
+        fs::write(workspace.join("keep.txt"), "after\n").expect("resolve edit");
+        let retry = reopened.undo("run-1").expect("retry undo");
+        assert_eq!(retry.restored, 1);
+        assert_eq!(
+            fs::read_to_string(workspace.join("keep.txt")).expect("keep"),
+            "before\n"
+        );
         assert!(!reopened.has_complete("run-1"));
 
         let _ = fs::remove_dir_all(root);
@@ -1477,7 +1754,7 @@ mod tests {
         fs::write(workspace.join("scratch.txt"), "scratch\n").expect("user create");
 
         assert_eq!(
-            checkpoint.finish().expect("finish"),
+            checkpoint.finish().expect("finish").len(),
             1,
             "only the agent-touched file counts as a run change"
         );
@@ -1521,7 +1798,7 @@ mod tests {
         // The user edits the same file after the tool returned.
         fs::write(workspace.join("shared.txt"), "user\n").expect("user edit");
 
-        assert_eq!(checkpoint.finish().expect("finish"), 1);
+        assert_eq!(checkpoint.finish().expect("finish").len(), 1);
 
         let reopened = Arc::new(CheckpointStore::new(root.join("checkpoints")));
         let outcome = reopened.undo("run-after-touch").expect("undo");
@@ -1534,6 +1811,95 @@ mod tests {
             fs::read_to_string(workspace.join("shared.txt")).expect("shared"),
             "user\n"
         );
+        assert!(
+            reopened.has_complete("run-after-touch"),
+            "a skipped file must stay available for a retry"
+        );
+        fs::write(workspace.join("shared.txt"), "agent\n").expect("resolve edit");
+        let retry = reopened.undo("run-after-touch").expect("retry undo");
+        assert_eq!(retry.restored, 1);
+        assert_eq!(
+            fs::read_to_string(workspace.join("shared.txt")).expect("shared"),
+            "before\n"
+        );
+        assert!(!reopened.has_complete("run-after-touch"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn selective_undo_restores_one_file_and_keeps_external_edits_safe() {
+        if !git_available() {
+            eprintln!("Git is unavailable; skipping the selective checkpoint test.");
+            return;
+        }
+        let root = temp_root("selective");
+        let workspace = root.join("ws");
+        fs::write(workspace.join("one.txt"), "before one\n").expect("one");
+        fs::write(workspace.join("two.txt"), "before two\n").expect("two");
+
+        let store = Arc::new(CheckpointStore::new(root.join("checkpoints")));
+        let checkpoint = store.begin("run-selective", &workspace).expect("begin");
+        let recorder = checkpoint.recorder();
+        recorder.baseline().expect("baseline");
+        fs::write(workspace.join("one.txt"), "agent one\n").expect("agent one");
+        fs::write(workspace.join("two.txt"), "agent two\n").expect("agent two");
+        recorder.commit_step().expect("step");
+        let changes = checkpoint.finish().expect("finish");
+        assert_eq!(changes.len(), 2);
+        assert!(changes.iter().all(|change| change.kind == "modified"));
+
+        let reopened = Arc::new(CheckpointStore::new(root.join("checkpoints")));
+        // A post-run edit wins over a selective restore for that file.
+        fs::write(workspace.join("one.txt"), "user one\n").expect("user one");
+        let skipped = reopened
+            .undo_paths("run-selective", &[PathBuf::from("one.txt")])
+            .expect("selective skip");
+        assert_eq!(skipped.restored, 0);
+        assert!(skipped.skipped.iter().any(|line| line.contains("one.txt")));
+        assert_eq!(
+            fs::read_to_string(workspace.join("one.txt")).expect("one"),
+            "user one\n"
+        );
+
+        // Restoring a different file works and leaves the run available.
+        let restored = reopened
+            .undo_paths("run-selective", &[PathBuf::from("two.txt")])
+            .expect("selective restore");
+        assert_eq!(restored.restored, 1);
+        assert_eq!(
+            fs::read_to_string(workspace.join("two.txt")).expect("two"),
+            "before two\n"
+        );
+        let summary = reopened.changes("run-selective").expect("summary");
+        assert!(summary
+            .iter()
+            .any(|change| change.path == "two.txt" && change.restored));
+        assert!(summary
+            .iter()
+            .any(|change| change.path == "one.txt" && !change.restored));
+        assert!(reopened.available(&["run-selective".to_string()]).len() == 1);
+
+        let all = reopened.undo("run-selective").expect("undo remaining");
+        assert_eq!(all.restored, 0);
+        assert!(all.skipped.iter().any(|line| line.contains("one.txt")));
+        assert_eq!(
+            fs::read_to_string(workspace.join("one.txt")).expect("one"),
+            "user one\n"
+        );
+        assert!(
+            reopened.has_complete("run-selective"),
+            "the skipped file must stay available for a retry"
+        );
+        fs::write(workspace.join("one.txt"), "agent one\n").expect("resolve one");
+        let retry = reopened.undo("run-selective").expect("retry undo");
+        assert_eq!(retry.restored, 1);
+        assert_eq!(
+            fs::read_to_string(workspace.join("one.txt")).expect("one"),
+            "before one\n"
+        );
+        assert!(!reopened.has_complete("run-selective"));
+        assert!(!reopened.has_record("run-selective"));
 
         let _ = fs::remove_dir_all(root);
     }

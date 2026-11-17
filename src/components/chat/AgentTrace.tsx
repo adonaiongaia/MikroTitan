@@ -25,10 +25,15 @@ import type {
 } from "../../types";
 
 export interface AgentActions {
-  approve: (runId: string, stepId: string) => void | Promise<void>;
+  approve: (
+    runId: string,
+    stepId: string,
+    options?: { allowEdits?: boolean },
+  ) => void | Promise<void>;
   reject: (runId: string, stepId: string, feedback: string) => void | Promise<void>;
   abort: (runId: string) => void | Promise<void>;
   undo: (runId: string) => void | Promise<void>;
+  undoFile: (runId: string, path: string) => void | Promise<void>;
 }
 
 interface AgentTraceProps {
@@ -46,6 +51,8 @@ function statusLabel(trace: AgentTrace): string {
   switch (trace.status) {
     case "completed":
       return "Finished";
+    case "verification_failed":
+      return "Verification failed";
     case "max_iterations":
       return "Step limit reached";
     case "aborted":
@@ -71,6 +78,8 @@ function statusTone(trace: AgentTrace): string {
       return "bg-emerald-400";
     case "error":
       return "bg-rose-400";
+    case "verification_failed":
+      return "bg-rose-400";
     case "aborted":
       return "bg-slate-500";
     case "max_iterations":
@@ -84,6 +93,7 @@ const RISK_LABEL: Record<AgentRisk, string> = {
   read_only: "read-only",
   mutating: "mutating",
   destructive: "destructive",
+  irreversible: "always confirm",
 };
 
 function StepIcon({ status }: { status: AgentStepStatus }) {
@@ -270,6 +280,7 @@ function ApprovalCard({
   actions: AgentActions;
 }) {
   const [feedback, setFeedback] = useState("");
+  const [allowEdits, setAllowEdits] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
 
   const run = async (label: string, action: () => void | Promise<void>) => {
@@ -330,12 +341,29 @@ function ApprovalCard({
           className="field mt-0 block h-16 w-full resize-none !py-2 text-[10.5px] leading-5"
         />
 
+        {pending.file_edit ? (
+          <label className="mt-2 flex cursor-pointer items-center gap-1.5 text-[9.5px] text-slate-400">
+            <input
+              type="checkbox"
+              checked={allowEdits}
+              onChange={(event) => setAllowEdits(event.target.checked)}
+              className="h-3 w-3 accent-acid-400"
+            />
+            Allow file edits for this run
+            <span className="text-slate-600">
+              · skips approval for write_file and edit_file only
+            </span>
+          </label>
+        ) : null}
+
         <div className="mt-3 flex items-center gap-1.5">
           <button
             type="button"
             disabled={busy !== null}
             onClick={() =>
-              void run("approve", () => actions.approve(runId, pending.step_id))
+              void run("approve", () =>
+                actions.approve(runId, pending.step_id, { allowEdits }),
+              )
             }
             className="inline-flex h-7 flex-1 items-center justify-center gap-1.5 rounded-lg bg-acid-400 px-2 text-[10px] font-medium text-ink-950 transition hover:bg-acid-300 disabled:opacity-50"
           >
@@ -384,6 +412,7 @@ function ApprovalCard({
 
 export function AgentTraceView({ trace, streaming, actions }: AgentTraceProps) {
   const [undoing, setUndoing] = useState(false);
+  const [restoringPath, setRestoringPath] = useState<string | null>(null);
   const items = buildTimeline(trace);
   const liveText = trace.live_text.trim();
   const liveReasoning = trace.live_reasoning.trim();
@@ -399,6 +428,18 @@ export function AgentTraceView({ trace, streaming, actions }: AgentTraceProps) {
       // useChat records the failure on this trace.
     } finally {
       setUndoing(false);
+    }
+  };
+
+  const restoreFile = async (path: string) => {
+    if (restoringPath) return;
+    setRestoringPath(path);
+    try {
+      await actions.undoFile(trace.run_id, path);
+    } catch {
+      // useChat records the failure on this trace.
+    } finally {
+      setRestoringPath(null);
     }
   };
 
@@ -485,6 +526,74 @@ export function AgentTraceView({ trace, streaming, actions }: AgentTraceProps) {
         </p>
       ) : null}
 
+      {trace.changes.length ? (
+        <div className="border-t border-white/5">
+          <div className="flex items-center gap-2 px-3 py-2">
+            <span className="text-[8px] uppercase tracking-[0.16em] text-slate-600">
+              Run changes
+            </span>
+            <span className="font-mono text-[9px] text-slate-600">
+              {trace.changes.length} file{trace.changes.length === 1 ? "" : "s"}
+            </span>
+            <span className="ml-auto text-[9px] text-slate-600">
+              restore one file or all
+            </span>
+          </div>
+          <ul className="divide-y divide-white/5 border-t border-white/5">
+            {trace.changes.map((change) => (
+              <li
+                key={change.path}
+                className="flex items-center gap-2 px-3 py-1.5"
+              >
+                <span
+                  className={cn(
+                    "w-12 shrink-0 rounded border px-1 py-px text-center text-[8px] uppercase tracking-wider",
+                    change.kind === "created"
+                      ? "border-emerald-400/20 bg-emerald-400/5 text-emerald-300/80"
+                      : change.kind === "deleted"
+                        ? "border-rose-400/20 bg-rose-400/5 text-rose-300/80"
+                        : "border-amber-400/20 bg-amber-400/5 text-amber-300/80",
+                  )}
+                >
+                  {change.kind}
+                </span>
+                <code className="min-w-0 flex-1 truncate font-mono text-[9.5px] text-slate-300">
+                  {change.path}
+                </code>
+                {change.restored ? (
+                  <span className="inline-flex shrink-0 items-center gap-1 text-[9px] text-slate-500">
+                    <Check className="h-2.5 w-2.5" />
+                    restored
+                  </span>
+                ) : trace.undo_available ? (
+                  <button
+                    type="button"
+                    disabled={restoringPath !== null}
+                    onClick={() => void restoreFile(change.path)}
+                    className="inline-flex h-6 shrink-0 items-center gap-1 rounded-md border border-white/10 bg-white/5 px-1.5 text-[9px] text-slate-300 transition hover:bg-white/10 disabled:opacity-40"
+                  >
+                    {restoringPath === change.path ? (
+                      <Loader2 className="h-2.5 w-2.5 animate-spin" />
+                    ) : (
+                      <Undo2 className="h-2.5 w-2.5" />
+                    )}
+                    Restore
+                  </button>
+                ) : (
+                  <span className="shrink-0 text-[9px] text-slate-600">
+                    not restored
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
+          <p className="border-t border-white/5 px-3 py-1.5 text-[9px] leading-4 text-slate-600">
+            Restore only touches files that still match what this run left
+            behind; later edits are protected.
+          </p>
+        </div>
+      ) : null}
+
       {canUndo ? (
         <div className="flex items-center gap-2 border-t border-white/5 px-3 py-2">
           <button
@@ -498,12 +607,22 @@ export function AgentTraceView({ trace, streaming, actions }: AgentTraceProps) {
             ) : (
               <Undo2 className="h-3 w-3" />
             )}
-            Undo run changes
+            Restore all files
           </button>
           <span className="text-[9px] text-slate-600">
-            Restores the workspace to before this run
+            Only files still matching what this run left behind
           </span>
         </div>
+      ) : null}
+
+      {!trace.undone && trace.undo_available && trace.undo_summary ? (
+        <p className="flex items-start gap-1.5 border-t border-amber-400/15 bg-amber-400/5 px-3 py-1.5 text-[9.5px] leading-4 text-amber-200/80">
+          <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+          <span>
+            <span className="font-medium">Restore incomplete.</span>{" "}
+            {trace.undo_summary}
+          </span>
+        </p>
       ) : null}
 
       {trace.undone ? (
@@ -517,6 +636,14 @@ export function AgentTraceView({ trace, streaming, actions }: AgentTraceProps) {
       {trace.undo_error ? (
         <p className="border-t border-rose-400/15 bg-rose-500/5 px-3 py-1.5 text-[9.5px] leading-4 text-rose-300">
           {trace.undo_error}
+        </p>
+      ) : null}
+
+      {trace.status === "verification_failed" ? (
+        <p className="flex items-center gap-1.5 border-t border-rose-400/15 bg-rose-500/5 px-3 py-1.5 text-[9.5px] leading-4 text-rose-300">
+          <AlertTriangle className="h-3 w-3 shrink-0" />
+          The configured verification command did not pass. Treat this run's
+          answer as unverified.
         </p>
       ) : null}
 

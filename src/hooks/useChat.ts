@@ -93,7 +93,11 @@ function normalizeCitation(value: unknown): Citation | null {
 }
 
 function normalizeRisk(value: unknown): AgentStep["risk"] {
-  return value === "mutating" || value === "destructive" ? value : "read_only";
+  return value === "mutating" ||
+    value === "destructive" ||
+    value === "irreversible"
+    ? value
+    : "read_only";
 }
 
 function updateStep(
@@ -165,6 +169,7 @@ function normalizeAgentTrace(value: unknown): AgentTrace | undefined {
     .slice(-60);
   const status =
     trace.status === "completed" ||
+    trace.status === "verification_failed" ||
     trace.status === "max_iterations" ||
     trace.status === "aborted" ||
     trace.status === "error"
@@ -211,6 +216,17 @@ function normalizeAgentTrace(value: unknown): AgentTrace | undefined {
       typeof trace.undo_error === "string" ? trace.undo_error : null,
     undo_summary:
       typeof trace.undo_summary === "string" ? trace.undo_summary : null,
+    changes: Array.isArray(trace.changes)
+      ? trace.changes
+          .filter((change) => Boolean(change) && typeof change === "object")
+          .map((change) => ({
+            path: typeof change.path === "string" ? change.path : "",
+            kind: typeof change.kind === "string" ? change.kind : "modified",
+            restored: Boolean(change.restored),
+          }))
+          .filter((change) => change.path.length > 0)
+          .slice(0, 500)
+      : [],
     started_at: typeof trace.started_at === "number" ? trace.started_at : Date.now(),
     finished_at:
       typeof trace.finished_at === "number" ? trace.finished_at : null,
@@ -369,8 +385,18 @@ export function useChat() {
     if (!runIds.length) return;
     void api
       .agentUndoAvailability(runIds)
-      .then((available) => {
+      .then(async (available) => {
         const canUndo = new Set(available);
+        const loaded = await Promise.all(
+          available.map(async (runId) => {
+            try {
+              return [runId, await api.agentRunChanges(runId)] as const;
+            } catch {
+              return [runId, [] as AgentTrace["changes"]] as const;
+            }
+          }),
+        );
+        const changesByRun = new Map(loaded);
         setSessions((previous) =>
           previous.map((session) => ({
             ...session,
@@ -378,10 +404,14 @@ export function useChat() {
               const trace = message.agentTrace;
               if (!trace) return message;
               const next = canUndo.has(trace.run_id) && !trace.undone;
-              if (trace.undo_available === next) return message;
+              const fresh = changesByRun.get(trace.run_id);
+              const changes = fresh?.length ? fresh : trace.changes;
+              if (trace.undo_available === next && changes === trace.changes) {
+                return message;
+              }
               return {
                 ...message,
-                agentTrace: { ...trace, undo_available: next },
+                agentTrace: { ...trace, undo_available: next, changes },
               };
             }),
           })),
@@ -581,6 +611,7 @@ export function useChat() {
               arguments: event.payload.arguments,
               risk: event.payload.risk,
               reason: event.payload.reason,
+              file_edit: Boolean(event.payload.file_edit),
               preview: event.payload.preview ?? null,
             },
             steps: updateStep(trace.steps, event.payload.step_id, {
@@ -690,7 +721,15 @@ export function useChat() {
                   live_text: "",
                   live_reasoning: "",
                   notice: null,
-                  undo_available: event.payload.changed_files > 0,
+                  changes:
+                    Array.isArray(event.payload.changes) &&
+                    event.payload.changes.length
+                      ? event.payload.changes
+                      : message.agentTrace.changes,
+                  undo_available:
+                    (Array.isArray(event.payload.changes)
+                      ? event.payload.changes.some((change) => !change.restored)
+                      : false) || event.payload.changed_files > 0,
                 }
               : null,
           }));
@@ -920,6 +959,7 @@ export function useChat() {
         undone: false,
         undo_error: null,
         undo_summary: null,
+        changes: [],
         started_at: now,
         finished_at: null,
       };
@@ -997,6 +1037,7 @@ export function useChat() {
             Math.max(0.5, options.agent.compactionThreshold),
           ),
           web_search: options.webSearch,
+          verify_command: (options.agent.verifyCommand ?? "").trim(),
           mcp_servers: options.mcpServers ?? [],
         });
       } catch (err) {
@@ -1148,7 +1189,19 @@ export function useChat() {
         const result = await api.undoAgent(runId);
         updateTraceByRun(runId, (trace) => ({
           ...trace,
-          undone: true,
+          undone: result.skipped.length === 0,
+          changes: trace.changes.map((change) => ({
+            ...change,
+            restored:
+              change.restored ||
+              !result.skipped.some(
+                (line) =>
+                  line === change.path || line.startsWith(`${change.path}:`),
+              ),
+          })),
+          // Skipped files stay available on the backend for a retry after the
+          // user resolves the external edit or permission problem.
+          undo_available: result.skipped.length > 0,
           undo_error: null,
           undo_summary: undoSummary(result),
         }));
@@ -1157,6 +1210,42 @@ export function useChat() {
         const message = errorMessage(err);
         // Keep undo available after a refusal (for example while another run
         // holds the workspace) so the user can stop that run and retry.
+        updateTraceByRun(runId, (trace) => ({
+          ...trace,
+          undo_error: message,
+        }));
+        throw err;
+      }
+    },
+    [updateTraceByRun],
+  );
+
+  const undoAgentFile = useCallback(
+    async (runId: string, path: string) => {
+      updateTraceByRun(runId, (trace) => ({
+        ...trace,
+        undo_error: null,
+      }));
+      try {
+        const result = await api.undoAgentFile(runId, path);
+        updateTraceByRun(runId, (trace) => {
+          const resolved = result.restored > 0 || result.deleted > 0;
+          const changes = trace.changes.map((change) =>
+            resolved && change.path === path
+              ? { ...change, restored: true }
+              : change,
+          );
+          return {
+            ...trace,
+            changes,
+            undo_available: changes.some((change) => !change.restored),
+            undo_error: null,
+            undo_summary: undoSummary(result),
+          };
+        });
+        return result;
+      } catch (err) {
+        const message = errorMessage(err);
         updateTraceByRun(runId, (trace) => ({
           ...trace,
           undo_error: message,
@@ -1191,6 +1280,7 @@ export function useChat() {
     send,
     sendAgent,
     undoAgent,
+    undoAgentFile,
     stop,
     clear,
     newChat,

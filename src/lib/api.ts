@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   ActiveEngineInfo,
   AgentApprovalReply,
+  AgentChangedFile,
   AgentRunRequest,
   AgentUndoResult,
   AppSettings,
@@ -155,6 +156,10 @@ export const api = {
     invoke<void>("agent_abort", { run_id: runId }),
   undoAgent: (runId: string) =>
     invoke<AgentUndoResult>("agent_undo", { run_id: runId }),
+  undoAgentFile: (runId: string, path: string) =>
+    invoke<AgentUndoResult>("agent_undo_file", { run_id: runId, path }),
+  agentRunChanges: (runId: string) =>
+    invoke<AgentChangedFile[]>("agent_run_changes", { run_id: runId }),
   agentUndoAvailability: (runIds: string[]) =>
     invoke<string[]>("agent_undo_availability", { run_ids: runIds }),
 };

@@ -538,10 +538,15 @@ export interface McpActivityEvent {
 // ---------------------------------------------------------------------------
 
 export type AgentApprovalPolicy = "destructive" | "all" | "auto";
-export type AgentRisk = "read_only" | "mutating" | "destructive";
+export type AgentRisk =
+  | "read_only"
+  | "mutating"
+  | "destructive"
+  | "irreversible";
 export type AgentRunStatus =
   | "running"
   | "completed"
+  | "verification_failed"
   | "max_iterations"
   | "aborted"
   | "error";
@@ -586,12 +591,21 @@ export interface AgentDiffPreview {
   error?: string | null;
 }
 
+export interface AgentChangedFile {
+  /** Workspace-relative path. */
+  path: string;
+  kind: "created" | "modified" | "deleted" | string;
+  restored: boolean;
+}
+
 export interface AgentPendingApproval {
   step_id: string;
   tool: string;
   arguments: string;
   risk: AgentRisk;
   reason: string;
+  /** write_file/edit_file, which can be allowed for the rest of the run. */
+  file_edit?: boolean;
   preview?: AgentDiffPreview | null;
 }
 
@@ -614,6 +628,8 @@ export interface AgentTrace {
   undone: boolean;
   undo_error: string | null;
   undo_summary: string | null;
+  /** Every file the run changed, retained after a partial or full undo. */
+  changes: AgentChangedFile[];
   started_at: number;
   finished_at: number | null;
 }
@@ -627,6 +643,8 @@ export interface AgentPreferences {
   planningStep: boolean;
   autoCompact: boolean;
   compactionThreshold: number;
+  /** Runs after file edits before the agent may finish; empty disables it. */
+  verifyCommand: string;
 }
 
 export interface AgentRunRequest {
@@ -649,6 +667,7 @@ export interface AgentRunRequest {
   auto_compact: boolean;
   compaction_threshold: number;
   web_search: boolean;
+  verify_command: string;
   mcp_servers: McpServerInput[];
 }
 
@@ -657,6 +676,8 @@ export interface AgentApprovalReply {
   step_id: string;
   decision: "approve" | "reject" | "abort";
   feedback: string;
+  /** Only meaningful with "approve"; never applies to shell or MCP tools. */
+  allow_file_edits?: boolean;
 }
 
 export interface AgentPlanEvent {
@@ -692,6 +713,7 @@ export interface AgentApprovalEvent {
   arguments: string;
   risk: AgentRisk;
   reason: string;
+  file_edit: boolean;
   preview?: AgentDiffPreview | null;
 }
 
@@ -732,6 +754,7 @@ export interface AgentDoneEvent {
   elapsed_ms: number;
   final_content: string;
   changed_files: number;
+  changes: AgentChangedFile[];
 }
 
 export interface AgentErrorEvent {
