@@ -232,6 +232,8 @@ export interface ChatMessage {
   created_at: number;
   citations?: Citation[];
   images?: Array<{ name: string; data_url: string; tokens: number }>;
+  /** Structured agent trace. Absent on legacy chats and normal replies. */
+  agentTrace?: AgentTrace | null;
 }
 
 export interface ChatSession {
@@ -528,5 +530,218 @@ export interface McpActivityEvent {
   server: string;
   tool: string;
   level: "info" | "error" | string;
+  message: string;
+}
+
+// ---------------------------------------------------------------------------
+// Agent mode
+// ---------------------------------------------------------------------------
+
+export type AgentApprovalPolicy = "destructive" | "all" | "auto";
+export type AgentRisk = "read_only" | "mutating" | "destructive";
+export type AgentRunStatus =
+  | "running"
+  | "completed"
+  | "max_iterations"
+  | "aborted"
+  | "error";
+
+export type AgentStepStatus =
+  | "running"
+  | "awaiting_approval"
+  | "succeeded"
+  | "failed"
+  | "rejected"
+  | "blocked";
+
+export interface AgentStep {
+  id: string;
+  iteration: number;
+  thought: string;
+  tool: string;
+  arguments: string;
+  risk: AgentRisk;
+  status: AgentStepStatus;
+  output: string | null;
+  duration_ms: number | null;
+  truncated: boolean;
+  created_at: number;
+}
+
+export interface AgentCompaction {
+  id: string;
+  dropped_messages: number;
+  estimated_tokens: number;
+  context_window: number;
+  summary: string;
+  created_at: number;
+}
+
+export interface AgentDiffPreview {
+  path: string;
+  diff: string;
+  added: number;
+  removed: number;
+  truncated: boolean;
+  error?: string | null;
+}
+
+export interface AgentPendingApproval {
+  step_id: string;
+  tool: string;
+  arguments: string;
+  risk: AgentRisk;
+  reason: string;
+  preview?: AgentDiffPreview | null;
+}
+
+export interface AgentTrace {
+  run_id: string;
+  status: AgentRunStatus;
+  iterations: number;
+  max_iterations: number;
+  plan: string[];
+  steps: AgentStep[];
+  compactions: AgentCompaction[];
+  pending: AgentPendingApproval | null;
+  live_text: string;
+  live_reasoning: string;
+  notice: string | null;
+  error: string | null;
+  /** True while this app session still has the run's pre-images. */
+  undo_available: boolean;
+  /** True once this run's file changes have been reverted. */
+  undone: boolean;
+  undo_error: string | null;
+  undo_summary: string | null;
+  started_at: number;
+  finished_at: number | null;
+}
+
+/** Persisted per machine, next to the sampling preferences. */
+export interface AgentPreferences {
+  enabled: boolean;
+  maxIterations: number;
+  approvalPolicy: AgentApprovalPolicy;
+  workspaceRoot: string;
+  planningStep: boolean;
+  autoCompact: boolean;
+  compactionThreshold: number;
+}
+
+export interface AgentRunRequest {
+  run_id: string;
+  conversation_id: string;
+  goal: string;
+  history: ChatOutboundMessage[];
+  system_prompt: string | null;
+  temperature: number;
+  top_p: number;
+  top_k: number;
+  min_p: number;
+  repeat_penalty: number;
+  thinking: boolean | null;
+  max_tokens: number | null;
+  max_iterations: number;
+  approval_policy: AgentApprovalPolicy;
+  workspace_root: string;
+  planning_step: boolean;
+  auto_compact: boolean;
+  compaction_threshold: number;
+  web_search: boolean;
+  mcp_servers: McpServerInput[];
+}
+
+export interface AgentApprovalReply {
+  run_id: string;
+  step_id: string;
+  decision: "approve" | "reject" | "abort";
+  feedback: string;
+}
+
+export interface AgentPlanEvent {
+  run_id: string;
+  conversation_id: string;
+  plan: string[];
+}
+
+export interface AgentThoughtEvent {
+  run_id: string;
+  conversation_id: string;
+  iteration: number;
+  delta: string;
+  reasoning: string;
+}
+
+export interface AgentToolStartEvent {
+  run_id: string;
+  conversation_id: string;
+  step_id: string;
+  iteration: number;
+  tool: string;
+  arguments: string;
+  risk: AgentRisk;
+  requires_approval: boolean;
+}
+
+export interface AgentApprovalEvent {
+  run_id: string;
+  conversation_id: string;
+  step_id: string;
+  tool: string;
+  arguments: string;
+  risk: AgentRisk;
+  reason: string;
+  preview?: AgentDiffPreview | null;
+}
+
+export interface AgentUndoResult {
+  restored: number;
+  deleted: number;
+  skipped: string[];
+  incomplete: boolean;
+}
+
+export interface AgentToolResultEvent {
+  run_id: string;
+  conversation_id: string;
+  step_id: string;
+  tool: string;
+  ok: boolean;
+  output: string;
+  duration_ms: number;
+  truncated: boolean;
+  blocked: boolean;
+  rejected: boolean;
+}
+
+export interface AgentCompactEvent {
+  run_id: string;
+  conversation_id: string;
+  dropped_messages: number;
+  estimated_tokens: number;
+  context_window: number;
+  summary: string;
+}
+
+export interface AgentDoneEvent {
+  run_id: string;
+  conversation_id: string;
+  status: AgentRunStatus;
+  iterations: number;
+  elapsed_ms: number;
+  final_content: string;
+  changed_files: number;
+}
+
+export interface AgentErrorEvent {
+  run_id: string;
+  conversation_id: string;
+  message: string;
+}
+
+export interface AgentNoticeEvent {
+  run_id: string;
+  conversation_id: string;
   message: string;
 }

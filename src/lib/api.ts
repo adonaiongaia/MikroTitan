@@ -2,6 +2,9 @@ import { invoke } from "@tauri-apps/api/core";
 
 import type {
   ActiveEngineInfo,
+  AgentApprovalReply,
+  AgentRunRequest,
+  AgentUndoResult,
   AppSettings,
   BackendCapabilities,
   BinaryInstallResult,
@@ -50,6 +53,15 @@ export const Events = {
   convertFinished: "convert://finished",
   downloadProgress: "download://progress",
   mcpActivity: "mcp://activity",
+  agentPlan: "agent:plan",
+  agentThought: "agent:thought",
+  agentToolStart: "agent:tool_start",
+  agentApprovalNeeded: "agent:approval_needed",
+  agentToolResult: "agent:tool_result",
+  agentContextCompacted: "agent:context_compacted",
+  agentDone: "agent:done",
+  agentError: "agent:error",
+  agentNotice: "agent:notice",
 } as const;
 
 export const api = {
@@ -134,4 +146,15 @@ export const api = {
   libraryModels: () => invoke<LibraryModel[]>("library_models"),
   mcpProbe: (server: McpServerInput) =>
     invoke<McpProbe>("mcp_probe", { server }),
+
+  startAgent: (request: AgentRunRequest) =>
+    invoke<void>("agent_start", { request }),
+  resolveAgentApproval: (reply: AgentApprovalReply) =>
+    invoke<void>("agent_resolve_approval", { reply }),
+  abortAgent: (runId: string) =>
+    invoke<void>("agent_abort", { run_id: runId }),
+  undoAgent: (runId: string) =>
+    invoke<AgentUndoResult>("agent_undo", { run_id: runId }),
+  agentUndoAvailability: (runIds: string[]) =>
+    invoke<string[]>("agent_undo_availability", { run_ids: runIds }),
 };

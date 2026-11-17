@@ -6,6 +6,20 @@ import { fitContext } from "../lib/contextBudget";
 import { errorMessage, uid } from "../lib/format";
 import { appendMcpLog } from "../lib/mcpLog";
 import type {
+  AgentApprovalEvent,
+  AgentCompactEvent,
+  AgentDoneEvent,
+  AgentErrorEvent,
+  AgentNoticeEvent,
+  AgentPlanEvent,
+  AgentPreferences,
+  AgentStep,
+  AgentStepStatus,
+  AgentThoughtEvent,
+  AgentToolResultEvent,
+  AgentToolStartEvent,
+  AgentTrace,
+  AgentUndoResult,
   ChatDelta,
   ChatDone,
   ChatErrorEvent,
@@ -42,6 +56,12 @@ export interface SendOptions {
   onAccepted?: () => void;
 }
 
+export interface AgentSendOptions extends SendOptions {
+  agent: AgentPreferences;
+  /** Whether the built-in `web_search` tool is exposed to the agent. */
+  webSearch: boolean;
+}
+
 function createSession(): ChatSession {
   const now = Date.now();
   return {
@@ -69,6 +89,131 @@ function normalizeCitation(value: unknown): Citation | null {
         : citation.url,
     url: citation.url,
     snippet: typeof citation.snippet === "string" ? citation.snippet : undefined,
+  };
+}
+
+function normalizeRisk(value: unknown): AgentStep["risk"] {
+  return value === "mutating" || value === "destructive" ? value : "read_only";
+}
+
+function updateStep(
+  steps: AgentStep[],
+  stepId: string,
+  patch: Partial<AgentStep>,
+): AgentStep[] {
+  return steps.map((step) => (step.id === stepId ? { ...step, ...patch } : step));
+}
+
+type ActiveRequest = {
+  requestId: string;
+  sessionId: string;
+  mode: "chat" | "agent";
+};
+
+async function cancelRequest(request: ActiveRequest) {
+  if (request.mode === "agent") return api.abortAgent(request.requestId);
+  return api.cancelChat(request.requestId);
+}
+
+function undoSummary(result: AgentUndoResult): string {
+  const parts: string[] = [];
+  if (result.restored > 0) {
+    parts.push(`restored ${result.restored} file${result.restored === 1 ? "" : "s"}`);
+  }
+  if (result.deleted > 0) {
+    parts.push(
+      `removed ${result.deleted} new file${result.deleted === 1 ? "" : "s"}`,
+    );
+  }
+  if (result.skipped.length > 0) {
+    parts.push(
+      `skipped ${result.skipped.length} (${result.skipped.slice(0, 2).join("; ")})`,
+    );
+  }
+  if (result.incomplete) parts.push("some changes were not recorded");
+  return parts.length ? parts.join(" · ") : "nothing needed reverting";
+}
+
+function normalizeAgentTrace(value: unknown): AgentTrace | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const trace = value as Partial<AgentTrace>;
+  if (!Array.isArray(trace.steps)) return undefined;
+  const stepStatuses: AgentStepStatus[] = [
+    "running",
+    "awaiting_approval",
+    "succeeded",
+    "failed",
+    "rejected",
+    "blocked",
+  ];
+  const steps: AgentStep[] = trace.steps
+    .filter((step): step is AgentStep => Boolean(step) && typeof step === "object")
+    .map((step) => ({
+      id: typeof step.id === "string" ? step.id : uid(),
+      iteration: typeof step.iteration === "number" ? step.iteration : 0,
+      thought: typeof step.thought === "string" ? step.thought : "",
+      tool: typeof step.tool === "string" ? step.tool : "tool",
+      arguments: typeof step.arguments === "string" ? step.arguments : "{}",
+      risk: normalizeRisk(step.risk),
+      status: stepStatuses.includes(step.status) ? step.status : "succeeded",
+      output: typeof step.output === "string" ? step.output : null,
+      duration_ms: typeof step.duration_ms === "number" ? step.duration_ms : null,
+      truncated: Boolean(step.truncated),
+      created_at:
+        typeof step.created_at === "number" ? step.created_at : Date.now(),
+    }))
+    .slice(-60);
+  const status =
+    trace.status === "completed" ||
+    trace.status === "max_iterations" ||
+    trace.status === "aborted" ||
+    trace.status === "error"
+      ? trace.status
+      : // A reloaded "running" trace never resumes; it was interrupted.
+        "aborted";
+  return {
+    run_id: typeof trace.run_id === "string" ? trace.run_id : "",
+    status,
+    iterations: typeof trace.iterations === "number" ? trace.iterations : 0,
+    max_iterations:
+      typeof trace.max_iterations === "number" ? trace.max_iterations : 10,
+    plan: Array.isArray(trace.plan)
+      ? trace.plan.filter((item): item is string => typeof item === "string").slice(0, 20)
+      : [],
+    steps,
+    compactions: Array.isArray(trace.compactions)
+      ? trace.compactions
+          .filter((event) => Boolean(event) && typeof event === "object")
+          .map((event) => ({
+            id: typeof event.id === "string" ? event.id : uid(),
+            dropped_messages:
+              typeof event.dropped_messages === "number" ? event.dropped_messages : 0,
+            estimated_tokens:
+              typeof event.estimated_tokens === "number" ? event.estimated_tokens : 0,
+            context_window:
+              typeof event.context_window === "number" ? event.context_window : 0,
+            summary: typeof event.summary === "string" ? event.summary : "",
+            created_at:
+              typeof event.created_at === "number" ? event.created_at : Date.now(),
+          }))
+          .slice(-12)
+      : [],
+    pending: null,
+    live_text: "",
+    live_reasoning: "",
+    notice: null,
+    error: typeof trace.error === "string" ? trace.error : null,
+    // The startup availability query fills this in for traces whose on-disk
+    // checkpoint still exists; live runs set it when agent:done arrives.
+    undo_available: false,
+    undone: Boolean(trace.undone),
+    undo_error:
+      typeof trace.undo_error === "string" ? trace.undo_error : null,
+    undo_summary:
+      typeof trace.undo_summary === "string" ? trace.undo_summary : null,
+    started_at: typeof trace.started_at === "number" ? trace.started_at : Date.now(),
+    finished_at:
+      typeof trace.finished_at === "number" ? trace.finished_at : null,
   };
 }
 
@@ -102,6 +247,7 @@ function normalizeMessage(value: unknown): ChatMessage | null {
           .filter((citation): citation is Citation => citation !== null)
       : undefined,
     images,
+    agentTrace: normalizeAgentTrace(message.agentTrace),
   };
 }
 
@@ -177,9 +323,7 @@ export function useChat() {
   const [finishReason, setFinishReason] = useState<string | null>(null);
   const [liveBytes, setLiveBytes] = useState(0);
   const [startedAtMs, setStartedAtMs] = useState<number | null>(null);
-  const activeRequest = useRef<{ requestId: string; sessionId: string } | null>(
-    null,
-  );
+  const activeRequest = useRef<ActiveRequest | null>(null);
   const streamStartedAt = useRef<number | null>(null);
   const sessionsRef = useRef(sessions);
   sessionsRef.current = sessions;
@@ -206,6 +350,48 @@ export function useChat() {
     }
   }, [activeId]);
 
+  // Checkpoints live on disk and survive a restart, while the in-memory
+  // journal does not. Ask Rust which persisted traces are still undoable once
+  // the initially loaded sessions are available.
+  const availabilityChecked = useRef(false);
+  useEffect(() => {
+    if (availabilityChecked.current) return;
+    availabilityChecked.current = true;
+    const runIds = Array.from(
+      new Set(
+        sessions.flatMap((session) =>
+          session.messages
+            .map((message) => message.agentTrace?.run_id)
+            .filter((runId): runId is string => Boolean(runId)),
+        ),
+      ),
+    );
+    if (!runIds.length) return;
+    void api
+      .agentUndoAvailability(runIds)
+      .then((available) => {
+        const canUndo = new Set(available);
+        setSessions((previous) =>
+          previous.map((session) => ({
+            ...session,
+            messages: session.messages.map((message) => {
+              const trace = message.agentTrace;
+              if (!trace) return message;
+              const next = canUndo.has(trace.run_id) && !trace.undone;
+              if (trace.undo_available === next) return message;
+              return {
+                ...message,
+                agentTrace: { ...trace, undo_available: next },
+              };
+            }),
+          })),
+        );
+      })
+      .catch(() => {
+        // Older backends do not expose availability; the button stays hidden.
+      });
+  }, [sessions]);
+
   useEffect(() => {
     let disposed = false;
     const unlisteners: UnlistenFn[] = [];
@@ -227,6 +413,18 @@ export function useChat() {
               }
             : session,
         ),
+      );
+    };
+
+    const updateTrace = (
+      requestId: string,
+      sessionId: string,
+      updater: (trace: AgentTrace) => AgentTrace,
+    ) => {
+      updateMessage(requestId, sessionId, (message) =>
+        message.agentTrace
+          ? { ...message, agentTrace: updater(message.agentTrace) }
+          : message,
       );
     };
 
@@ -305,12 +503,216 @@ export function useChat() {
         },
       );
 
+      const planUnlisten = await listen<AgentPlanEvent>(Events.agentPlan, (event) => {
+        const request = activeRequest.current;
+        if (!request || event.payload.run_id !== request.requestId) return;
+        updateTrace(request.requestId, request.sessionId, (trace) => ({
+          ...trace,
+          plan: Array.isArray(event.payload.plan)
+            ? event.payload.plan.slice(0, 20)
+            : trace.plan,
+        }));
+      });
+
+      const thoughtUnlisten = await listen<AgentThoughtEvent>(
+        Events.agentThought,
+        (event) => {
+          const request = activeRequest.current;
+          if (!request || event.payload.run_id !== request.requestId) return;
+          const delta = typeof event.payload.delta === "string" ? event.payload.delta : "";
+          const reasoning =
+            typeof event.payload.reasoning === "string" ? event.payload.reasoning : "";
+          if (!delta && !reasoning) return;
+          updateTrace(request.requestId, request.sessionId, (trace) => ({
+            ...trace,
+            live_text: (trace.live_text + delta).slice(-8_000),
+            live_reasoning: (trace.live_reasoning + reasoning).slice(-4_000),
+            notice: null,
+          }));
+        },
+      );
+
+      const toolStartUnlisten = await listen<AgentToolStartEvent>(
+        Events.agentToolStart,
+        (event) => {
+          const request = activeRequest.current;
+          if (!request || event.payload.run_id !== request.requestId) return;
+          updateTrace(request.requestId, request.sessionId, (trace) => {
+            const status: AgentStepStatus = event.payload.requires_approval
+              ? "awaiting_approval"
+              : "running";
+            const step: AgentStep = {
+              id: event.payload.step_id,
+              iteration: event.payload.iteration,
+              thought: (trace.live_text || trace.live_reasoning).slice(-4_000),
+              tool: event.payload.tool,
+              arguments:
+                typeof event.payload.arguments === "string"
+                  ? event.payload.arguments
+                  : "{}",
+              risk: event.payload.risk,
+              status,
+              output: null,
+              duration_ms: null,
+              truncated: false,
+              created_at: Date.now(),
+            };
+            return {
+              ...trace,
+              steps: [...trace.steps, step].slice(-60),
+              live_text: "",
+              live_reasoning: "",
+              notice: null,
+            };
+          });
+        },
+      );
+
+      const approvalUnlisten = await listen<AgentApprovalEvent>(
+        Events.agentApprovalNeeded,
+        (event) => {
+          const request = activeRequest.current;
+          if (!request || event.payload.run_id !== request.requestId) return;
+          updateTrace(request.requestId, request.sessionId, (trace) => ({
+            ...trace,
+            pending: {
+              step_id: event.payload.step_id,
+              tool: event.payload.tool,
+              arguments: event.payload.arguments,
+              risk: event.payload.risk,
+              reason: event.payload.reason,
+              preview: event.payload.preview ?? null,
+            },
+            steps: updateStep(trace.steps, event.payload.step_id, {
+              status: "awaiting_approval",
+            }),
+            notice: null,
+          }));
+        },
+      );
+
+      const toolResultUnlisten = await listen<AgentToolResultEvent>(
+        Events.agentToolResult,
+        (event) => {
+          const request = activeRequest.current;
+          if (!request || event.payload.run_id !== request.requestId) return;
+          updateTrace(request.requestId, request.sessionId, (trace) => {
+            const status: AgentStepStatus = event.payload.ok
+              ? "succeeded"
+              : event.payload.rejected
+                ? "rejected"
+                : event.payload.blocked
+                  ? "blocked"
+                  : "failed";
+            return {
+              ...trace,
+              pending:
+                trace.pending?.step_id === event.payload.step_id
+                  ? null
+                  : trace.pending,
+              steps: updateStep(trace.steps, event.payload.step_id, {
+                status,
+                output: event.payload.output,
+                duration_ms: event.payload.duration_ms,
+                truncated: Boolean(event.payload.truncated),
+              }),
+            };
+          });
+        },
+      );
+
+      const compactUnlisten = await listen<AgentCompactEvent>(
+        Events.agentContextCompacted,
+        (event) => {
+          const request = activeRequest.current;
+          if (!request || event.payload.run_id !== request.requestId) return;
+          updateTrace(request.requestId, request.sessionId, (trace) => ({
+            ...trace,
+            compactions: [
+              ...trace.compactions,
+              {
+                id: `${event.payload.run_id}-${Date.now()}`,
+                dropped_messages: event.payload.dropped_messages,
+                estimated_tokens: event.payload.estimated_tokens,
+                context_window: event.payload.context_window,
+                summary: event.payload.summary,
+                created_at: Date.now(),
+              },
+            ].slice(-12),
+          }));
+        },
+      );
+
+      const agentNoticeUnlisten = await listen<AgentNoticeEvent>(
+        Events.agentNotice,
+        (event) => {
+          const request = activeRequest.current;
+          if (!request || event.payload.run_id !== request.requestId) return;
+          updateTrace(request.requestId, request.sessionId, (trace) => ({
+            ...trace,
+            notice: event.payload.message,
+          }));
+        },
+      );
+
+      const agentErrorUnlisten = await listen<AgentErrorEvent>(
+        Events.agentError,
+        (event) => {
+          const request = activeRequest.current;
+          if (!request || event.payload.run_id !== request.requestId) return;
+          setError(event.payload.message);
+          updateTrace(request.requestId, request.sessionId, (trace) => ({
+            ...trace,
+            error: event.payload.message,
+          }));
+        },
+      );
+
+      const agentDoneUnlisten = await listen<AgentDoneEvent>(
+        Events.agentDone,
+        (event) => {
+          const request = activeRequest.current;
+          if (!request || event.payload.run_id !== request.requestId) return;
+          setStreaming(false);
+          setStreamingSessionId(null);
+          setFinishReason(event.payload.status);
+          if (event.payload.status !== "error") setError(null);
+          updateMessage(request.requestId, request.sessionId, (message) => ({
+            ...message,
+            content: event.payload.final_content || message.content,
+            agentTrace: message.agentTrace
+              ? {
+                  ...message.agentTrace,
+                  status: event.payload.status,
+                  iterations: event.payload.iterations,
+                  finished_at: Date.now(),
+                  pending: null,
+                  live_text: "",
+                  live_reasoning: "",
+                  notice: null,
+                  undo_available: event.payload.changed_files > 0,
+                }
+              : null,
+          }));
+          activeRequest.current = null;
+        },
+      );
+
       if (disposed) {
         deltaUnlisten();
         doneUnlisten();
         errorUnlisten();
         noticeUnlisten();
         mcpActivityUnlisten();
+        planUnlisten();
+        thoughtUnlisten();
+        toolStartUnlisten();
+        approvalUnlisten();
+        toolResultUnlisten();
+        compactUnlisten();
+        agentNoticeUnlisten();
+        agentErrorUnlisten();
+        agentDoneUnlisten();
       } else {
         unlisteners.push(
           deltaUnlisten,
@@ -318,6 +720,15 @@ export function useChat() {
           errorUnlisten,
           noticeUnlisten,
           mcpActivityUnlisten,
+          planUnlisten,
+          thoughtUnlisten,
+          toolStartUnlisten,
+          approvalUnlisten,
+          toolResultUnlisten,
+          compactUnlisten,
+          agentNoticeUnlisten,
+          agentErrorUnlisten,
+          agentDoneUnlisten,
         );
       }
     };
@@ -422,7 +833,7 @@ export function useChat() {
       setFinishReason(null);
       setLiveBytes(0);
       setStartedAtMs(now);
-      activeRequest.current = { requestId, sessionId };
+      activeRequest.current = { requestId, sessionId, mode: "chat" };
       streamStartedAt.current = Date.now();
 
       try {
@@ -469,20 +880,177 @@ export function useChat() {
     [],
   );
 
+  const sendAgent = useCallback(
+    async (text: string, options: AgentSendOptions) => {
+      const trimmed = text.trim();
+      if (!trimmed || activeRequest.current) return false;
+
+      const requestedSessionId = activeIdRef.current;
+      const session =
+        sessionsRef.current.find(
+          (candidate) => candidate.id === requestedSessionId,
+        ) ?? sessionsRef.current[0];
+      if (!session) return false;
+      const sessionId = session.id;
+      if (sessionId !== requestedSessionId) setActiveId(sessionId);
+
+      const requestId = uid();
+      const now = Date.now();
+      const userMessage: ChatMessage = {
+        id: uid(),
+        role: "user",
+        content: trimmed,
+        reasoning: "",
+        created_at: now,
+      };
+      const trace: AgentTrace = {
+        run_id: requestId,
+        status: "running",
+        iterations: 0,
+        max_iterations: Math.min(25, Math.max(1, options.agent.maxIterations)),
+        plan: [],
+        steps: [],
+        compactions: [],
+        pending: null,
+        live_text: "",
+        live_reasoning: "",
+        notice: null,
+        error: null,
+        undo_available: false,
+        undone: false,
+        undo_error: null,
+        undo_summary: null,
+        started_at: now,
+        finished_at: null,
+      };
+      const assistantMessage: ChatMessage = {
+        id: requestId,
+        role: "assistant",
+        content: "",
+        reasoning: "",
+        created_at: now,
+        agentTrace: trace,
+      };
+
+      // The Rust loop appends the goal itself; only prior turns are history.
+      const history = session.messages
+        .slice(-Math.max(1, options.contextPrefetch) * 2)
+        .filter(
+          (message) =>
+            (message.role === "user" || message.role === "assistant") &&
+            message.content.trim().length > 0,
+        )
+        .map((message) => ({
+          role: message.role,
+          content: message.content,
+        }));
+
+      setSessions((previous) =>
+        previous.map((candidate) =>
+          candidate.id === sessionId
+            ? {
+                ...candidate,
+                title:
+                  candidate.messages.length === 0
+                    ? trimmed.slice(0, 56)
+                    : candidate.title,
+                updated_at: now,
+                messages: [...candidate.messages, userMessage, assistantMessage],
+              }
+            : candidate,
+        ),
+      );
+      options.onAccepted?.();
+      setStreaming(true);
+      setStreamingSessionId(sessionId);
+      setError(null);
+      setUsage(null);
+      setElapsedMs(null);
+      setFirstTokenMs(null);
+      setFinishReason(null);
+      setLiveBytes(0);
+      setStartedAtMs(now);
+      activeRequest.current = { requestId, sessionId, mode: "agent" };
+      streamStartedAt.current = Date.now();
+
+      try {
+        await api.startAgent({
+          run_id: requestId,
+          conversation_id: sessionId,
+          goal: trimmed,
+          history,
+          system_prompt: options.systemPrompt || null,
+          temperature: options.temperature,
+          top_p: options.topP,
+          top_k: Math.round(Math.min(100, Math.max(1, options.topK))),
+          min_p: options.minP,
+          repeat_penalty: options.repeatPenalty,
+          thinking: options.thinking,
+          max_tokens: options.maxTokens,
+          max_iterations: trace.max_iterations,
+          approval_policy: options.agent.approvalPolicy,
+          workspace_root: options.agent.workspaceRoot.trim(),
+          planning_step: options.agent.planningStep,
+          auto_compact: options.agent.autoCompact,
+          compaction_threshold: Math.min(
+            0.9,
+            Math.max(0.5, options.agent.compactionThreshold),
+          ),
+          web_search: options.webSearch,
+          mcp_servers: options.mcpServers ?? [],
+        });
+      } catch (err) {
+        const message = errorMessage(err);
+        setError(message);
+        setStreaming(false);
+        setStreamingSessionId(null);
+        activeRequest.current = null;
+        setSessions((previous) =>
+          previous.map((candidate) =>
+            candidate.id === sessionId
+              ? {
+                  ...candidate,
+                  messages: candidate.messages.map((item) =>
+                    item.id === requestId && item.agentTrace
+                      ? {
+                          ...item,
+                          agentTrace: {
+                            ...item.agentTrace,
+                            status: "error",
+                            error: message,
+                            finished_at: Date.now(),
+                          },
+                        }
+                      : item,
+                  ),
+                }
+              : candidate,
+          ),
+        );
+      }
+      return true;
+    },
+    [],
+  );
+
   const stop = useCallback(async () => {
     const request = activeRequest.current;
     if (!request) return;
     try {
-      await api.cancelChat(request.requestId);
+      await cancelRequest(request);
     } catch (err) {
       setError(errorMessage(err));
+      if (request.mode === "agent") {
+        setStreaming(false);
+        setStreamingSessionId(null);
+      }
     }
   }, []);
 
   const clear = useCallback(async () => {
     if (activeRequest.current) {
       try {
-        await api.cancelChat(activeRequest.current.requestId);
+        await cancelRequest(activeRequest.current);
       } catch {
         // The request may have completed between the click and the cancel.
       }
@@ -520,7 +1088,7 @@ export function useChat() {
   const deleteChat = useCallback(async (id: string) => {
     if (activeRequest.current?.sessionId === id) {
       try {
-        await api.cancelChat(activeRequest.current.requestId);
+        await cancelRequest(activeRequest.current);
       } catch {
         // ignore
       }
@@ -554,6 +1122,51 @@ export function useChat() {
     );
   }, []);
 
+  const updateTraceByRun = useCallback(
+    (runId: string, updater: (trace: AgentTrace) => AgentTrace) => {
+      setSessions((previous) =>
+        previous.map((session) => ({
+          ...session,
+          messages: session.messages.map((message) =>
+            message.agentTrace?.run_id === runId
+              ? { ...message, agentTrace: updater(message.agentTrace) }
+              : message,
+          ),
+        })),
+      );
+    },
+    [],
+  );
+
+  const undoAgent = useCallback(
+    async (runId: string) => {
+      updateTraceByRun(runId, (trace) => ({
+        ...trace,
+        undo_error: null,
+      }));
+      try {
+        const result = await api.undoAgent(runId);
+        updateTraceByRun(runId, (trace) => ({
+          ...trace,
+          undone: true,
+          undo_error: null,
+          undo_summary: undoSummary(result),
+        }));
+        return result;
+      } catch (err) {
+        const message = errorMessage(err);
+        // Keep undo available after a refusal (for example while another run
+        // holds the workspace) so the user can stop that run and retry.
+        updateTraceByRun(runId, (trace) => ({
+          ...trace,
+          undo_error: message,
+        }));
+        throw err;
+      }
+    },
+    [updateTraceByRun],
+  );
+
   const activeSession =
     sessions.find((session) => session.id === activeId) ?? sessions[0];
   const messages = activeSession?.messages ?? [];
@@ -576,6 +1189,8 @@ export function useChat() {
     streamStartedAt,
     setActiveId,
     send,
+    sendAgent,
+    undoAgent,
     stop,
     clear,
     newChat,

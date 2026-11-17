@@ -1,8 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import {
+  Bot,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   Cpu,
+  FolderOpen,
   HardDrive,
   Loader2,
   MemoryStick,
@@ -11,14 +14,16 @@ import {
   SlidersHorizontal,
   Sparkles,
   Trash2,
+  X,
   Zap,
 } from "lucide-react";
 
 import { cn } from "../../lib/cn";
-import { formatBytes } from "../../lib/format";
+import { basename, formatBytes } from "../../lib/format";
 import { useBackendCapabilities } from "../../hooks/useBackendCapabilities";
 import { SAMPLING_PARAMETERS } from "../../lib/backendCapabilities";
 import type {
+  AgentPreferences,
   AppSettings,
   ChatUsage,
   EngineKind,
@@ -49,6 +54,12 @@ interface EnginePanelProps {
   onApplyEngineSettings: (patch: Partial<AppSettings>) => Promise<void>;
   onRestartEngine: () => Promise<void>;
   onReset: (runtime: Partial<AppSettings>) => Promise<void>;
+  agentPreferences: AgentPreferences;
+  onAgentUpdate: <K extends keyof AgentPreferences>(
+    key: K,
+    value: AgentPreferences[K],
+  ) => void;
+  onPickWorkspace: () => Promise<void>;
   systemPrompt: string;
   onSystemPromptChange: (value: string) => void;
   usage: ChatUsage | null;
@@ -134,6 +145,9 @@ export function EnginePanel({
   onApplyEngineSettings,
   onRestartEngine,
   onReset,
+  agentPreferences,
+  onAgentUpdate,
+  onPickWorkspace,
   systemPrompt,
   onSystemPromptChange,
   usage,
@@ -413,6 +427,12 @@ export function EnginePanel({
             description="Request response_format: json_object so the reply is valid JSON."
           />
         </section>
+
+        <AgentConfiguration
+          preferences={agentPreferences}
+          onUpdate={onAgentUpdate}
+          onPickWorkspace={onPickWorkspace}
+        />
 
         <section className="space-y-3">
           <SectionTitle>Context</SectionTitle>
@@ -836,6 +856,150 @@ function LlamaRuntimeSection({
             value={`${Math.round(telemetry.kv_cache_usage * 100)}%`}
           />
           <Metric label="RSS" value={formatBytes(telemetry.rss_bytes)} />
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function AgentConfiguration({
+  preferences,
+  onUpdate,
+  onPickWorkspace,
+}: {
+  preferences: AgentPreferences;
+  onUpdate: <K extends keyof AgentPreferences>(
+    key: K,
+    value: AgentPreferences[K],
+  ) => void;
+  onPickWorkspace: () => Promise<void>;
+}) {
+  const [open, setOpen] = useState(true);
+
+  return (
+    <section className="space-y-3">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        className="flex w-full items-center gap-2 text-left"
+        aria-expanded={open}
+      >
+        <SectionTitle>Agent configuration</SectionTitle>
+        <Bot className="h-3 w-3 shrink-0 text-acid-500/60" />
+        <ChevronDown
+          className={cn(
+            "h-3 w-3 shrink-0 text-slate-600 transition",
+            !open && "-rotate-90",
+          )}
+        />
+      </button>
+
+      {open ? (
+        <div className="space-y-3">
+          <Slider
+            label="Max iterations"
+            value={preferences.maxIterations}
+            min={1}
+            max={25}
+            step={1}
+            onChange={(value) => onUpdate("maxIterations", Math.round(value))}
+            formatValue={(value) => `${Math.round(value)} steps`}
+            leftHint="1 · single step"
+            rightHint="25 · long tasks"
+            description="Hard stop for the Think → Act → Observe loop."
+          />
+
+          <label className="block space-y-1">
+            <span className="block text-[10px] text-slate-500">Approval policy</span>
+            <select
+              value={preferences.approvalPolicy}
+              onChange={(event) =>
+                onUpdate(
+                  "approvalPolicy",
+                  event.target.value as AgentPreferences["approvalPolicy"],
+                )
+              }
+              className="field !px-2 !py-1.5 text-[10.5px]"
+            >
+              <option value="destructive">Ask for destructive actions</option>
+              <option value="all">Ask for all tools</option>
+              <option value="auto">Full auto</option>
+            </select>
+            <span className="block text-[10px] leading-4 text-slate-600">
+              {preferences.approvalPolicy === "auto"
+                ? "Every tool runs without pausing. Use only in a workspace you trust."
+                : preferences.approvalPolicy === "all"
+                  ? "Every tool call pauses for Approve, Reject or Abort."
+                  : "Read-only tools run automatically; writes, shell commands and MCP mutations pause."}
+            </span>
+          </label>
+
+          <div className="space-y-1.5">
+            <span className="block text-[10px] text-slate-500">Workspace root</span>
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => void onPickWorkspace()}
+                className={cn(
+                  "inline-flex h-8 min-w-0 flex-1 items-center gap-1.5 rounded-lg border px-2 text-[10px] transition",
+                  preferences.workspaceRoot
+                    ? "border-white/10 bg-white/[0.03] text-slate-300 hover:bg-white/[0.06]"
+                    : "border-dashed border-white/15 bg-transparent text-slate-500 hover:text-slate-300",
+                )}
+                title={preferences.workspaceRoot || "Choose a workspace folder"}
+              >
+                <FolderOpen className="h-3 w-3 shrink-0" />
+                <span className="truncate">
+                  {preferences.workspaceRoot
+                    ? basename(preferences.workspaceRoot)
+                    : "Choose a workspace folder…"}
+                </span>
+              </button>
+              {preferences.workspaceRoot ? (
+                <button
+                  type="button"
+                  onClick={() => onUpdate("workspaceRoot", "")}
+                  className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-white/10 bg-white/5 text-slate-500 transition hover:text-rose-300"
+                  aria-label="Clear the agent workspace root"
+                  title="Clear the workspace root"
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              ) : null}
+            </div>
+            <p className="break-all font-mono text-[9px] leading-4 text-slate-600">
+              {preferences.workspaceRoot ||
+                "File, search and shell tools stay disabled until a folder is chosen. MCP tools still work."}
+            </p>
+          </div>
+
+          <Toggle
+            checked={preferences.planningStep}
+            onChange={(value) => onUpdate("planningStep", value)}
+            label="Planning step"
+            description="Ask for a numbered <plan> checklist before the first tool call."
+          />
+
+          <Toggle
+            checked={preferences.autoCompact}
+            onChange={(value) => onUpdate("autoCompact", value)}
+            label="Auto-compact context"
+            description="Summarise older steps into <agent_memory> when the window fills up."
+          />
+
+          <Slider
+            label="Compaction threshold"
+            value={Math.round(preferences.compactionThreshold * 100)}
+            min={50}
+            max={90}
+            step={1}
+            disabled={!preferences.autoCompact}
+            onChange={(value) => onUpdate("compactionThreshold", value / 100)}
+            formatValue={(value) => `${Math.round(value)}%`}
+            leftHint="50% · early"
+            rightHint="90% · late"
+            description="Share of the active model's n_ctx that triggers compaction."
+          />
         </div>
       ) : null}
     </section>

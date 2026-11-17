@@ -1009,16 +1009,18 @@ const MAX_TOOL_CALLS: usize = 8;
 const MAX_TOOL_ROUNDS: usize = 6;
 
 #[derive(Debug, Clone, Default)]
-struct ToolCallDraft {
-    id: String,
-    name: String,
-    arguments: String,
+pub(crate) struct ToolCallDraft {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) arguments: String,
 }
 
+/// Shared with `agent.rs`: the agent loop speaks the same stream format and
+/// reuses this accumulator instead of growing a second parser.
 #[derive(Debug, Default)]
-struct StreamRound {
-    content: String,
-    tool_calls: Vec<ToolCallDraft>,
+pub(crate) struct StreamRound {
+    pub(crate) content: String,
+    pub(crate) tool_calls: Vec<ToolCallDraft>,
     finish_reason: String,
     usage: Option<serde_json::Value>,
     malformed: usize,
@@ -1032,13 +1034,13 @@ enum PayloadOutcome {
 }
 
 #[derive(Default)]
-struct PayloadBatch {
-    deltas: Vec<(String, String)>,
-    done: bool,
-    error: Option<String>,
+pub(crate) struct PayloadBatch {
+    pub(crate) deltas: Vec<(String, String)>,
+    pub(crate) done: bool,
+    pub(crate) error: Option<String>,
 }
 
-enum SseItem {
+pub(crate) enum SseItem {
     Data(String),
     Warning(String),
 }
@@ -1048,14 +1050,14 @@ enum SseItem {
 /// fields, and also accepts newline-delimited raw JSON from servers that do not
 /// implement SSE framing. Nothing here indexes a string by byte offset.
 #[derive(Default)]
-struct SseDecoder {
+pub(crate) struct SseDecoder {
     buffer: Vec<u8>,
     data: String,
     warned_overflow: bool,
 }
 
 impl SseDecoder {
-    fn feed(&mut self, chunk: &[u8]) -> Vec<SseItem> {
+    pub(crate) fn feed(&mut self, chunk: &[u8]) -> Vec<SseItem> {
         let mut items = Vec::new();
         self.buffer.extend_from_slice(chunk);
 
@@ -1079,7 +1081,7 @@ impl SseDecoder {
         items
     }
 
-    fn finish(&mut self) -> Vec<SseItem> {
+    pub(crate) fn finish(&mut self) -> Vec<SseItem> {
         let mut items = Vec::new();
         if !self.buffer.is_empty() {
             let line = String::from_utf8_lossy(&self.buffer).to_string();
@@ -1135,7 +1137,7 @@ impl SseDecoder {
     }
 }
 
-fn drain_payloads(items: Vec<SseItem>, round: &mut StreamRound) -> PayloadBatch {
+pub(crate) fn drain_payloads(items: Vec<SseItem>, round: &mut StreamRound) -> PayloadBatch {
     let mut batch = PayloadBatch::default();
     for item in items {
         match item {
@@ -1359,7 +1361,7 @@ fn tool_schema_tokens(tools: &[serde_json::Value]) -> usize {
 /// Conservative token count for the retry path. ASCII text is treated as three
 /// characters per token; non-ASCII text is counted per character so CJK prompts
 /// are not underestimated.
-fn retry_text_tokens(text: &str) -> usize {
+pub(crate) fn retry_text_tokens(text: &str) -> usize {
     let mut ascii = 0usize;
     let mut wide = 0usize;
     for character in text.chars() {
@@ -1743,7 +1745,7 @@ fn run_tools(
     }
 }
 
-fn parse_tool_arguments(raw: &str) -> Result<serde_json::Value, String> {
+pub(crate) fn parse_tool_arguments(raw: &str) -> Result<serde_json::Value, String> {
     if raw.trim().is_empty() {
         return Ok(serde_json::json!({}));
     }

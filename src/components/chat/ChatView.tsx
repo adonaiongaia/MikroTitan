@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   AlertTriangle,
@@ -12,6 +12,7 @@ import {
 
 import type { ChatController } from "../../hooks/useChat";
 import type { EngineController } from "../../hooks/useEngine";
+import { useAgentPreferences } from "../../hooks/useAgentPreferences";
 import {
   DEFAULT_ENGINE_PREFERENCES,
   useEnginePreferences,
@@ -35,6 +36,7 @@ import type {
 } from "../../types";
 import { Logo } from "../Logo";
 import { Button } from "../ui/Button";
+import type { AgentActions } from "./AgentTrace";
 import { Composer, type ComposerImage } from "./Composer";
 import { EnginePanel } from "./EnginePanel";
 import { McpLogDrawer } from "./McpLogDrawer";
@@ -69,6 +71,7 @@ const SUGGESTIONS = [
 export function ChatView({ engine, chat }: ChatViewProps) {
   const { settings, save } = useSettings();
   const { preferences, update, setPreferences } = useEnginePreferences();
+  const agent = useAgentPreferences();
   const memory = useMemory();
   const telemetry = useTelemetry(engine.snapshot.pid, true);
 
@@ -223,6 +226,61 @@ export function ChatView({ engine, chat }: ChatViewProps) {
     }
   }, [attachProject, chat]);
 
+  // The path picker only chooses a folder; Rust canonicalises it and enforces
+  // it as the sandbox root for every built-in tool.
+  const pickWorkspace = useCallback(async () => {
+    try {
+      const picked = await open({ multiple: false, directory: true });
+      if (typeof picked === "string") agent.update("workspaceRoot", picked);
+    } catch (err) {
+      chat.setError(errorMessage(err));
+    }
+  }, [agent, chat]);
+
+  const agentActions = useMemo<AgentActions>(
+    () => ({
+      approve: async (runId, stepId) => {
+        try {
+          await api.resolveAgentApproval({
+            run_id: runId,
+            step_id: stepId,
+            decision: "approve",
+            feedback: "",
+          });
+        } catch (err) {
+          chat.setError(errorMessage(err));
+        }
+      },
+      reject: async (runId, stepId, feedback) => {
+        try {
+          await api.resolveAgentApproval({
+            run_id: runId,
+            step_id: stepId,
+            decision: "reject",
+            feedback,
+          });
+        } catch (err) {
+          chat.setError(errorMessage(err));
+        }
+      },
+      abort: async (runId) => {
+        try {
+          await api.abortAgent(runId);
+        } catch (err) {
+          chat.setError(errorMessage(err));
+        }
+      },
+      undo: async (runId) => {
+        try {
+          await chat.undoAgent(runId);
+        } catch {
+          // useChat records the failure on the run's trace.
+        }
+      },
+    }),
+    [chat],
+  );
+
   // A folder dropped anywhere on the window is ingested without a dialog.
   useEffect(() => {
     let cancelled = false;
@@ -318,7 +376,9 @@ export function ChatView({ engine, chat }: ChatViewProps) {
     let citations: Citation[] | undefined;
     let extraContext = project?.bundle ?? "";
 
-    if (preferences.internet) {
+    // In Agent Mode the agent decides when to search; pre-fetching here would
+    // hide the tool call from the trace.
+    if (preferences.internet && !agent.preferences.enabled) {
       setActivity(`Searching DuckDuckGo for “${text.slice(0, 64)}”…`);
       try {
         const search = await api.webSearch(text, 3);
@@ -354,12 +414,53 @@ export function ChatView({ engine, chat }: ChatViewProps) {
           .join("\n")}`
       : "";
 
+    const combinedSystemPrompt = [CORE_SYSTEM_PROMPT, systemPrompt, memoryBlock]
+      .filter(Boolean)
+      .join("\n\n");
+    const mcpInputs = mcpServers
+      .filter((server) => server.enabled && server.command.trim())
+      .map((server) => ({
+        name: server.name,
+        command: server.command,
+        args: server.args,
+        env: server.env ?? "",
+        cwd: server.cwd ?? "",
+      }));
+
     setActivity(null);
+    if (agent.preferences.enabled) {
+      try {
+        await chat.sendAgent(text, {
+          systemPrompt: combinedSystemPrompt,
+          temperature: preferences.temperature,
+          topP: preferences.topP,
+          topK: preferences.topK ?? 40,
+          minP: preferences.minP,
+          repeatPenalty: preferences.repeatPenalty,
+          thinking: preferences.thinking,
+          structuredOutput: preferences.structuredOutput,
+          contextPrefetch: preferences.contextPrefetch,
+          maxTokens: preferences.maxTokens,
+          contextWindow: contextMax,
+          images: [],
+          extraContext: "",
+          mcpServers: mcpInputs,
+          agent: agent.preferences,
+          webSearch: preferences.internet,
+          onAccepted: () => {
+            setInput("");
+            setImages([]);
+          },
+        });
+      } catch (err) {
+        chat.setError(errorMessage(err));
+      }
+      return;
+    }
+
     try {
       await chat.send(text, {
-        systemPrompt: [CORE_SYSTEM_PROMPT, systemPrompt, memoryBlock]
-          .filter(Boolean)
-          .join("\n\n"),
+        systemPrompt: combinedSystemPrompt,
         temperature: preferences.temperature,
         topP: preferences.topP,
         topK: preferences.topK ?? 40,
@@ -374,15 +475,7 @@ export function ChatView({ engine, chat }: ChatViewProps) {
         images: images.map((image) => image.data_url),
         extraContext,
         citations,
-        mcpServers: mcpServers
-          .filter((server) => server.enabled && server.command.trim())
-          .map((server) => ({
-            name: server.name,
-            command: server.command,
-            args: server.args,
-            env: server.env ?? "",
-            cwd: server.cwd ?? "",
-          })),
+        mcpServers: mcpInputs,
         onAccepted: () => {
           setInput("");
           setImages([]);
@@ -392,6 +485,7 @@ export function ChatView({ engine, chat }: ChatViewProps) {
       chat.setError(errorMessage(err));
     }
   }, [
+    agent.preferences,
     chat,
     contextMax,
     images,
@@ -570,6 +664,7 @@ export function ChatView({ engine, chat }: ChatViewProps) {
                         message.role === "assistant"
                       }
                       onDelete={chat.deleteMessage}
+                      agentActions={agentActions}
                     />
                   </MessageBoundary>
                 ))}
@@ -590,6 +685,8 @@ export function ChatView({ engine, chat }: ChatViewProps) {
           contextMax={contextMax}
           internet={preferences.internet}
           onInternetChange={(value) => update("internet", value)}
+          agentMode={agent.preferences.enabled}
+          onAgentModeChange={(value) => agent.update("enabled", value)}
           images={images}
           onAddImages={setImages}
           onRemoveImage={(index) =>
@@ -637,6 +734,9 @@ export function ChatView({ engine, chat }: ChatViewProps) {
         onApplyEngineSettings={applyEngineSettings}
         onRestartEngine={restartEngine}
         onReset={resetEnginePanel}
+        agentPreferences={agent.preferences}
+        onAgentUpdate={agent.update}
+        onPickWorkspace={pickWorkspace}
         systemPrompt={systemPrompt}
         onSystemPromptChange={setSystemPrompt}
         usage={chat.usage}

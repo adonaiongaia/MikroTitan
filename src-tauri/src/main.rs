@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agent;
 mod converter;
 mod capabilities;
 mod engine;
@@ -302,6 +303,9 @@ fn main() {
             app.manage(provisioner.clone());
             app.manage(Arc::new(ConverterManager::new()));
             app.manage(Arc::new(DownloadManager::new()));
+            app.manage(Arc::new(agent::AgentManager::with_checkpoints(
+                data_dir.join("agent-checkpoints"),
+            )));
 
             // Provisioning is intentionally silent and off the UI thread. The
             // report is available immediately via get_engine_setup_status and
@@ -362,6 +366,11 @@ fn main() {
             engines::binary::probe_managed_binary,
             provision::get_engine_setup_status,
             provision::rerun_engine_setup,
+            agent::agent_start,
+            agent::agent_resolve_approval,
+            agent::agent_abort,
+            agent::agent_undo,
+            agent::agent_undo_availability,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Janas Studio");

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   ArrowUp,
+  Bot,
   FolderOpen,
   Globe,
   ImagePlus,
@@ -31,6 +32,8 @@ interface ComposerProps {
   contextMax: number;
   internet: boolean;
   onInternetChange: (value: boolean) => void;
+  agentMode: boolean;
+  onAgentModeChange: (value: boolean) => void;
   images: ComposerImage[];
   onAddImages: (images: ComposerImage[]) => void;
   onRemoveImage: (index: number) => void;
@@ -73,6 +76,8 @@ export function Composer({
   contextMax,
   internet,
   onInternetChange,
+  agentMode,
+  onAgentModeChange,
   images,
   onAddImages,
   onRemoveImage,
@@ -242,9 +247,11 @@ export function Composer({
             }}
             placeholder={
               ready
-                ? internet
-                  ? "Ask the model, and it will read the web first…"
-                  : "Message your local model…"
+                ? agentMode
+                  ? "Assign a task to your local agent…"
+                  : internet
+                    ? "Ask the model, and it will read the web first…"
+                    : "Message your local model…"
                 : "Start the Janas engine to begin chatting"
             }
             className="max-h-[220px] min-h-[52px] w-full resize-none bg-transparent px-3 py-2.5 text-[13.5px] leading-6 text-slate-100 outline-none placeholder:text-slate-600 disabled:cursor-not-allowed"
@@ -264,9 +271,13 @@ export function Composer({
                 }}
               />
               <IconButton
-                label="Attach images"
+                label={
+                  agentMode
+                    ? "Image attachments are not available in Agent Mode"
+                    : "Attach images"
+                }
                 onClick={() => fileRef.current?.click()}
-                disabled={images.length >= 4}
+                disabled={images.length >= 4 || agentMode}
               >
                 <ImagePlus className="h-3.5 w-3.5" />
               </IconButton>
@@ -277,6 +288,21 @@ export function Composer({
               >
                 <FolderOpen className="h-3.5 w-3.5" />
               </IconButton>
+              <button
+                type="button"
+                onClick={() => onAgentModeChange(!agentMode)}
+                className={cn(
+                  "inline-flex h-7 items-center gap-1.5 rounded-lg border px-2 text-[10px] transition",
+                  agentMode
+                    ? "border-acid-400/40 bg-acid-400/10 text-acid-200 shadow-glow"
+                    : "border-white/10 bg-white/5 text-slate-500 hover:text-slate-300",
+                )}
+                aria-pressed={agentMode}
+                title="Let the local agent plan, call tools and report each step"
+              >
+                <Bot className="h-3 w-3" />
+                {agentMode ? "Agent on" : "Agent"}
+              </button>
               <button
                 type="button"
                 onClick={() => onInternetChange(!internet)}
@@ -329,9 +355,10 @@ export function Composer({
 
         <div className="mt-1.5 flex items-center justify-between text-[9.5px] text-slate-600">
           <span>
-            Enter to send · Shift + Enter for a new line ·{" "}
+            {agentMode ? "Enter to assign · " : "Enter to send · "}
+            Shift + Enter for a new line ·{" "}
             <span className="text-acid-500/80">
-              {ready ? "local engine" : "engine offline"}
+              {agentMode ? "agent workspace" : ready ? "local engine" : "engine offline"}
             </span>
           </span>
           <span className="font-mono">

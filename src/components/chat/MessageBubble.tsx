@@ -7,11 +7,13 @@ import { api } from "../../lib/api";
 import { errorMessage } from "../../lib/format";
 import type { ChatMessage, Citation } from "../../types";
 import { Logo } from "../Logo";
+import { AgentTraceView, type AgentActions } from "./AgentTrace";
 
 interface MessageBubbleProps {
   message: ChatMessage;
   streaming: boolean;
   onDelete?: (id: string) => void;
+  agentActions?: AgentActions;
 }
 
 function safeCitations(citations: Citation[] | undefined): Citation[] {
@@ -45,6 +47,7 @@ export function MessageBubble({
   message,
   streaming,
   onDelete,
+  agentActions,
 }: MessageBubbleProps) {
   const [copied, setCopied] = useState(false);
   const [linkError, setLinkError] = useState<string | null>(null);
@@ -53,7 +56,8 @@ export function MessageBubble({
   const reasoning =
     typeof message.reasoning === "string" ? message.reasoning : "";
   const citations = safeCitations(message.citations);
-  const empty = !content && !reasoning;
+  const trace = message.agentTrace ?? null;
+  const empty = !content && !reasoning && !trace;
 
   const copy = async () => {
     try {
@@ -148,6 +152,14 @@ export function MessageBubble({
           ) : null}
         </div>
 
+        {trace && agentActions ? (
+          <AgentTraceView
+            trace={trace}
+            streaming={streaming && trace.status === "running"}
+            actions={agentActions}
+          />
+        ) : null}
+
         {reasoning ? (
           <details className="mb-3 rounded-xl border border-white/5 bg-white/[0.02] px-3 py-2">
             <summary className="cursor-pointer select-none text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-500 transition hover:text-slate-400">
@@ -165,7 +177,7 @@ export function MessageBubble({
             <span className="h-1.5 w-1.5 animate-pulse-soft rounded-full bg-acid-400 [animation-delay:150ms]" />
             <span className="h-1.5 w-1.5 animate-pulse-soft rounded-full bg-acid-400 [animation-delay:300ms]" />
           </div>
-        ) : (
+        ) : !content && trace ? null : (
           <div className="md">
             <ReactMarkdown
               remarkPlugins={[remarkGfm]}
@@ -229,7 +241,9 @@ export function MessageBubble({
           <p className="mt-1.5 text-[10px] text-rose-300">{linkError}</p>
         ) : null}
 
-        {!streaming ? <div className="mt-2 flex items-center gap-1">{actions}</div> : null}
+        {!streaming && (content || reasoning || trace) ? (
+          <div className="mt-2 flex items-center gap-1">{actions}</div>
+        ) : null}
       </div>
     </div>
   );
