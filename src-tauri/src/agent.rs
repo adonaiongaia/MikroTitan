@@ -27,7 +27,10 @@ use tauri::{AppHandle, Emitter, State};
 
 mod checkpoint;
 
-use checkpoint::{CheckpointStore, RunCheckpoint, RunRecorder};
+use checkpoint::{
+    CheckpointStore, FileUndoEntry, FileUndoState, RunCheckpoint, RunRecorder, UndoAction,
+    UndoAttempt, UndoOutcome,
+};
 
 use crate::{
     engine::{
@@ -851,20 +854,44 @@ pub fn agent_abort(manager: State<'_, Arc<AgentManager>>, run_id: String) -> App
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct AgentUndoResult {
-    pub restored: u32,
-    pub deleted: u32,
-    pub skipped: Vec<String>,
-    pub incomplete: bool,
+#[derive(Clone)]
+enum UndoScope {
+    All,
+    File(String),
+    Keep(String),
 }
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn agent_undo(
     manager: State<'_, Arc<AgentManager>>,
     run_id: String,
-) -> AppResult<AgentUndoResult> {
-    let manager = manager.inner().clone();
+) -> AppResult<UndoOutcome> {
+    undo_scope(manager.inner().as_ref(), run_id, UndoScope::All).await
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn agent_undo_file(
+    manager: State<'_, Arc<AgentManager>>,
+    run_id: String,
+    path: String,
+) -> AppResult<UndoOutcome> {
+    undo_scope(manager.inner().as_ref(), run_id, UndoScope::File(path)).await
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn agent_keep_file(
+    manager: State<'_, Arc<AgentManager>>,
+    run_id: String,
+    path: String,
+) -> AppResult<UndoOutcome> {
+    undo_scope(manager.inner().as_ref(), run_id, UndoScope::Keep(path)).await
+}
+
+async fn undo_scope(
+    manager: &AgentManager,
+    run_id: String,
+    scope: UndoScope,
+) -> AppResult<UndoOutcome> {
     if manager.control(&run_id).is_some() {
         return Err(AppError::message(
             "Stop the agent run before undoing its changes.",
@@ -878,7 +905,13 @@ pub async fn agent_undo(
                 manager.begin_undo(workspace)?;
             }
             let id = run_id.clone();
-            let result = tauri::async_runtime::spawn_blocking(move || store.undo(&id)).await;
+            let requested = scope.clone();
+            let result = tauri::async_runtime::spawn_blocking(move || match requested {
+                UndoScope::All => store.undo(&id),
+                UndoScope::File(path) => store.undo_path(&id, &path),
+                UndoScope::Keep(path) => store.keep_path(&id, &path),
+            })
+            .await;
             if let Some(workspace) = undo_workspace.as_ref() {
                 manager.end_undo(workspace);
             }
@@ -887,14 +920,17 @@ pub async fn agent_undo(
                     AppError::message(format!("The undo task stopped: {error}"))
                 })?
                 .map_err(AppError::message)?;
-            manager.forget_journal(&run_id);
-            return Ok(AgentUndoResult {
-                restored: outcome.restored,
-                deleted: outcome.deleted,
-                skipped: outcome.skipped,
-                incomplete: outcome.incomplete,
-            });
+            if outcome.complete {
+                manager.forget_journal(&run_id);
+            }
+            return Ok(outcome);
         }
+    }
+
+    if !matches!(scope, UndoScope::All) {
+        return Err(AppError::message(
+            "This run has no per-file undo state. Restore all of its changes instead.",
+        ));
     }
 
     // The journal fallback covers runs without a checkpoint; it must take the
@@ -927,6 +963,21 @@ pub fn agent_undo_availability(
     run_ids: Vec<String>,
 ) -> Vec<String> {
     manager.available_undo_ids(&run_ids)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn agent_undo_state(
+    manager: State<'_, Arc<AgentManager>>,
+    run_id: String,
+) -> AppResult<UndoOutcome> {
+    let store = manager
+        .inner()
+        .checkpoint_store()
+        .ok_or_else(|| AppError::message("Workspace checkpoints are unavailable."))?;
+    tauri::async_runtime::spawn_blocking(move || store.state(&run_id))
+        .await
+        .map_err(|error| AppError::message(format!("The undo state task stopped: {error}")))?
+        .map_err(AppError::message)
 }
 
 // ---------------------------------------------------------------------------
@@ -2765,12 +2816,17 @@ fn line_diff(before: &str, after: &str) -> (String, u32, u32, bool) {
 /// Restores the pre-images captured by a run. A file is only touched when its
 /// current contents match what the agent left behind, so edits made after the
 /// run are never silently overwritten.
-fn undo_journal(journal: &RunJournal) -> AgentUndoResult {
+fn undo_journal(journal: &RunJournal) -> UndoOutcome {
     let (root, changes, complete) = journal.take_snapshot();
-    let mut result = AgentUndoResult {
+    let at = undo_timestamp_ms();
+    let mut result = UndoOutcome {
         restored: 0,
         deleted: 0,
-        skipped: Vec::new(),
+        files: Vec::new(),
+        pending: 0,
+        // The journal is consumed by this call, so nothing can be retried even
+        // when a file had to be skipped. Its reason stays in `files`.
+        complete: true,
         incomplete: !complete,
     };
     let Some(root) = root else {
@@ -2785,11 +2841,15 @@ fn undo_journal(journal: &RunJournal) -> AgentUndoResult {
             .display()
             .to_string();
         if !change.path.starts_with(&root) {
-            result.skipped.push(format!("{label}: outside the workspace"));
+            result
+                .files
+                .push(journal_skipped(&label, "outside the workspace".into(), at));
             continue;
         }
         let Some(parent) = change.path.parent() else {
-            result.skipped.push(format!("{label}: has no parent"));
+            result
+                .files
+                .push(journal_skipped(&label, "has no parent".into(), at));
             continue;
         };
         let parent_inside = std::fs::canonicalize(parent)
@@ -2797,8 +2857,12 @@ fn undo_journal(journal: &RunJournal) -> AgentUndoResult {
             .unwrap_or(false);
         if !parent_inside {
             result
-                .skipped
-                .push(format!("{label}: its directory moved outside the workspace"));
+                .files
+                .push(journal_skipped(
+                    &label,
+                    "its directory moved outside the workspace".into(),
+                    at,
+                ));
             continue;
         }
 
@@ -2806,27 +2870,27 @@ fn undo_journal(journal: &RunJournal) -> AgentUndoResult {
             Ok(metadata) => Some(metadata),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => {
-                result.skipped.push(format!("{label}: {error}"));
+                result.files.push(journal_skipped(&label, error.to_string(), at));
                 continue;
             }
         };
         if let Some(metadata) = &metadata {
             if metadata.file_type().is_symlink() {
                 result
-                    .skipped
-                    .push(format!("{label}: is now a symlink"));
+                    .files
+                    .push(journal_skipped(&label, "is now a symlink".into(), at));
                 continue;
             }
             if !metadata.is_file() {
                 result
-                    .skipped
-                    .push(format!("{label}: is no longer a regular file"));
+                    .files
+                    .push(journal_skipped(&label, "is no longer a regular file".into(), at));
                 continue;
             }
             if metadata.len() as usize != change.after.len() {
                 result
-                    .skipped
-                    .push(format!("{label}: changed since the run"));
+                    .files
+                    .push(journal_skipped(&label, "changed since the run".into(), at));
                 continue;
             }
         }
@@ -2835,29 +2899,55 @@ fn undo_journal(journal: &RunJournal) -> AgentUndoResult {
             Ok(bytes) => Some(bytes),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => {
-                result.skipped.push(format!("{label}: {error}"));
+                result.files.push(journal_skipped(&label, error.to_string(), at));
                 continue;
             }
         };
         if current.as_deref() != Some(change.after.as_slice()) {
             result
-                .skipped
-                .push(format!("{label}: changed since the run"));
+                .files
+                .push(journal_skipped(&label, "changed since the run".into(), at));
             continue;
         }
 
         match &change.before {
             Some(before) => match std::fs::write(&change.path, before) {
                 Ok(()) => result.restored += 1,
-                Err(error) => result.skipped.push(format!("{label}: {error}")),
+                Err(error) => result
+                    .files
+                    .push(journal_skipped(&label, error.to_string(), at)),
             },
             None => match std::fs::remove_file(&change.path) {
                 Ok(()) => result.deleted += 1,
-                Err(error) => result.skipped.push(format!("{label}: {error}")),
+                Err(error) => result
+                    .files
+                    .push(journal_skipped(&label, error.to_string(), at)),
             },
         }
     }
     result
+}
+
+fn journal_skipped(label: &str, reason: String, at: u64) -> FileUndoEntry {
+    FileUndoEntry {
+        path: label.to_string(),
+        state: FileUndoState::Skipped,
+        reason: Some(reason.clone()),
+        attempts: 1,
+        history: vec![UndoAttempt {
+            action: UndoAction::Restore,
+            state: FileUndoState::Skipped,
+            reason: Some(reason),
+            at,
+        }],
+    }
+}
+
+fn undo_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn require_workspace(workspace: Option<&Path>) -> Result<&Path, String> {
@@ -4233,7 +4323,7 @@ mod tests {
         let result = undo_journal(&journal);
         assert_eq!(result.restored, 1);
         assert_eq!(result.deleted, 1);
-        assert!(result.skipped.is_empty(), "{:?}", result.skipped);
+        assert!(result.files.is_empty(), "{:?}", result.files);
         assert!(!result.incomplete);
         assert_eq!(std::fs::read_to_string(&note).unwrap(), "before\n");
         assert!(!created.exists());
@@ -4256,8 +4346,13 @@ mod tests {
         let result = undo_journal(&journal);
         assert_eq!(result.restored, 0);
         assert_eq!(result.deleted, 1);
-        assert_eq!(result.skipped.len(), 1);
-        assert!(result.skipped[0].contains("changed since the run"));
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.files[0].state, FileUndoState::Skipped);
+        assert!(result.files[0]
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("changed since the run"));
         assert_eq!(std::fs::read_to_string(&note).unwrap(), "user edit\n");
         assert!(!created.exists());
         let _ = std::fs::remove_dir_all(&root);
@@ -4276,8 +4371,13 @@ mod tests {
         journal.record(&root, &link, Some(b"before\n".to_vec()), b"after\n".to_vec());
         let result = undo_journal(&journal);
         assert_eq!(result.restored, 0);
-        assert_eq!(result.skipped.len(), 1);
-        assert!(result.skipped[0].contains("symlink"));
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.files[0].state, FileUndoState::Skipped);
+        assert!(result.files[0]
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("symlink"));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "after\n");
         let _ = std::fs::remove_dir_all(&root);
     }

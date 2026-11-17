@@ -674,7 +674,7 @@ fn file_edits_preview_and_undo() {
     let result = undo_journal(&journal);
     assert_eq!(result.restored, 1);
     assert_eq!(result.deleted, 1);
-    assert!(result.skipped.is_empty(), "{:?}", result.skipped);
+    assert!(result.files.is_empty(), "{:?}", result.files);
     assert_eq!(
         std::fs::read_to_string(root.join("note.txt")).unwrap(),
         "before\n"

@@ -36,6 +36,7 @@ const MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: u64 = 1_500 * 1024 * 1024;
 const MAX_SNAPSHOT_FILES: usize = 50_000;
 const STALE_RUNNING_MS: u64 = 24 * 60 * 60 * 1000;
+const MAX_ATTEMPTS: usize = 20;
 
 const GIT_EXCLUDES: &str = "\
 .git/
@@ -107,16 +108,97 @@ struct RunMetadata {
     /// existed; those fall back to comparing against the final snapshot.
     #[serde(default)]
     attribution: Option<Vec<AttributedPath>>,
+    /// Per-file undo state, including the reason each attempt produced. Older
+    /// checkpoints leave this empty and seed it from `attribution` on first use.
+    #[serde(default)]
+    undo_files: Vec<FileUndoEntry>,
     /// Filled when a metadata file is read; never serialized.
     #[serde(skip, default)]
     path: PathBuf,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileUndoState {
+    /// Not attempted yet, or waiting after a retryable skip or failure.
+    Pending,
+    Restored,
+    Skipped,
+    Failed,
+    /// The user accepted their own edit, so the pre-image must not be applied.
+    Kept,
+}
+
+impl FileUndoState {
+    fn unresolved(self) -> bool {
+        matches!(self, Self::Pending | Self::Skipped | Self::Failed)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UndoAction {
+    Restore,
+    Keep,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UndoAttempt {
+    pub action: UndoAction,
+    pub state: FileUndoState,
+    /// Full explanation for the attempt, kept so a retry does not erase why an
+    /// earlier restore was skipped.
+    pub reason: Option<String>,
+    pub at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileUndoEntry {
+    pub path: String,
+    pub state: FileUndoState,
+    pub reason: Option<String>,
+    pub attempts: u32,
+    pub history: Vec<UndoAttempt>,
+}
+
+impl FileUndoEntry {
+    fn pending(path: String) -> Self {
+        Self {
+            path,
+            state: FileUndoState::Pending,
+            reason: None,
+            attempts: 0,
+            history: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, action: UndoAction, state: FileUndoState, reason: Option<String>, at: u64) {
+        self.state = state;
+        self.reason = reason.clone();
+        self.attempts = self.attempts.saturating_add(1);
+        self.history.push(UndoAttempt {
+            action,
+            state,
+            reason,
+            at,
+        });
+        if self.history.len() > MAX_ATTEMPTS {
+            let extra = self.history.len() - MAX_ATTEMPTS;
+            self.history.drain(0..extra);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct UndoOutcome {
     pub restored: u32,
     pub deleted: u32,
-    pub skipped: Vec<String>,
+    /// Every file the run changed, with its current state and history.
+    pub files: Vec<FileUndoEntry>,
+    /// Files that still need a restore or a keep decision.
+    pub pending: u32,
+    /// True once nothing is pending; the checkpoint is removed at that point.
+    pub complete: bool,
     pub incomplete: bool,
 }
 
@@ -215,6 +297,7 @@ impl CheckpointStore {
             changed_files: 0,
             status: MetadataStatus::Running,
             attribution: None,
+            undo_files: Vec::new(),
             path: PathBuf::new(),
         };
 
@@ -251,20 +334,81 @@ impl CheckpointStore {
     /// Restore a completed run by its persisted run id. This works from a new
     /// process because the metadata and Git objects live under app data.
     pub fn undo(&self, run_id: &str) -> Result<UndoOutcome, String> {
+        self.undo_selected(run_id, None)
+    }
+
+    /// Restore a single changed file. Files that were already restored or kept
+    /// are left alone, so a retry only touches what still needs it.
+    pub fn undo_path(&self, run_id: &str, path: &str) -> Result<UndoOutcome, String> {
+        self.undo_selected(run_id, Some(path))
+    }
+
+    /// Accept the user's own version of a file without changing it, resolving
+    /// that file's pending undo. The checkpoint is removed once the last file
+    /// is resolved this way.
+    pub fn keep_path(&self, run_id: &str, path: &str) -> Result<UndoOutcome, String> {
         let _guard = self
             .lock
             .lock()
             .map_err(|_| "The checkpoint store is locked.".to_string())?;
-        let metadata = self
-            .find_complete_locked(run_id)?
-            .ok_or_else(|| {
-                "No undo checkpoint is available for that run. It may have been removed by cleanup."
-                    .to_string()
-            })?;
-        let outcome = self.undo_metadata_locked(&metadata)?;
-        self.delete_entry_locked(&metadata);
-        let _ = self.cleanup_locked(None);
+        let mut metadata = self.complete_locked(run_id)?;
+        let entries = self.attributed_entries_locked(&metadata)?;
+        ensure_undo_files(&mut metadata, &entries);
+        let index = metadata
+            .undo_files
+            .iter()
+            .position(|file| file.path == path)
+            .ok_or_else(|| format!("{path} is not part of this run's undo set."))?;
+        match metadata.undo_files[index].state {
+            FileUndoState::Restored => {
+                return Err(format!("{path} was already restored by undo."));
+            }
+            FileUndoState::Kept => {
+                let outcome = outcome_from_files(metadata.undo_files.clone());
+                self.persist_outcome_locked(metadata, &outcome)?;
+                return Ok(outcome);
+            }
+            _ => {}
+        }
+        let at = now_ms();
+        metadata.undo_files[index].record(
+            UndoAction::Keep,
+            FileUndoState::Kept,
+            Some("kept your version; the file was left unchanged".to_string()),
+            at,
+        );
+        let outcome = outcome_from_files(metadata.undo_files.clone());
+        self.persist_outcome_locked(metadata, &outcome)?;
         Ok(outcome)
+    }
+
+    fn undo_selected(&self, run_id: &str, only: Option<&str>) -> Result<UndoOutcome, String> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| "The checkpoint store is locked.".to_string())?;
+        let mut metadata = self.complete_locked(run_id)?;
+        let outcome = self.undo_metadata_locked(&mut metadata, only)?;
+        self.persist_outcome_locked(metadata, &outcome)?;
+        Ok(outcome)
+    }
+
+    /// Persist the latest per-file state, or remove the checkpoint once every
+    /// file is either restored or kept.
+    fn persist_outcome_locked(
+        &self,
+        mut metadata: RunMetadata,
+        outcome: &UndoOutcome,
+    ) -> Result<(), String> {
+        if outcome.complete {
+            self.delete_entry_locked(&metadata);
+            let _ = self.cleanup_locked(None);
+            return Ok(());
+        }
+        metadata.undo_files = outcome.files.clone();
+        self.write_metadata_at(&metadata.path, &metadata)?;
+        let _ = self.cleanup_locked(Some(&metadata.checkpoint_id));
+        Ok(())
     }
 
     pub fn available(&self, run_ids: &[String]) -> Vec<String> {
@@ -306,6 +450,19 @@ impl CheckpointStore {
             .unwrap_or(false)
     }
 
+    /// Current per-file undo state without changing anything. Used to show the
+    /// file list as soon as a run finishes and after a restart.
+    pub fn state(&self, run_id: &str) -> Result<UndoOutcome, String> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| "The checkpoint store is locked.".to_string())?;
+        let mut metadata = self.complete_locked(run_id)?;
+        let entries = self.attributed_entries_locked(&metadata)?;
+        ensure_undo_files(&mut metadata, &entries);
+        Ok(outcome_from_files(metadata.undo_files))
+    }
+
     /// Workspace a completed checkpoint belongs to, used to keep an undo from
     /// racing a new run in the same directory.
     pub fn workspace_of(&self, run_id: &str) -> Option<PathBuf> {
@@ -316,11 +473,11 @@ impl CheckpointStore {
             .map(|metadata| metadata.workspace)
     }
 
-    fn undo_metadata_locked(&self, metadata: &RunMetadata) -> Result<UndoOutcome, String> {
-        let post = metadata
-            .post
-            .as_deref()
-            .ok_or_else(|| "This checkpoint has no post-run snapshot.".to_string())?;
+    fn undo_metadata_locked(
+        &self,
+        metadata: &mut RunMetadata,
+        only: Option<&str>,
+    ) -> Result<UndoOutcome, String> {
         let workspace = fs::canonicalize(&metadata.workspace)
             .map_err(|error| format!("The checkpoint workspace is unavailable: {error}"))?;
         if !workspace.is_dir() {
@@ -329,6 +486,94 @@ impl CheckpointStore {
                 workspace.display()
             ));
         }
+        let entries = self.attributed_entries_locked(metadata)?;
+        ensure_undo_files(metadata, &entries);
+        if let Some(only) = only {
+            if !metadata.undo_files.iter().any(|file| file.path == only) {
+                return Err(format!("{only} is not part of this run's undo set."));
+            }
+        }
+
+        let mut outcome = UndoOutcome::default();
+        for (entry, expected) in &entries {
+            let label = path_label(&entry.path);
+            if only.map(|only| only != label).unwrap_or(false) {
+                continue;
+            }
+            let Some(index) = metadata
+                .undo_files
+                .iter()
+                .position(|file| file.path == label)
+            else {
+                continue;
+            };
+            // A file that is already restored or kept stays resolved. This is
+            // what makes a per-file retry target only the files that still
+            // need a decision.
+            if !metadata.undo_files[index].state.unresolved() {
+                continue;
+            }
+            let at = now_ms();
+            match self.restore_entry(&workspace, entry, expected.as_ref()) {
+                Ok(RestoreKind::Restored) => {
+                    metadata.undo_files[index].record(
+                        UndoAction::Restore,
+                        FileUndoState::Restored,
+                        None,
+                        at,
+                    );
+                    outcome.restored += 1;
+                }
+                Ok(RestoreKind::Deleted) => {
+                    metadata.undo_files[index].record(
+                        UndoAction::Restore,
+                        FileUndoState::Restored,
+                        None,
+                        at,
+                    );
+                    outcome.deleted += 1;
+                }
+                Ok(RestoreKind::Skipped(reason)) => {
+                    metadata.undo_files[index].record(
+                        UndoAction::Restore,
+                        FileUndoState::Skipped,
+                        Some(reason),
+                        at,
+                    );
+                }
+                Err(error) => {
+                    outcome.incomplete = true;
+                    metadata.undo_files[index].record(
+                        UndoAction::Restore,
+                        FileUndoState::Failed,
+                        Some(error),
+                        at,
+                    );
+                }
+            }
+        }
+
+        outcome.files = metadata.undo_files.clone();
+        outcome.pending = outcome
+            .files
+            .iter()
+            .filter(|file| file.state.unresolved())
+            .count() as u32;
+        outcome.complete = outcome.pending == 0;
+        Ok(outcome)
+    }
+
+    /// Changed paths the run itself touched, paired with the content it left
+    /// behind. Anything else in the pre/post diff was changed by another
+    /// process and is never offered to undo.
+    fn attributed_entries_locked(
+        &self,
+        metadata: &RunMetadata,
+    ) -> Result<Vec<(DiffEntry, Option<AttributedPath>)>, String> {
+        let post = metadata
+            .post
+            .as_deref()
+            .ok_or_else(|| "This checkpoint has no post-run snapshot.".to_string())?;
         let entries = self.diff_locked(&metadata.pre, post)?;
         let attributed: Option<HashMap<PathBuf, AttributedPath>> = metadata.attribution.as_ref().map(|paths| {
             paths
@@ -336,32 +581,16 @@ impl CheckpointStore {
                 .map(|path| (path.path.clone(), path.clone()))
                 .collect()
         });
-        let mut outcome = UndoOutcome::default();
-        for entry in entries {
-            // With attribution, anything the run did not touch is left alone: it
-            // was changed by something else while the run was active.
-            let expected = match &attributed {
-                Some(paths) => match paths.get(&entry.path) {
-                    Some(path) => Some(path),
-                    None => continue,
-                },
-                None => None,
-            };
-            match self.restore_entry(&workspace, &entry, expected) {
-                Ok(RestoreKind::Restored) => outcome.restored += 1,
-                Ok(RestoreKind::Deleted) => outcome.deleted += 1,
-                Ok(RestoreKind::Skipped(reason)) => {
-                    outcome.skipped.push(format!("{}: {reason}", entry.path.display()));
-                }
-                Err(error) => {
-                    outcome.incomplete = true;
-                    outcome
-                        .skipped
-                        .push(format!("{}: {error}", entry.path.display()));
-                }
-            }
-        }
-        Ok(outcome)
+        Ok(entries
+            .into_iter()
+            .filter_map(|entry| match &attributed {
+                Some(paths) => paths
+                    .get(&entry.path)
+                    .cloned()
+                    .map(|expected| (entry, Some(expected))),
+                None => Some((entry, None)),
+            })
+            .collect())
     }
 
     fn restore_entry(
@@ -376,6 +605,14 @@ impl CheckpointStore {
         let path = workspace.join(&entry.path);
         if !path.starts_with(workspace) {
             return Err("The path escaped the workspace.".into());
+        }
+        // The final component is checked by symlink_metadata below, but a
+        // parent directory could have been swapped for a symlink pointing
+        // outside the workspace after the run. Never write through one.
+        if !parent_inside_workspace(workspace, &path) {
+            return Ok(RestoreKind::Skipped(
+                "its directory moved outside the workspace".to_string(),
+            ));
         }
 
         // Compare with the version the agent left behind, not with the final
@@ -823,6 +1060,13 @@ impl CheckpointStore {
         Ok(found)
     }
 
+    fn complete_locked(&self, run_id: &str) -> Result<RunMetadata, String> {
+        self.find_complete_locked(run_id)?.ok_or_else(|| {
+            "No undo checkpoint is available for that run. It may have been removed by cleanup."
+                .to_string()
+        })
+    }
+
     fn cleanup_locked(&self, keep: Option<&str>) -> Result<(), String> {
         let mut metadata = self.read_metadata_locked()?;
         let now = now_ms();
@@ -1016,6 +1260,10 @@ impl RunCheckpoint {
             let mut metadata = store.read_metadata_path(&self.metadata_path)?;
             metadata.post = Some(post);
             metadata.changed_files = changed_files;
+            metadata.undo_files = kept
+                .iter()
+                .map(|path| FileUndoEntry::pending(path_label(&path.path)))
+                .collect();
             metadata.attribution = Some(kept);
             metadata.status = MetadataStatus::Complete;
             store.write_metadata_at(&self.metadata_path, &metadata)?;
@@ -1154,6 +1402,34 @@ fn oldest_removable(metadata: &[RunMetadata], keep: Option<&str>) -> Option<usiz
         .map(|(index, _)| index)
 }
 
+/// Stable label for a checkpoint path. Git reports `/` separators on every
+/// platform, so normalising them would corrupt a legal `\` in a Unix filename
+/// and could make two distinct paths share a label.
+fn path_label(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+/// Older checkpoints have no per-file records. Seed them as pending so the
+/// first undo (or keep) can still be targeted by path.
+fn ensure_undo_files(metadata: &mut RunMetadata, entries: &[(DiffEntry, Option<AttributedPath>)]) {
+    for (entry, _) in entries {
+        let path = path_label(&entry.path);
+        if !metadata.undo_files.iter().any(|file| file.path == path) {
+            metadata.undo_files.push(FileUndoEntry::pending(path));
+        }
+    }
+}
+
+fn outcome_from_files(files: Vec<FileUndoEntry>) -> UndoOutcome {
+    let pending = files.iter().filter(|file| file.state.unresolved()).count() as u32;
+    UndoOutcome {
+        files,
+        pending,
+        complete: pending == 0,
+        ..UndoOutcome::default()
+    }
+}
+
 fn workspace_usage(root: &Path, exclude: Option<&Path>) -> Result<(u64, usize), String> {
     fn heavy(name: &str) -> bool {
         matches!(
@@ -1224,6 +1500,30 @@ fn safe_relative(path: &Path) -> bool {
         && path
             .components()
             .all(|component| matches!(component, Component::Normal(_)))
+}
+
+/// True when the nearest existing ancestor of `path` is inside `workspace`.
+/// Missing directories are allowed: restoring a file the run deleted may need
+/// to recreate them, and the nearest existing ancestor still bounds the write.
+fn parent_inside_workspace(workspace: &Path, path: &Path) -> bool {
+    let mut ancestor = path.parent();
+    while let Some(directory) = ancestor {
+        match fs::symlink_metadata(directory) {
+            // Follow a symlink only when it resolves inside the workspace. A
+            // dangling link has no safe target, so it is refused as well.
+            Ok(metadata) if metadata.is_dir() || metadata.file_type().is_symlink() => {
+                return fs::canonicalize(directory)
+                    .map(|canonical| canonical.starts_with(workspace))
+                    .unwrap_or(false);
+            }
+            Ok(_) => return false,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ancestor = directory.parent();
+            }
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 fn parse_mode(value: &str) -> Result<u32, String> {
@@ -1405,7 +1705,32 @@ mod tests {
         assert!(!workspace.join("new.txt").exists());
         #[cfg(unix)]
         assert!(!workspace.join("shell.txt").exists());
-        assert!(outcome.skipped.iter().any(|line| line.contains("keep.txt")));
+        let kept = outcome
+            .files
+            .iter()
+            .find(|file| file.path == "keep.txt")
+            .expect("keep.txt entry");
+        assert_eq!(kept.state, FileUndoState::Skipped);
+        assert!(kept
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("changed since the run"));
+        assert_eq!(outcome.pending, 1);
+        assert!(!outcome.complete);
+        // A skipped file is still pending, so its checkpoint must survive for
+        // a retry or a keep decision.
+        assert!(reopened.has_complete("run-1"));
+
+        // Accepting the external edit resolves the last pending file without
+        // changing it, and the checkpoint is cleared.
+        let kept_outcome = reopened.keep_path("run-1", "keep.txt").expect("keep");
+        assert_eq!(kept_outcome.pending, 0);
+        assert!(kept_outcome.complete);
+        assert_eq!(
+            fs::read_to_string(workspace.join("keep.txt")).expect("keep"),
+            "user edit\n"
+        );
         assert!(!reopened.has_complete("run-1"));
 
         let _ = fs::remove_dir_all(root);
@@ -1486,6 +1811,7 @@ mod tests {
         let outcome = reopened.undo("run-external").expect("undo");
         assert_eq!(outcome.restored, 1);
         assert!(!outcome.incomplete);
+        assert!(outcome.complete);
         assert_eq!(
             fs::read_to_string(workspace.join("notes.txt")).expect("notes"),
             "notes\n"
@@ -1526,14 +1852,224 @@ mod tests {
         let reopened = Arc::new(CheckpointStore::new(root.join("checkpoints")));
         let outcome = reopened.undo("run-after-touch").expect("undo");
         assert_eq!(outcome.restored, 0);
-        assert!(outcome
-            .skipped
+        let skipped = outcome
+            .files
             .iter()
-            .any(|line| line.contains("shared.txt")));
+            .find(|file| file.path == "shared.txt")
+            .expect("shared entry");
+        assert_eq!(skipped.state, FileUndoState::Skipped);
+        assert!(skipped
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("changed since the run"));
         assert_eq!(
             fs::read_to_string(workspace.join("shared.txt")).expect("shared"),
             "user\n"
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn undo_refuses_a_directory_replaced_by_an_outside_symlink() {
+        if !git_available() {
+            eprintln!("Git is unavailable; skipping the parent symlink test.");
+            return;
+        }
+        #[cfg(not(unix))]
+        return;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let root = temp_root("parent-symlink");
+            let workspace = root.join("ws");
+            let outside = root.join("outside");
+            fs::create_dir_all(workspace.join("sub")).expect("sub");
+            fs::create_dir_all(&outside).expect("outside");
+            fs::write(workspace.join("sub/note.txt"), "before\n").expect("note");
+
+            let store = Arc::new(CheckpointStore::new(root.join("checkpoints")));
+            let checkpoint = store.begin("run-parent-symlink", &workspace).expect("begin");
+            let recorder = checkpoint.recorder();
+            recorder.baseline().expect("baseline");
+            fs::write(workspace.join("sub/note.txt"), "after\n").expect("agent");
+            recorder.commit_step().expect("step");
+            assert_eq!(checkpoint.finish().expect("finish"), 1);
+
+            // Replace the directory with a link to a copy outside the workspace.
+            // The copy has the same content the run left behind, so only the
+            // parent check can prevent an outside write.
+            fs::rename(workspace.join("sub"), outside.join("sub")).expect("move");
+            symlink(outside.join("sub"), workspace.join("sub")).expect("link");
+
+            let reopened = Arc::new(CheckpointStore::new(root.join("checkpoints")));
+            let outcome = reopened.undo("run-parent-symlink").expect("undo");
+            assert_eq!(outcome.restored, 0);
+            assert_eq!(
+                fs::read_to_string(outside.join("sub/note.txt")).expect("outside"),
+                "after\n",
+                "undo must never write through an outside symlink"
+            );
+            let skipped = outcome
+                .files
+                .iter()
+                .find(|file| file.path == "sub/note.txt")
+                .expect("note entry");
+            assert_eq!(skipped.state, FileUndoState::Skipped);
+            assert!(skipped
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("outside the workspace"));
+
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn per_file_undo_tracks_attempts_and_keeps_external_edits() {
+        if !git_available() {
+            eprintln!("Git is unavailable; skipping the per-file undo test.");
+            return;
+        }
+        let root = temp_root("per-file");
+        let workspace = root.join("ws");
+        fs::write(workspace.join("alpha.txt"), "before alpha\n").expect("alpha");
+        fs::write(workspace.join("beta.txt"), "before beta\n").expect("beta");
+
+        let store = Arc::new(CheckpointStore::new(root.join("checkpoints")));
+        let checkpoint = store.begin("run-per-file", &workspace).expect("begin");
+        let recorder = checkpoint.recorder();
+        recorder.baseline().expect("baseline");
+        fs::write(workspace.join("alpha.txt"), "after alpha\n").expect("alpha");
+        fs::write(workspace.join("beta.txt"), "after beta\n").expect("beta");
+        recorder.commit_step().expect("step");
+        assert_eq!(checkpoint.finish().expect("finish"), 2);
+
+        let reopened = Arc::new(CheckpointStore::new(root.join("checkpoints")));
+
+        let initial = reopened.state("run-per-file").expect("state");
+        assert_eq!(initial.pending, 2);
+        assert!(initial
+            .files
+            .iter()
+            .all(|file| file.state == FileUndoState::Pending));
+
+        // Restoring one file leaves the other pending and keeps the checkpoint.
+        let alpha = reopened.undo_path("run-per-file", "alpha.txt").expect("alpha");
+        assert_eq!(alpha.restored, 1);
+        assert_eq!(alpha.pending, 1);
+        assert!(!alpha.complete);
+        assert_eq!(
+            fs::read_to_string(workspace.join("alpha.txt")).expect("alpha"),
+            "before alpha\n"
+        );
+        let beta = alpha
+            .files
+            .iter()
+            .find(|file| file.path == "beta.txt")
+            .expect("beta entry");
+        assert_eq!(beta.state, FileUndoState::Pending);
+        assert!(reopened.has_complete("run-per-file"));
+
+        // The partial state is on disk, so a restarted app still knows which
+        // file was restored and which one is pending.
+        let restarted = Arc::new(CheckpointStore::new(root.join("checkpoints")));
+        let persisted = restarted.state("run-per-file").expect("state");
+        assert_eq!(persisted.pending, 1);
+        assert_eq!(
+            persisted
+                .files
+                .iter()
+                .find(|file| file.path == "alpha.txt")
+                .expect("alpha entry")
+                .state,
+            FileUndoState::Restored
+        );
+
+        // A user edit after the run is skipped, and the retry history is kept.
+        fs::write(workspace.join("beta.txt"), "my beta\n").expect("user edit");
+        let skipped = reopened
+            .undo_path("run-per-file", "beta.txt")
+            .expect("beta undo");
+        assert_eq!(skipped.restored, 0);
+        assert_eq!(skipped.pending, 1);
+        assert!(!skipped.complete);
+        let beta = skipped
+            .files
+            .iter()
+            .find(|file| file.path == "beta.txt")
+            .expect("beta entry");
+        assert_eq!(beta.state, FileUndoState::Skipped);
+        assert_eq!(beta.attempts, 1);
+        assert!(beta
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("changed since the run"));
+        assert_eq!(
+            fs::read_to_string(workspace.join("beta.txt")).expect("beta"),
+            "my beta\n"
+        );
+
+        // Keeping the user's version resolves the last file without writing it.
+        let kept = reopened.keep_path("run-per-file", "beta.txt").expect("keep");
+        assert_eq!(kept.pending, 0);
+        assert!(kept.complete);
+        let beta = kept
+            .files
+            .iter()
+            .find(|file| file.path == "beta.txt")
+            .expect("beta entry");
+        assert_eq!(beta.state, FileUndoState::Kept);
+        assert_eq!(beta.attempts, 2);
+        assert_eq!(beta.history.len(), 2, "the skip stays visible after a retry");
+        assert_eq!(beta.history[0].state, FileUndoState::Skipped);
+        assert_eq!(beta.history[1].action, UndoAction::Keep);
+        assert_eq!(
+            fs::read_to_string(workspace.join("beta.txt")).expect("beta"),
+            "my beta\n"
+        );
+        assert!(!reopened.has_complete("run-per-file"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn last_per_file_restore_completes_the_run() {
+        if !git_available() {
+            eprintln!("Git is unavailable; skipping the per-file completion test.");
+            return;
+        }
+        let root = temp_root("per-file-complete");
+        let workspace = root.join("ws");
+        fs::write(workspace.join("one.txt"), "before one\n").expect("one");
+        fs::write(workspace.join("two.txt"), "before two\n").expect("two");
+
+        let store = Arc::new(CheckpointStore::new(root.join("checkpoints")));
+        let checkpoint = store.begin("run-complete", &workspace).expect("begin");
+        let recorder = checkpoint.recorder();
+        recorder.baseline().expect("baseline");
+        fs::write(workspace.join("one.txt"), "after one\n").expect("one");
+        fs::write(workspace.join("two.txt"), "after two\n").expect("two");
+        recorder.commit_step().expect("step");
+        assert_eq!(checkpoint.finish().expect("finish"), 2);
+
+        let reopened = Arc::new(CheckpointStore::new(root.join("checkpoints")));
+        let first = reopened.undo_path("run-complete", "one.txt").expect("one");
+        assert!(!first.complete);
+        assert_eq!(first.pending, 1);
+        let last = reopened.undo_path("run-complete", "two.txt").expect("two");
+        assert!(last.complete, "the last restore finishes the run");
+        assert_eq!(last.pending, 0);
+        assert!(last
+            .files
+            .iter()
+            .all(|file| file.state == FileUndoState::Restored));
+        assert!(!reopened.has_complete("run-complete"));
 
         let _ = fs::remove_dir_all(root);
     }

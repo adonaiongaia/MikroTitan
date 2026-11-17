@@ -21,6 +21,8 @@ import type {
   AgentStep,
   AgentStepStatus,
   AgentTrace,
+  AgentUndoFile,
+  AgentUndoState,
   AgentPendingApproval,
 } from "../../types";
 
@@ -29,6 +31,8 @@ export interface AgentActions {
   reject: (runId: string, stepId: string, feedback: string) => void | Promise<void>;
   abort: (runId: string) => void | Promise<void>;
   undo: (runId: string) => void | Promise<void>;
+  undoFile: (runId: string, path: string) => void | Promise<void>;
+  keepFile: (runId: string, path: string) => void | Promise<void>;
 }
 
 interface AgentTraceProps {
@@ -85,6 +89,53 @@ const RISK_LABEL: Record<AgentRisk, string> = {
   mutating: "mutating",
   destructive: "destructive",
 };
+
+const UNDO_STATE_STYLE: Record<
+  AgentUndoState,
+  { label: string; chip: string; dot: string }
+> = {
+  pending: {
+    label: "Pending undo",
+    chip: "border-white/10 bg-white/5 text-slate-400",
+    dot: "bg-slate-500",
+  },
+  restored: {
+    label: "Restored",
+    chip: "border-emerald-400/20 bg-emerald-400/5 text-emerald-300",
+    dot: "bg-emerald-400",
+  },
+  skipped: {
+    label: "Skipped",
+    chip: "border-amber-400/20 bg-amber-400/5 text-amber-300",
+    dot: "bg-amber-400",
+  },
+  failed: {
+    label: "Failed",
+    chip: "border-rose-400/20 bg-rose-500/5 text-rose-300",
+    dot: "bg-rose-400",
+  },
+  kept: {
+    label: "Kept your version",
+    chip: "border-sky-400/20 bg-sky-400/5 text-sky-300",
+    dot: "bg-sky-400",
+  },
+};
+
+function undoFilePending(file: AgentUndoFile): boolean {
+  return (
+    file.state === "pending" ||
+    file.state === "skipped" ||
+    file.state === "failed"
+  );
+}
+
+function attemptTime(at: number): string {
+  return new Date(at).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
 
 function StepIcon({ status }: { status: AgentStepStatus }) {
   if (status === "running") {
@@ -382,13 +433,157 @@ function ApprovalCard({
   );
 }
 
+function UndoFileRow({
+  runId,
+  file,
+  canResolve,
+  actions,
+}: {
+  runId: string;
+  file: AgentUndoFile;
+  canResolve: boolean;
+  actions: AgentActions;
+}) {
+  const [busy, setBusy] = useState<"restore" | "keep" | null>(null);
+  const pending = undoFilePending(file);
+
+  const run = async (
+    kind: "restore" | "keep",
+    action: () => void | Promise<void>,
+  ) => {
+    if (busy) return;
+    setBusy(kind);
+    try {
+      await action();
+    } catch {
+      // useChat records the failure on this trace.
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <li className="px-3 py-2">
+      <div className="flex items-center gap-2">
+        <span
+          className={cn(
+            "h-1.5 w-1.5 shrink-0 rounded-full",
+            UNDO_STATE_STYLE[file.state].dot,
+          )}
+        />
+        <code
+          className="min-w-0 flex-1 truncate font-mono text-[10px] text-slate-300"
+          title={file.path}
+        >
+          {file.path}
+        </code>
+        <span
+          className={cn(
+            "shrink-0 rounded border px-1.5 py-px text-[8px] uppercase tracking-wider",
+            UNDO_STATE_STYLE[file.state].chip,
+          )}
+        >
+          {UNDO_STATE_STYLE[file.state].label}
+        </span>
+      </div>
+
+      {file.reason ? (
+        <p className="mt-1 pl-3.5 text-[9.5px] leading-4 text-slate-500">
+          {file.reason}
+        </p>
+      ) : null}
+
+      {pending && canResolve ? (
+        <div className="mt-1.5 flex items-center gap-1.5 pl-3.5">
+          <button
+            type="button"
+            disabled={busy !== null}
+            onClick={() =>
+              void run("restore", () => actions.undoFile(runId, file.path))
+            }
+            className="inline-flex h-6 items-center gap-1 rounded-md border border-white/10 bg-white/5 px-2 text-[9.5px] text-slate-300 transition hover:bg-white/10 disabled:opacity-50"
+          >
+            {busy === "restore" ? (
+              <Loader2 className="h-2.5 w-2.5 animate-spin" />
+            ) : (
+              <Undo2 className="h-2.5 w-2.5" />
+            )}
+            Restore
+          </button>
+          {file.state === "skipped" ? (
+            <button
+              type="button"
+              disabled={busy !== null}
+              onClick={() =>
+                void run("keep", () => actions.keepFile(runId, file.path))
+              }
+              className="inline-flex h-6 items-center gap-1 rounded-md border border-sky-400/20 bg-sky-400/5 px-2 text-[9.5px] text-sky-300 transition hover:bg-sky-400/10 disabled:opacity-50"
+            >
+              {busy === "keep" ? (
+                <Loader2 className="h-2.5 w-2.5 animate-spin" />
+              ) : (
+                <Check className="h-2.5 w-2.5" />
+              )}
+              Keep my version
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+
+      {file.history.length ? (
+        <details className="mt-1 pl-3.5">
+          <summary className="cursor-pointer select-none text-[8.5px] uppercase tracking-[0.14em] text-slate-600 transition hover:text-slate-500">
+            {file.attempts} attempt{file.attempts === 1 ? "" : "s"}
+          </summary>
+          <ol className="mt-1 space-y-0.5">
+            {file.history.map((attempt, index) => (
+              <li
+                key={`${attempt.at}-${index}`}
+                className="flex gap-1.5 text-[9px] leading-4 text-slate-500"
+              >
+                <span className="shrink-0 font-mono text-[8.5px] text-slate-600">
+                  {attemptTime(attempt.at)}
+                </span>
+                <span className="shrink-0 text-slate-400">
+                  {attempt.action === "keep" ? "Keep" : "Restore"} →{" "}
+                  {UNDO_STATE_STYLE[attempt.state].label.toLowerCase()}
+                </span>
+                {attempt.reason ? (
+                  <span className="min-w-0 flex-1">{attempt.reason}</span>
+                ) : null}
+              </li>
+            ))}
+          </ol>
+        </details>
+      ) : null}
+    </li>
+  );
+}
+
 export function AgentTraceView({ trace, streaming, actions }: AgentTraceProps) {
   const [undoing, setUndoing] = useState(false);
   const items = buildTimeline(trace);
   const liveText = trace.live_text.trim();
   const liveReasoning = trace.live_reasoning.trim();
+  const undoFiles = trace.undo_files ?? [];
+  // An undone run has no files left to resolve, even when a journal-only undo
+  // recorded a skip. Its reasons and history stay visible.
+  const pendingUndo = trace.undone
+    ? 0
+    : undoFiles.filter(undoFilePending).length;
+  const canResolveFiles = trace.undo_available && !trace.undone;
+  const undoExpired =
+    !trace.undo_available && !trace.undone && pendingUndo > 0;
+  const allRestored =
+    undoFiles.length > 0 && undoFiles.every((file) => file.state === "restored");
+  const incompleteUndo = undoFiles.some(
+    (file) => file.state === "skipped" || file.state === "failed",
+  );
   const canUndo =
-    trace.undo_available && !trace.undone && trace.status !== "running";
+    trace.undo_available &&
+    !trace.undone &&
+    trace.status !== "running" &&
+    (undoFiles.length === 0 || pendingUndo > 0);
 
   const undo = async () => {
     if (undoing) return;
@@ -485,6 +680,47 @@ export function AgentTraceView({ trace, streaming, actions }: AgentTraceProps) {
         </p>
       ) : null}
 
+      {undoFiles.length ? (
+        <div className="border-t border-white/5">
+          <div className="flex items-center gap-2 px-3 py-1.5">
+            <Undo2 className="h-3 w-3 shrink-0 text-slate-500" />
+            <span className="text-[8px] font-semibold uppercase tracking-[0.16em] text-slate-500">
+              Undo
+            </span>
+            <span className="text-[9.5px] text-slate-500">
+              {undoExpired
+                ? "Checkpoint unavailable"
+                : pendingUndo
+                  ? `${pendingUndo} of ${undoFiles.length} file${
+                      undoFiles.length === 1 ? "" : "s"
+                    } pending`
+                  : "Nothing pending"}
+            </span>
+          </div>
+          <ul className="max-h-[260px] divide-y divide-white/5 overflow-y-auto">
+            {undoFiles.map((file) => (
+              <UndoFileRow
+                key={file.path}
+                runId={trace.run_id}
+                file={file}
+                canResolve={canResolveFiles}
+                actions={actions}
+              />
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      {canResolveFiles && incompleteUndo ? (
+        <p className="flex items-center gap-1.5 border-t border-amber-400/15 bg-amber-400/5 px-3 py-1.5 text-[9.5px] leading-4 text-amber-200/80">
+          <AlertTriangle className="h-3 w-3 shrink-0" />
+          Restore incomplete
+          {pendingUndo
+            ? ` · ${pendingUndo} file${pendingUndo === 1 ? "" : "s"} still need a decision`
+            : ""}
+        </p>
+      ) : null}
+
       {canUndo ? (
         <div className="flex items-center gap-2 border-t border-white/5 px-3 py-2">
           <button
@@ -498,19 +734,27 @@ export function AgentTraceView({ trace, streaming, actions }: AgentTraceProps) {
             ) : (
               <Undo2 className="h-3 w-3" />
             )}
-            Undo run changes
+            {pendingUndo > 0
+              ? `Restore ${pendingUndo} pending file${
+                  pendingUndo === 1 ? "" : "s"
+                }`
+              : "Undo run changes"}
           </button>
           <span className="text-[9px] text-slate-600">
-            Restores the workspace to before this run
+            {pendingUndo > 0
+              ? "Retries every file that still needs a restore"
+              : "Restores the workspace to before this run"}
           </span>
         </div>
       ) : null}
 
       {trace.undone ? (
         <p className="flex items-center gap-1.5 border-t border-white/5 px-3 py-1.5 text-[9.5px] leading-4 text-slate-400">
-          <Undo2 className="h-3 w-3 shrink-0" />
-          Undo applied
-          {trace.undo_summary ? ` · ${trace.undo_summary}` : ""}
+          <Check className="h-3 w-3 shrink-0 text-emerald-400" />
+          {allRestored ? "All files restored" : "Undo applied"}
+          {trace.undo_summary && !allRestored
+            ? ` · ${trace.undo_summary}`
+            : ""}
         </p>
       ) : null}
 

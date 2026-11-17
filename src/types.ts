@@ -614,6 +614,8 @@ export interface AgentTrace {
   undone: boolean;
   undo_error: string | null;
   undo_summary: string | null;
+  /** Per-file undo state and attempt history, newest attempt last. */
+  undo_files: AgentUndoFile[];
   started_at: number;
   finished_at: number | null;
 }
@@ -695,10 +697,34 @@ export interface AgentApprovalEvent {
   preview?: AgentDiffPreview | null;
 }
 
+export type AgentUndoState =
+  | "pending"
+  | "restored"
+  | "skipped"
+  | "failed"
+  | "kept";
+
+export interface AgentUndoAttempt {
+  action: "restore" | "keep";
+  state: AgentUndoState;
+  reason: string | null;
+  at: number;
+}
+
+export interface AgentUndoFile {
+  path: string;
+  state: AgentUndoState;
+  reason: string | null;
+  attempts: number;
+  history: AgentUndoAttempt[];
+}
+
 export interface AgentUndoResult {
   restored: number;
   deleted: number;
-  skipped: string[];
+  files: AgentUndoFile[];
+  pending: number;
+  complete: boolean;
   incomplete: boolean;
 }
 

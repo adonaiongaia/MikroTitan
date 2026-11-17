@@ -277,6 +277,20 @@ export function ChatView({ engine, chat }: ChatViewProps) {
           // useChat records the failure on the run's trace.
         }
       },
+      undoFile: async (runId, path) => {
+        try {
+          await chat.undoAgentFile(runId, path);
+        } catch {
+          // useChat records the failure on the run's trace.
+        }
+      },
+      keepFile: async (runId, path) => {
+        try {
+          await chat.keepAgentFile(runId, path);
+        } catch {
+          // useChat records the failure on the run's trace.
+        }
+      },
     }),
     [chat],
   );

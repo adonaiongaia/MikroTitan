@@ -370,7 +370,10 @@ fn main() {
             agent::agent_resolve_approval,
             agent::agent_abort,
             agent::agent_undo,
+            agent::agent_undo_file,
+            agent::agent_keep_file,
             agent::agent_undo_availability,
+            agent::agent_undo_state,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Janas Studio");

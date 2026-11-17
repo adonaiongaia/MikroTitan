@@ -19,7 +19,10 @@ import type {
   AgentToolResultEvent,
   AgentToolStartEvent,
   AgentTrace,
+  AgentUndoAttempt,
+  AgentUndoFile,
   AgentUndoResult,
+  AgentUndoState,
   ChatDelta,
   ChatDone,
   ChatErrorEvent,
@@ -117,21 +120,84 @@ async function cancelRequest(request: ActiveRequest) {
 
 function undoSummary(result: AgentUndoResult): string {
   const parts: string[] = [];
-  if (result.restored > 0) {
-    parts.push(`restored ${result.restored} file${result.restored === 1 ? "" : "s"}`);
+  const files = result.files;
+  const restored = files.length
+    ? files.filter((file) => file.state === "restored").length
+    : result.restored;
+  const kept = files.filter((file) => file.state === "kept").length;
+  const unresolved = files.filter(
+    (file) =>
+      file.state === "pending" ||
+      file.state === "skipped" ||
+      file.state === "failed",
+  ).length;
+  if (restored > 0) {
+    parts.push(`${restored} restored`);
+  } else if (result.restored > 0) {
+    // The journal fallback only lists skipped paths, so its restored count
+    // cannot be derived from `files`.
+    parts.push(`${result.restored} restored`);
   }
   if (result.deleted > 0) {
     parts.push(
-      `removed ${result.deleted} new file${result.deleted === 1 ? "" : "s"}`,
+      `${result.deleted} new file${result.deleted === 1 ? "" : "s"} removed`,
     );
   }
-  if (result.skipped.length > 0) {
-    parts.push(
-      `skipped ${result.skipped.length} (${result.skipped.slice(0, 2).join("; ")})`,
-    );
+  if (kept > 0) parts.push(`${kept} kept`);
+  // A journal undo is consumed by the attempt, so a file it could not revert
+  // is skipped rather than still pending; only a live checkpoint can retry.
+  if (result.complete) {
+    const skipped = files.filter(
+      (file) => file.state === "skipped" || file.state === "failed",
+    ).length;
+    if (skipped > 0) parts.push(`${skipped} skipped`);
+  } else if (unresolved > 0) {
+    parts.push(`${unresolved} pending`);
   }
   if (result.incomplete) parts.push("some changes were not recorded");
   return parts.length ? parts.join(" · ") : "nothing needed reverting";
+}
+
+const UNDO_STATES: AgentUndoState[] = [
+  "pending",
+  "restored",
+  "skipped",
+  "failed",
+  "kept",
+];
+
+function normalizeUndoFile(value: unknown): AgentUndoFile | null {
+  if (!value || typeof value !== "object") return null;
+  const file = value as Partial<AgentUndoFile>;
+  if (typeof file.path !== "string" || !file.path) return null;
+  const state = UNDO_STATES.includes(file.state as AgentUndoState)
+    ? (file.state as AgentUndoState)
+    : "pending";
+  const history: AgentUndoAttempt[] = Array.isArray(file.history)
+    ? file.history
+        .filter((attempt) => Boolean(attempt) && typeof attempt === "object")
+        .map((attempt) => {
+          const entry = attempt as Partial<AgentUndoAttempt>;
+          return {
+            action:
+              entry.action === "keep" ? ("keep" as const) : ("restore" as const),
+            state: UNDO_STATES.includes(entry.state as AgentUndoState)
+              ? (entry.state as AgentUndoState)
+              : state,
+            reason: typeof entry.reason === "string" ? entry.reason : null,
+            at: typeof entry.at === "number" ? entry.at : Date.now(),
+          };
+        })
+        .slice(-20)
+    : [];
+  return {
+    path: file.path,
+    state,
+    reason: typeof file.reason === "string" ? file.reason : null,
+    attempts:
+      typeof file.attempts === "number" ? file.attempts : history.length,
+    history,
+  };
 }
 
 function normalizeAgentTrace(value: unknown): AgentTrace | undefined {
@@ -211,6 +277,11 @@ function normalizeAgentTrace(value: unknown): AgentTrace | undefined {
       typeof trace.undo_error === "string" ? trace.undo_error : null,
     undo_summary:
       typeof trace.undo_summary === "string" ? trace.undo_summary : null,
+    undo_files: Array.isArray(trace.undo_files)
+      ? trace.undo_files
+          .map(normalizeUndoFile)
+          .filter((file): file is AgentUndoFile => file !== null)
+      : [],
     started_at: typeof trace.started_at === "number" ? trace.started_at : Date.now(),
     finished_at:
       typeof trace.finished_at === "number" ? trace.finished_at : null,
@@ -367,10 +438,33 @@ export function useChat() {
       ),
     );
     if (!runIds.length) return;
+    // Traces that already carry per-file state do not need another read; the
+    // saved state is what the tray rendered before the restart.
+    const needsFiles = new Set(
+      sessions.flatMap((session) =>
+        session.messages.flatMap((message) => {
+          const trace = message.agentTrace;
+          return trace && trace.undo_files.length === 0 ? [trace.run_id] : [];
+        }),
+      ),
+    );
     void api
       .agentUndoAvailability(runIds)
-      .then((available) => {
+      .then(async (available) => {
         const canUndo = new Set(available);
+        // A restored or skipped run keeps a checkpoint, so load its per-file
+        // state too: a restart should not hide why a file is still pending.
+        const filesByRun = new Map<string, AgentUndoFile[]>();
+        await Promise.all(
+          available.filter((runId) => needsFiles.has(runId)).map(async (runId) => {
+            try {
+              const state = await api.agentUndoState(runId);
+              if (state.files.length) filesByRun.set(runId, state.files);
+            } catch {
+              // The undo button still works without the preview.
+            }
+          }),
+        );
         setSessions((previous) =>
           previous.map((session) => ({
             ...session,
@@ -378,10 +472,15 @@ export function useChat() {
               const trace = message.agentTrace;
               if (!trace) return message;
               const next = canUndo.has(trace.run_id) && !trace.undone;
-              if (trace.undo_available === next) return message;
+              const undoFiles = filesByRun.get(trace.run_id);
+              if (trace.undo_available === next && !undoFiles) return message;
               return {
                 ...message,
-                agentTrace: { ...trace, undo_available: next },
+                agentTrace: {
+                  ...trace,
+                  undo_available: next,
+                  undo_files: undoFiles ?? trace.undo_files,
+                },
               };
             }),
           })),
@@ -691,9 +790,19 @@ export function useChat() {
                   live_reasoning: "",
                   notice: null,
                   undo_available: event.payload.changed_files > 0,
+                  undo_files: [],
                 }
               : null,
           }));
+          // The checkpoint is finished before this event, so the file list is
+          // available right away. A failure only hides the preview; the undo
+          // button still works.
+          if (event.payload.changed_files > 0) {
+            void api
+              .agentUndoState(event.payload.run_id)
+              .then((state) => applyUndoState(event.payload.run_id, state))
+              .catch(() => undefined);
+          }
           activeRequest.current = null;
         },
       );
@@ -920,6 +1029,7 @@ export function useChat() {
         undone: false,
         undo_error: null,
         undo_summary: null,
+        undo_files: [],
         started_at: now,
         finished_at: null,
       };
@@ -1138,20 +1248,46 @@ export function useChat() {
     [],
   );
 
-  const undoAgent = useCallback(
-    async (runId: string) => {
+  const applyUndoState = useCallback(
+    (runId: string, result: AgentUndoResult) => {
+      if (!result.files.length) return;
+      updateTraceByRun(runId, (trace) =>
+        // A restore or keep may finish while this read-only query is in
+        // flight; never replace newer per-file state with the earlier snapshot.
+        trace.undo_files.length ? trace : { ...trace, undo_files: result.files },
+      );
+    },
+    [updateTraceByRun],
+  );
+
+  const applyUndoResult = useCallback(
+    (runId: string, result: AgentUndoResult) => {
+      updateTraceByRun(runId, (trace) => ({
+        ...trace,
+        // The run is complete exactly when no file still needs a restore or a
+        // keep decision, which is also when the backend clears the checkpoint.
+        undone: result.complete,
+        undo_available: !result.complete,
+        undo_error: null,
+        undo_summary: undoSummary(result),
+        undo_files: result.files.length ? result.files : trace.undo_files,
+      }));
+    },
+    [updateTraceByRun],
+  );
+
+  const runUndo = useCallback(
+    async (
+      runId: string,
+      action: () => Promise<AgentUndoResult>,
+    ): Promise<AgentUndoResult> => {
       updateTraceByRun(runId, (trace) => ({
         ...trace,
         undo_error: null,
       }));
       try {
-        const result = await api.undoAgent(runId);
-        updateTraceByRun(runId, (trace) => ({
-          ...trace,
-          undone: true,
-          undo_error: null,
-          undo_summary: undoSummary(result),
-        }));
+        const result = await action();
+        applyUndoResult(runId, result);
         return result;
       } catch (err) {
         const message = errorMessage(err);
@@ -1164,7 +1300,24 @@ export function useChat() {
         throw err;
       }
     },
-    [updateTraceByRun],
+    [applyUndoResult, updateTraceByRun],
+  );
+
+  const undoAgent = useCallback(
+    (runId: string) => runUndo(runId, () => api.undoAgent(runId)),
+    [runUndo],
+  );
+
+  const undoAgentFile = useCallback(
+    (runId: string, path: string) =>
+      runUndo(runId, () => api.undoAgentFile(runId, path)),
+    [runUndo],
+  );
+
+  const keepAgentFile = useCallback(
+    (runId: string, path: string) =>
+      runUndo(runId, () => api.keepAgentFile(runId, path)),
+    [runUndo],
   );
 
   const activeSession =
@@ -1191,6 +1344,8 @@ export function useChat() {
     send,
     sendAgent,
     undoAgent,
+    undoAgentFile,
+    keepAgentFile,
     stop,
     clear,
     newChat,

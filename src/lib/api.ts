@@ -155,6 +155,12 @@ export const api = {
     invoke<void>("agent_abort", { run_id: runId }),
   undoAgent: (runId: string) =>
     invoke<AgentUndoResult>("agent_undo", { run_id: runId }),
+  undoAgentFile: (runId: string, path: string) =>
+    invoke<AgentUndoResult>("agent_undo_file", { run_id: runId, path }),
+  keepAgentFile: (runId: string, path: string) =>
+    invoke<AgentUndoResult>("agent_keep_file", { run_id: runId, path }),
   agentUndoAvailability: (runIds: string[]) =>
     invoke<string[]>("agent_undo_availability", { run_ids: runIds }),
+  agentUndoState: (runId: string) =>
+    invoke<AgentUndoResult>("agent_undo_state", { run_id: runId }),
 };
