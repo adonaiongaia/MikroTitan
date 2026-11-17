@@ -60,6 +60,7 @@ interface EnginePanelProps {
     value: AgentPreferences[K],
   ) => void;
   onPickWorkspace: () => Promise<void>;
+  workspaceLocked: boolean;
   systemPrompt: string;
   onSystemPromptChange: (value: string) => void;
   usage: ChatUsage | null;
@@ -148,6 +149,7 @@ export function EnginePanel({
   agentPreferences,
   onAgentUpdate,
   onPickWorkspace,
+  workspaceLocked,
   systemPrompt,
   onSystemPromptChange,
   usage,
@@ -432,6 +434,7 @@ export function EnginePanel({
           preferences={agentPreferences}
           onUpdate={onAgentUpdate}
           onPickWorkspace={onPickWorkspace}
+          workspaceLocked={workspaceLocked}
         />
 
         <section className="space-y-3">
@@ -866,6 +869,7 @@ function AgentConfiguration({
   preferences,
   onUpdate,
   onPickWorkspace,
+  workspaceLocked,
 }: {
   preferences: AgentPreferences;
   onUpdate: <K extends keyof AgentPreferences>(
@@ -873,6 +877,7 @@ function AgentConfiguration({
     value: AgentPreferences[K],
   ) => void;
   onPickWorkspace: () => Promise<void>;
+  workspaceLocked: boolean;
 }) {
   const [open, setOpen] = useState(true);
 
@@ -974,13 +979,18 @@ function AgentConfiguration({
               <button
                 type="button"
                 onClick={() => void onPickWorkspace()}
+                disabled={workspaceLocked}
                 className={cn(
-                  "inline-flex h-8 min-w-0 flex-1 items-center gap-1.5 rounded-lg border px-2 text-[10px] transition",
+                  "inline-flex h-8 min-w-0 flex-1 items-center gap-1.5 rounded-lg border px-2 text-[10px] transition disabled:cursor-not-allowed disabled:opacity-50",
                   preferences.workspaceRoot
                     ? "border-white/10 bg-white/[0.03] text-slate-300 hover:bg-white/[0.06]"
                     : "border-dashed border-white/15 bg-transparent text-slate-500 hover:text-slate-300",
                 )}
-                title={preferences.workspaceRoot || "Choose a workspace folder"}
+                title={
+                  workspaceLocked
+                    ? "The agent workspace is pinned while a run or pending undo exists."
+                    : preferences.workspaceRoot || "Choose a workspace folder"
+                }
               >
                 <FolderOpen className="h-3 w-3 shrink-0" />
                 <span className="truncate">
@@ -993,9 +1003,14 @@ function AgentConfiguration({
                 <button
                   type="button"
                   onClick={() => onUpdate("workspaceRoot", "")}
-                  className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-white/10 bg-white/5 text-slate-500 transition hover:text-rose-300"
+                  disabled={workspaceLocked}
+                  className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-white/10 bg-white/5 text-slate-500 transition hover:text-rose-300 disabled:cursor-not-allowed disabled:opacity-40"
                   aria-label="Clear the agent workspace root"
-                  title="Clear the workspace root"
+                  title={
+                    workspaceLocked
+                      ? "The agent workspace is pinned while a run or pending undo exists."
+                      : "Clear the workspace root"
+                  }
                 >
                   <X className="h-3 w-3" />
                 </button>
@@ -1005,6 +1020,12 @@ function AgentConfiguration({
               {preferences.workspaceRoot ||
                 "File, search and shell tools stay disabled until a folder is chosen. MCP tools still work."}
             </p>
+            {workspaceLocked ? (
+              <p className="text-[9px] leading-4 text-amber-300/70">
+                Locked while a run or pending undo exists. Undo or keep its
+                changes before switching workspaces.
+              </p>
+            ) : null}
           </div>
 
           <Toggle

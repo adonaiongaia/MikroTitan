@@ -290,6 +290,8 @@ function normalizeAgentTrace(value: unknown): AgentTrace | undefined {
           .map(normalizeUndoFile)
           .filter((file): file is AgentUndoFile => file !== null)
       : [],
+    workspace_root:
+      typeof trace.workspace_root === "string" ? trace.workspace_root : "",
     changes: Array.isArray(trace.changes)
       ? trace.changes
           .filter((change) => Boolean(change) && typeof change === "object")
@@ -704,6 +706,8 @@ export function useChat() {
               reason: event.payload.reason,
               file_edit: Boolean(event.payload.file_edit),
               preview: event.payload.preview ?? null,
+              workspace_root:
+                event.payload.workspace_root ?? trace.workspace_root,
             },
             steps: updateStep(trace.steps, event.payload.step_id, {
               status: "awaiting_approval",
@@ -814,6 +818,9 @@ export function useChat() {
                   notice: null,
                   undo_available: event.payload.changed_files > 0,
                   undo_files: [],
+                  workspace_root:
+                    event.payload.workspace_root ??
+                    message.agentTrace.workspace_root,
                   changes:
                     Array.isArray(event.payload.changes) &&
                     event.payload.changes.length
@@ -1059,6 +1066,7 @@ export function useChat() {
         undo_summary: null,
         undo_files: [],
         changes: [],
+        workspace_root: options.agent.workspaceRoot.trim(),
         started_at: now,
         finished_at: null,
       };

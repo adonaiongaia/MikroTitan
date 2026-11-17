@@ -1383,8 +1383,11 @@ impl RunRecorder {
         Ok(())
     }
 
-    /// Record the paths changed by the tool call since the last baseline.
-    pub fn commit_step(&self) -> Result<(), String> {
+    /// Record the trusted paths changed by the tool call since the last
+    /// baseline. A path that the tool did not name is left out even when it
+    /// changed in the same window, so a concurrent user edit can never become
+    /// undoable as an agent change.
+    pub fn commit_step(&self, trusted_paths: &[PathBuf]) -> Result<(), String> {
         let tree = self.store.tree_for(&self.workspace)?;
         let (previous, parent, tracked) = {
             let state = self
@@ -1400,7 +1403,11 @@ impl RunRecorder {
         let mut attribution = tracked;
         let mut last_commit = parent;
         if let Some(previous) = previous.filter(|previous| previous != &tree) {
+            let trusted: HashSet<&Path> = trusted_paths.iter().map(PathBuf::as_path).collect();
             for entry in self.store.diff_trees(&previous, &tree)? {
+                if !trusted.contains(entry.path.as_path()) {
+                    continue;
+                }
                 attribution.insert(
                     entry.path.clone(),
                     AttributedPath {
@@ -1776,10 +1783,17 @@ mod tests {
                 .expect("shell");
             assert!(status.success());
         }
-        recorder.commit_step().expect("step");
+        recorder
+            .commit_step(&[
+                PathBuf::from("keep.txt"),
+                PathBuf::from("gone.txt"),
+                PathBuf::from("new.txt"),
+            ])
+            .expect("step");
         assert_eq!(
             checkpoint.finish().expect("finish"),
-            if cfg!(unix) { 4 } else { 3 }
+            3,
+            "shell-created paths have no trustworthy provenance"
         );
 
         // A different store instance is what a restarted process sees.
@@ -1795,11 +1809,7 @@ mod tests {
         let outcome = reopened.undo("run-1").expect("undo");
         assert!(!outcome.incomplete);
         assert_eq!(outcome.restored, 1, "the deleted file is restored");
-        assert_eq!(
-            outcome.deleted,
-            if cfg!(unix) { 2 } else { 1 },
-            "the created files are removed"
-        );
+        assert_eq!(outcome.deleted, 1, "only the created file is removed");
         assert_eq!(
             fs::read_to_string(workspace.join("keep.txt")).expect("keep"),
             "user edit\n"
@@ -1810,7 +1820,10 @@ mod tests {
         );
         assert!(!workspace.join("new.txt").exists());
         #[cfg(unix)]
-        assert!(!workspace.join("shell.txt").exists());
+        assert!(
+            workspace.join("shell.txt").exists(),
+            "an un-attributed shell edit must survive undo"
+        );
         let kept = outcome
             .files
             .iter()
@@ -1865,7 +1878,9 @@ mod tests {
                 format!("run {index}\n"),
             )
             .expect("write");
-            recorder.commit_step().expect("step");
+            recorder
+                .commit_step(&[PathBuf::from(format!("file-{index}.txt"))])
+                .expect("step");
             checkpoint.finish().expect("finish");
             thread::sleep(Duration::from_millis(3));
         }
@@ -1899,7 +1914,9 @@ mod tests {
         // The agent changes notes.txt through a tool call.
         recorder.baseline().expect("baseline");
         fs::write(workspace.join("notes.txt"), "agent\n").expect("agent write");
-        recorder.commit_step().expect("step");
+        recorder
+            .commit_step(&[PathBuf::from("notes.txt")])
+            .expect("step");
 
         // Something else edits a different file and creates one while the run
         // is still active. Neither went through a tool, so undo must not touch
@@ -1949,7 +1966,9 @@ mod tests {
         let recorder = checkpoint.recorder();
         recorder.baseline().expect("baseline");
         fs::write(workspace.join("shared.txt"), "agent\n").expect("agent write");
-        recorder.commit_step().expect("step");
+        recorder
+            .commit_step(&[PathBuf::from("shared.txt")])
+            .expect("step");
         // The user edits the same file after the tool returned.
         fs::write(workspace.join("shared.txt"), "user\n").expect("user edit");
 
@@ -2002,7 +2021,9 @@ mod tests {
             let recorder = checkpoint.recorder();
             recorder.baseline().expect("baseline");
             fs::write(workspace.join("sub/note.txt"), "after\n").expect("agent");
-            recorder.commit_step().expect("step");
+            recorder
+                .commit_step(&[PathBuf::from("sub/note.txt")])
+                .expect("step");
             assert_eq!(checkpoint.finish().expect("finish"), 1);
 
             // Replace the directory with a link to a copy outside the workspace.
@@ -2052,7 +2073,9 @@ mod tests {
         recorder.baseline().expect("baseline");
         fs::write(workspace.join("alpha.txt"), "after alpha\n").expect("alpha");
         fs::write(workspace.join("beta.txt"), "after beta\n").expect("beta");
-        recorder.commit_step().expect("step");
+        recorder
+            .commit_step(&[PathBuf::from("alpha.txt"), PathBuf::from("beta.txt")])
+            .expect("step");
         assert_eq!(checkpoint.finish().expect("finish"), 2);
 
         let reopened = Arc::new(CheckpointStore::new(root.join("checkpoints")));
@@ -2165,7 +2188,9 @@ mod tests {
         recorder.baseline().expect("baseline");
         fs::write(workspace.join("one.txt"), "after one\n").expect("one");
         fs::write(workspace.join("two.txt"), "after two\n").expect("two");
-        recorder.commit_step().expect("step");
+        recorder
+            .commit_step(&[PathBuf::from("one.txt"), PathBuf::from("two.txt")])
+            .expect("step");
         assert_eq!(checkpoint.finish().expect("finish"), 2);
 
         let reopened = Arc::new(CheckpointStore::new(root.join("checkpoints")));

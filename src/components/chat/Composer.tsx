@@ -39,6 +39,8 @@ interface ComposerProps {
   onRemoveImage: (index: number) => void;
   projectName: string | null;
   projectTokens: number;
+  workspaceRoot: string;
+  workspaceLocked: boolean;
   onPickProject: () => void;
   onClearProject: () => void;
   activity: string | null;
@@ -83,6 +85,8 @@ export function Composer({
   onRemoveImage,
   projectName,
   projectTokens,
+  workspaceRoot,
+  workspaceLocked,
   onPickProject,
   onClearProject,
   activity,
@@ -352,6 +356,26 @@ export function Composer({
             </div>
           </div>
         </div>
+
+        {agentMode ? (
+          <div className="mt-1.5 flex min-w-0 items-center gap-1.5 rounded-lg border border-white/5 bg-white/[0.02] px-2 py-1 text-[9.5px] text-slate-600">
+            <FolderOpen className="h-3 w-3 shrink-0 text-acid-500/70" />
+            <span
+              className="min-w-0 break-all font-mono text-slate-400"
+              title={workspaceRoot || "No agent workspace selected"}
+            >
+              {workspaceRoot || "no agent workspace selected"}
+            </span>
+            {workspaceLocked ? (
+              <span
+                className="ml-auto shrink-0 rounded border border-amber-400/20 bg-amber-400/5 px-1 py-px text-[8px] uppercase tracking-wider text-amber-300/80"
+                title="The agent workspace is pinned while a run or pending undo exists."
+              >
+                locked
+              </span>
+            ) : null}
+          </div>
+        ) : null}
 
         <div className="mt-1.5 flex items-center justify-between text-[9.5px] text-slate-600">
           <span>

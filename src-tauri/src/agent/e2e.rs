@@ -209,6 +209,26 @@ fn execute_headless(
     events: AgentEvents,
     journal: &RunJournal,
 ) -> Result<AgentFinish, AgentFailure> {
+    execute_headless_with_recorder(
+        request,
+        base_url,
+        context_window,
+        control,
+        events,
+        journal,
+        None,
+    )
+}
+
+fn execute_headless_with_recorder(
+    request: AgentRequest,
+    base_url: String,
+    context_window: usize,
+    control: Arc<RunControl>,
+    events: AgentEvents,
+    journal: &RunJournal,
+    recorder: Option<Arc<RunRecorder>>,
+) -> Result<AgentFinish, AgentFailure> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -230,7 +250,7 @@ fn execute_headless(
             request: &request,
             run_id: &request.run_id,
             conversation_id: &request.conversation_id,
-            recorder: None,
+            recorder,
         };
         execute(&context).await
     })
@@ -682,6 +702,136 @@ fn file_edits_preview_and_undo() {
         "before\n"
     );
     assert!(!root.join("new.txt").exists());
+}
+
+#[test]
+fn shell_command_does_not_attribute_concurrent_user_edits() {
+    let root = workspace("shell-race");
+    std::fs::write(root.join("builtin.txt"), "before\n").expect("write builtin");
+    let checkpoint_root = root.with_extension("checkpoints");
+    let _ = std::fs::remove_dir_all(&checkpoint_root);
+    let store = Arc::new(CheckpointStore::new(checkpoint_root.clone()));
+    let checkpoint = store
+        .begin("e2e-shell-race", &root)
+        .expect("begin checkpoint");
+    let recorder = checkpoint.recorder();
+
+    let turns = Arc::new(AtomicUsize::new(0));
+    let engine_turns = turns.clone();
+    let engine = FakeEngine::start(move |_request| {
+        match engine_turns.fetch_add(1, Ordering::SeqCst) {
+            // The shell step creates agent.txt while the test writes user.txt.
+            // Neither path was named by a built-in file tool, so neither may
+            // become undoable.
+            0 => sse_tool(
+                "run_command",
+                r#"{"command":"touch started.flag; sleep 1; echo agent > agent.txt"}"#,
+                "call_1",
+            ),
+            1 => sse_tool(
+                "write_file",
+                r#"{"path":"builtin.txt","content":"after\n"}"#,
+                "call_2",
+            ),
+            _ => sse_text("Finished."),
+        }
+    });
+
+    let control = Arc::new(RunControl::default());
+    let events = AgentEvents::capture();
+    let _approvals = approve_when_requested(events.clone(), control.clone());
+    let journal = RunJournal::default();
+    let mut request = request_with(&root, ApprovalPolicy::All);
+    request.max_iterations = 6;
+
+    let user_edit = {
+        let root = root.clone();
+        thread::spawn(move || {
+            for _ in 0..200 {
+                if root.join("started.flag").exists() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                root.join("started.flag").exists(),
+                "the shell command never started"
+            );
+            std::fs::write(root.join("user.txt"), "user\n").expect("concurrent user edit");
+        })
+    };
+
+    let finish = execute_headless_with_recorder(
+        request,
+        engine.base_url(),
+        16_384,
+        control,
+        events.clone(),
+        &journal,
+        Some(recorder),
+    )
+    .expect("agent run should finish");
+    user_edit.join().expect("user edit thread");
+
+    assert_eq!(finish.status, "completed");
+    assert_eq!(
+        std::fs::read_to_string(root.join("builtin.txt")).expect("read builtin"),
+        "after\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("agent.txt")).expect("read agent file"),
+        "agent\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("user.txt")).expect("read user file"),
+        "user\n"
+    );
+
+    assert_eq!(
+        checkpoint.finish().expect("finish checkpoint"),
+        1,
+        "only the built-in edit is attributable"
+    );
+    let state = store.state("e2e-shell-race").expect("checkpoint state");
+    let paths: Vec<&str> = state.files.iter().map(|file| file.path.as_str()).collect();
+    assert_eq!(paths, vec!["builtin.txt"], "{:?}", state.files);
+    assert!(!paths.contains(&"agent.txt"));
+    assert!(!paths.contains(&"user.txt"));
+    assert!(!paths.contains(&"started.flag"));
+
+    let outcome = store.undo("e2e-shell-race").expect("undo");
+    assert_eq!(outcome.restored, 1);
+    assert_eq!(
+        std::fs::read_to_string(root.join("builtin.txt")).expect("read builtin"),
+        "before\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("agent.txt")).expect("agent survives undo"),
+        "agent\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("user.txt")).expect("user survives undo"),
+        "user\n"
+    );
+    assert!(root.join("started.flag").exists(), "shell file survives undo");
+
+    let canonical = std::fs::canonicalize(&root).expect("canonical workspace");
+    let approvals: Vec<_> = events
+        .captured()
+        .into_iter()
+        .filter(|event| event.name == "agent:approval_needed")
+        .collect();
+    assert_eq!(approvals.len(), 2, "shell and built-in edit both prompt");
+    for approval in approvals {
+        assert_eq!(
+            approval.payload["workspace_root"],
+            canonical.to_string_lossy().as_ref(),
+            "approval cards carry the pinned absolute workspace"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&checkpoint_root);
 }
 
 #[test]

@@ -110,6 +110,21 @@ export function ChatView({ engine, chat }: ChatViewProps) {
   const [mcpOpen, setMcpOpen] = useState(false);
   const endRef = useRef<HTMLDivElement>(null);
 
+  const workspaceLocked = useMemo(
+    () =>
+      chat.sessions.some((session) =>
+        session.messages.some((message) => {
+          const trace = message.agentTrace;
+          return Boolean(
+            trace &&
+              (trace.status === "running" ||
+                (trace.undo_available && !trace.undone)),
+          );
+        }),
+      ),
+    [chat.sessions],
+  );
+
   const ready = engine.snapshot.status === "ready";
   const activeKind = engine.active?.kind ?? null;
   const currentModelPath = settings?.model_path ?? "";
@@ -229,13 +244,19 @@ export function ChatView({ engine, chat }: ChatViewProps) {
   // The path picker only chooses a folder; Rust canonicalises it and enforces
   // it as the sandbox root for every built-in tool.
   const pickWorkspace = useCallback(async () => {
+    if (workspaceLocked) {
+      chat.setError(
+        "The agent workspace is locked while a run or pending undo exists.",
+      );
+      return;
+    }
     try {
       const picked = await open({ multiple: false, directory: true });
       if (typeof picked === "string") agent.update("workspaceRoot", picked);
     } catch (err) {
       chat.setError(errorMessage(err));
     }
-  }, [agent, chat]);
+  }, [agent, chat, workspaceLocked]);
 
   const agentActions = useMemo<AgentActions>(
     () => ({
@@ -709,6 +730,8 @@ export function ChatView({ engine, chat }: ChatViewProps) {
           }
           projectName={project?.name ?? null}
           projectTokens={project?.tokens ?? 0}
+          workspaceRoot={agent.preferences.workspaceRoot}
+          workspaceLocked={workspaceLocked}
           onPickProject={() => void pickProject()}
           onClearProject={() => setProject(null)}
           activity={activity}
@@ -752,6 +775,7 @@ export function ChatView({ engine, chat }: ChatViewProps) {
         agentPreferences={agent.preferences}
         onAgentUpdate={agent.update}
         onPickWorkspace={pickWorkspace}
+        workspaceLocked={workspaceLocked}
         systemPrompt={systemPrompt}
         onSystemPromptChange={setSystemPrompt}
         usage={chat.usage}

@@ -600,6 +600,8 @@ export interface AgentPendingApproval {
   /** write_file/edit_file, which can be allowed for the rest of the run. */
   file_edit?: boolean;
   preview?: AgentDiffPreview | null;
+  /** Canonical root pinned for this run. */
+  workspace_root?: string;
 }
 
 export interface AgentChangedFile {
@@ -632,6 +634,8 @@ export interface AgentTrace {
   undo_files: AgentUndoFile[];
   /** File summary for runs without a workspace checkpoint. */
   changes: AgentChangedFile[];
+  /** Canonical workspace root pinned when this run started. */
+  workspace_root: string;
   started_at: number;
   finished_at: number | null;
 }
@@ -717,6 +721,7 @@ export interface AgentApprovalEvent {
   reason: string;
   file_edit: boolean;
   preview?: AgentDiffPreview | null;
+  workspace_root?: string | null;
 }
 
 export type AgentUndoState =
@@ -784,6 +789,7 @@ export interface AgentDoneEvent {
   changed_files: number;
   /** Present for runs without a workspace checkpoint. */
   changes: AgentChangedFile[];
+  workspace_root?: string | null;
 }
 
 export interface AgentErrorEvent {

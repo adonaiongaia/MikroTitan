@@ -369,6 +369,19 @@ function ApprovalCard({
           </span>
         </div>
         <p className="mt-1 text-[10px] leading-4 text-amber-200/60">{pending.reason}</p>
+        {pending.workspace_root ? (
+          <p className="mt-1 flex min-w-0 items-center gap-1.5 text-[9px] text-slate-500">
+            <span className="shrink-0 uppercase tracking-wider text-slate-600">
+              Workspace
+            </span>
+            <code
+              className="min-w-0 break-all font-mono text-slate-400"
+              title={pending.workspace_root}
+            >
+              {pending.workspace_root}
+            </code>
+          </p>
+        ) : null}
 
         {pending.preview ? (
           <>

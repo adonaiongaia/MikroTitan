@@ -265,6 +265,9 @@ pub struct AgentApprovalEvent {
     /// the run. Shell and MCP approvals never get that shortcut.
     pub file_edit: bool,
     pub preview: Option<AgentDiffPreview>,
+    /// Canonical workspace root pinned when the run started. The UI uses this
+    /// to show the exact folder the approval applies to.
+    pub workspace_root: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -313,6 +316,8 @@ pub struct AgentDoneEvent {
     /// Summary for runs without a workspace checkpoint. Checkpoint runs use
     /// the richer per-file undo state instead.
     pub changes: Vec<RunFileChange>,
+    /// Canonical workspace root pinned for this run.
+    pub workspace_root: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -997,7 +1002,10 @@ pub async fn agent_start(
     };
 
     let (control, journal) = manager.begin(&request.run_id, workspace.as_deref())?;
-    let mut checkpoint_setup = CheckpointSetup::default();
+    let mut checkpoint_setup = CheckpointSetup {
+        workspace: workspace.clone(),
+        ..CheckpointSetup::default()
+    };
     if let Some(workspace) = workspace {
         if let Some(store) = manager.checkpoint_store() {
             let run_id = request.run_id.clone();
@@ -1257,6 +1265,9 @@ struct AgentFinish {
 struct CheckpointSetup {
     checkpoint: Option<RunCheckpoint>,
     note: Option<String>,
+    /// Canonical root resolved before the run starts. Keeping it here pins the
+    /// path shown in the UI even if the preference changes later.
+    workspace: Option<PathBuf>,
 }
 
 struct RunContext<'a> {
@@ -1334,6 +1345,7 @@ impl RunContext<'_> {
         risk: Risk,
         reason: &str,
         preview: Option<&AgentDiffPreview>,
+        workspace: Option<&Path>,
     ) {
         self.events.emit(
             "agent:approval_needed",
@@ -1347,6 +1359,7 @@ impl RunContext<'_> {
                 reason: reason.to_string(),
                 file_edit: is_file_edit_tool(tool),
                 preview: preview.cloned(),
+                workspace_root: workspace.map(|path| path.to_string_lossy().to_string()),
             },
         );
     }
@@ -1417,7 +1430,14 @@ async fn run_agent(
     config: AgentRuntimeConfig,
     request: AgentRequest,
 ) {
-    let CheckpointSetup { checkpoint, note } = checkpoint_setup;
+    let CheckpointSetup {
+        checkpoint,
+        note,
+        workspace,
+    } = checkpoint_setup;
+    let workspace_root = workspace
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string());
     let recorder = checkpoint
         .as_ref()
         .map(|checkpoint| checkpoint.recorder());
@@ -1520,6 +1540,7 @@ async fn run_agent(
             final_content,
             changed_files,
             changes,
+            workspace_root,
         },
     );
 }
@@ -1924,6 +1945,7 @@ async fn execute(context: &RunContext<'_>) -> Result<AgentFinish, AgentFailure> 
                     decision.risk,
                     &decision.reason,
                     preview.as_ref(),
+                    workspace.as_deref(),
                 );
                 match await_approval(context, receiver).await {
                     Resolution::Aborted => return Err(AgentFailure::Aborted),
@@ -1949,12 +1971,15 @@ async fn execute(context: &RunContext<'_>) -> Result<AgentFinish, AgentFailure> 
                 }
             }
 
-            // Bracket mutating tools so their files are attributed to the run.
-            // Read-only tools cannot change the workspace, so they are skipped.
+            // Only a built-in file edit has a trustworthy target path. Shell
+            // and MCP mutations have no provenance: a concurrent user edit in
+            // the same window would otherwise be recorded as the agent's and
+            // restored by undo. They are deliberately not attributed.
             let recorder = context
                 .recorder
                 .clone()
-                .filter(|_| !matches!(risk, Risk::ReadOnly));
+                .filter(|_| is_file_edit_tool(&tool_name));
+            let trusted_paths = attribution_path(workspace.as_deref(), &tool_name, &arguments_value);
             if let Some(recorder) = recorder.as_ref() {
                 let recorder = recorder.clone();
                 let _ = tauri::async_runtime::spawn_blocking(move || recorder.baseline()).await;
@@ -1970,7 +1995,9 @@ async fn execute(context: &RunContext<'_>) -> Result<AgentFinish, AgentFailure> 
             .await;
             let duration_ms = started.elapsed().as_millis() as u64;
             if let Some(recorder) = recorder {
-                let _ = tauri::async_runtime::spawn_blocking(move || recorder.commit_step()).await;
+                let paths = trusted_paths;
+                let _ = tauri::async_runtime::spawn_blocking(move || recorder.commit_step(&paths))
+                    .await;
             }
 
             let (ok, text) = match outcome {
@@ -2663,6 +2690,26 @@ fn workspace_tools(has_workspace: bool, web_search: bool) -> Vec<Value> {
 
 fn is_file_edit_tool(tool: &str) -> bool {
     matches!(tool, "write_file" | "edit_file")
+}
+
+/// Resolve the target a built-in file edit actually claimed. Anything that
+/// cannot be resolved inside the pinned workspace returns no trusted path, so
+/// the recorder attributes nothing rather than guessing.
+fn attribution_path(root: Option<&Path>, tool: &str, arguments: &Value) -> Vec<PathBuf> {
+    if !is_file_edit_tool(tool) {
+        return Vec::new();
+    }
+    let Some(root) = root else {
+        return Vec::new();
+    };
+    let Some(raw) = arguments.get("path").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    sandbox_path(root, raw)
+        .ok()
+        .and_then(|path| path.strip_prefix(root).ok().map(Path::to_path_buf))
+        .into_iter()
+        .collect()
 }
 
 /// Whether this specific call pauses for approval.
