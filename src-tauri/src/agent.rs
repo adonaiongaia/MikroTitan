@@ -292,6 +292,15 @@ pub struct AgentCompactEvent {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct RunFileChange {
+    /// Workspace-relative path, using forward slashes for display.
+    pub path: String,
+    /// `created`, `modified` or `deleted`.
+    pub kind: String,
+    pub restored: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct AgentDoneEvent {
     pub run_id: String,
     pub conversation_id: String,
@@ -301,6 +310,9 @@ pub struct AgentDoneEvent {
     pub final_content: String,
     /// Number of files whose pre-images are available for a per-run undo.
     pub changed_files: u32,
+    /// Summary for runs without a workspace checkpoint. Checkpoint runs use
+    /// the richer per-file undo state instead.
+    pub changes: Vec<RunFileChange>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -524,6 +536,28 @@ impl RunJournal {
             restored: false,
             kept: false,
         });
+    }
+
+    /// The run's file summary. Journal-only runs have no checkpoint, so this
+    /// is the only record of which files they changed.
+    fn summaries(&self) -> Vec<RunFileChange> {
+        let Ok(state) = self.state.lock() else {
+            return Vec::new();
+        };
+        let Some(root) = state.root.as_ref() else {
+            return Vec::new();
+        };
+        let mut changes: Vec<RunFileChange> = state
+            .changes
+            .iter()
+            .map(|change| RunFileChange {
+                path: journal_label(root, &change.path),
+                kind: journal_kind(change).to_string(),
+                restored: change.restored,
+            })
+            .collect();
+        changes.sort_by(|left, right| left.path.cmp(&right.path));
+        changes
     }
 
     /// Restore the requested workspace-relative paths. Entries that could not
@@ -1019,19 +1053,35 @@ pub fn agent_resolve_approval(
         ApprovalChoice::Reject => Resolution::Rejected(reply.feedback.trim().to_string()),
         ApprovalChoice::Abort => Resolution::Aborted,
     };
-    let aborted = matches!(resolution, Resolution::Aborted);
-    if matches!(resolution, Resolution::Approved) && reply.allow_file_edits {
-        control.allow_file_edits();
-    }
-    if !control.resolve(&reply.step_id, resolution) {
+    if !resolve_approval(&control, &reply.step_id, resolution, reply.allow_file_edits) {
         return Err(AppError::message(
             "That approval step already finished. The agent may have moved on.",
         ));
     }
+    Ok(())
+}
+
+/// Apply a single-use approval. The run-wide file-edit allowance is granted
+/// only after the step was actually accepted, so a stale or replayed approval
+/// cannot widen permissions.
+fn resolve_approval(
+    control: &RunControl,
+    step_id: &str,
+    resolution: Resolution,
+    allow_file_edits: bool,
+) -> bool {
+    let approved = matches!(resolution, Resolution::Approved);
+    let aborted = matches!(resolution, Resolution::Aborted);
+    if !control.resolve(step_id, resolution) {
+        return false;
+    }
+    if approved && allow_file_edits {
+        control.allow_file_edits();
+    }
     if aborted {
         control.cancel();
     }
-    Ok(())
+    true
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -1412,7 +1462,7 @@ async fn run_agent(
         }
     };
 
-    let journal_changed = journal.pending_count();
+    let journal_changes = journal.summaries();
     let checkpoint_changed = match checkpoint {
         Some(checkpoint) => {
             match tauri::async_runtime::spawn_blocking(move || checkpoint.finish()).await {
@@ -1447,7 +1497,14 @@ async fn run_agent(
         }
         None => None,
     };
-    let changed_files = checkpoint_changed.unwrap_or(journal_changed);
+    let changed_files = checkpoint_changed.unwrap_or(journal_changes.len() as u32);
+    // The checkpoint has its own per-file undo state. Only the journal-only
+    // fallback needs the separate run-change summary.
+    let changes = if checkpoint_changed.is_some() {
+        Vec::new()
+    } else {
+        journal_changes
+    };
 
     // Remove the run before announcing it as done: the UI offers Undo as soon
     // as this event arrives, and undo refuses while a run is active.
@@ -1462,6 +1519,7 @@ async fn run_agent(
             elapsed_ms: started.elapsed().as_millis() as u64,
             final_content,
             changed_files,
+            changes,
         },
     );
 }
@@ -3591,10 +3649,11 @@ fn journal_label(root: &Path, path: &Path) -> String {
 }
 
 fn journal_kind(change: &FileChange) -> &'static str {
+    // Journal entries come from write_file/edit_file. A zero-byte result is a
+    // modified file, not a deleted one; deletion has its own tool and is not
+    // journaled as an empty write.
     if change.before.is_none() {
         "created"
-    } else if change.after.is_empty() {
-        "deleted"
     } else {
         "modified"
     }
@@ -5541,6 +5600,28 @@ mod tests {
     }
 
     #[test]
+    fn stale_approval_cannot_grant_file_edits() {
+        let control = RunControl::default();
+        assert!(!control.file_edits_allowed());
+        assert!(!resolve_approval(
+            &control,
+            "missing-step",
+            Resolution::Approved,
+            true
+        ));
+        assert!(!control.file_edits_allowed());
+
+        let _receiver = control.request_approval("step-3").expect("gate");
+        assert!(resolve_approval(
+            &control,
+            "step-3",
+            Resolution::Approved,
+            true
+        ));
+        assert!(control.file_edits_allowed());
+    }
+
+    #[test]
     fn diff_preview_is_bounded_and_reports_counts() {
         let (diff, added, removed, truncated) =
             line_diff("one\ntwo\nthree\n", "one\nTWO\nthree\n");
@@ -5631,6 +5712,50 @@ mod tests {
         assert!(retry.files.is_empty(), "{:?}", retry.files);
         assert_eq!(std::fs::read_to_string(&note).unwrap(), "before\n");
         assert_eq!(journal.pending_count(), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn journal_summaries_keep_kinds_and_empty_edits_are_modified() {
+        let root = temp_workspace("journal-summaries");
+        let note = root.join("note.txt");
+        let created = root.join("created.txt");
+        let emptied = root.join("emptied.txt");
+        let journal = RunJournal::default();
+
+        journal.record(&root, &note, Some(b"before\n".to_vec()), b"after\n".to_vec());
+        journal.record(&root, &created, None, b"new\n".to_vec());
+        journal.record(&root, &emptied, Some(b"before\n".to_vec()), Vec::new());
+
+        let changes = journal.summaries();
+        assert_eq!(changes.len(), 3);
+        let by_path = |path: &str| {
+            changes
+                .iter()
+                .find(|change| change.path == path)
+                .unwrap_or_else(|| panic!("missing {path} in {changes:?}"))
+        };
+        assert_eq!(by_path("note.txt").kind, "modified");
+        assert_eq!(by_path("created.txt").kind, "created");
+        assert_eq!(
+            by_path("emptied.txt").kind,
+            "modified",
+            "an edited-to-empty file is not a deletion"
+        );
+        assert!(changes.iter().all(|change| !change.restored));
+
+        journal.keep_selected(&[PathBuf::from("note.txt")]);
+        let changes = journal.summaries();
+        assert!(changes
+            .iter()
+            .find(|change| change.path == "note.txt")
+            .expect("note summary")
+            .restored);
+        assert!(!changes
+            .iter()
+            .find(|change| change.path == "created.txt")
+            .expect("created summary")
+            .restored);
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -602,6 +602,13 @@ export interface AgentPendingApproval {
   preview?: AgentDiffPreview | null;
 }
 
+export interface AgentChangedFile {
+  /** Workspace-relative path. */
+  path: string;
+  kind: "created" | "modified" | "deleted" | string;
+  restored: boolean;
+}
+
 export interface AgentTrace {
   run_id: string;
   status: AgentRunStatus;
@@ -623,6 +630,8 @@ export interface AgentTrace {
   undo_summary: string | null;
   /** Per-file undo state and attempt history, newest attempt last. */
   undo_files: AgentUndoFile[];
+  /** File summary for runs without a workspace checkpoint. */
+  changes: AgentChangedFile[];
   started_at: number;
   finished_at: number | null;
 }
@@ -773,6 +782,8 @@ export interface AgentDoneEvent {
   elapsed_ms: number;
   final_content: string;
   changed_files: number;
+  /** Present for runs without a workspace checkpoint. */
+  changes: AgentChangedFile[];
 }
 
 export interface AgentErrorEvent {

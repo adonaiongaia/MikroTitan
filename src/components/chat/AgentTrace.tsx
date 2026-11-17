@@ -99,6 +99,13 @@ const RISK_LABEL: Record<AgentRisk, string> = {
   irreversible: "always confirm",
 };
 
+function changeKindLabel(kind: string | null | undefined): string {
+  const value = (kind ?? "").trim().toLowerCase();
+  return value === "created" || value === "deleted" || value === "modified"
+    ? value
+    : "modified";
+}
+
 const UNDO_STATE_STYLE: Record<
   AgentUndoState,
   { label: string; chip: string; dot: string }
@@ -508,7 +515,7 @@ function UndoFileRow({
                 : "border-amber-400/20 bg-amber-400/5 text-amber-300/80",
           )}
         >
-          {file.kind}
+          {changeKindLabel(file.kind)}
         </span>
         <code
           className="min-w-0 flex-1 truncate font-mono text-[10px] text-slate-300"
@@ -717,6 +724,54 @@ export function AgentTraceView({ trace, streaming, actions }: AgentTraceProps) {
         <p className="border-t border-rose-400/15 bg-rose-500/5 px-3 py-1.5 text-[9.5px] leading-4 text-rose-300">
           {trace.error}
         </p>
+      ) : null}
+
+      {trace.changes.length && !undoFiles.length ? (
+        <div className="border-t border-white/5">
+          <div className="flex items-center gap-2 px-3 py-2">
+            <span className="text-[8px] uppercase tracking-[0.16em] text-slate-600">
+              Run changes
+            </span>
+            <span className="font-mono text-[9px] text-slate-600">
+              {trace.changes.length} file{trace.changes.length === 1 ? "" : "s"}
+            </span>
+          </div>
+          <ul className="divide-y divide-white/5 border-t border-white/5">
+            {trace.changes.map((change) => (
+              <li
+                key={change.path}
+                className="flex items-center gap-2 px-3 py-1.5"
+              >
+                <span
+                  className={cn(
+                    "shrink-0 rounded border px-1 py-px text-[7.5px] uppercase tracking-wider",
+                    change.kind === "created"
+                      ? "border-emerald-400/20 bg-emerald-400/5 text-emerald-300/80"
+                      : change.kind === "deleted"
+                        ? "border-rose-400/20 bg-rose-400/5 text-rose-300/80"
+                        : "border-amber-400/20 bg-amber-400/5 text-amber-300/80",
+                  )}
+                >
+                  {changeKindLabel(change.kind)}
+                </span>
+                <code className="min-w-0 flex-1 truncate font-mono text-[9.5px] text-slate-300">
+                  {change.path}
+                </code>
+                {change.restored ? (
+                  <span className="inline-flex shrink-0 items-center gap-1 text-[9px] text-slate-500">
+                    <Check className="h-2.5 w-2.5" />
+                    restored
+                  </span>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+          <p className="border-t border-white/5 px-3 py-1.5 text-[9px] leading-4 text-slate-600">
+            {trace.undo_available
+              ? "This run had no workspace checkpoint; undo covers these built-in file edits."
+              : "This run had no workspace checkpoint. Its journal is only available for the current app session."}
+          </p>
+        </div>
       ) : null}
 
       {undoFiles.length ? (

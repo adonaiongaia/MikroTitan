@@ -290,6 +290,20 @@ function normalizeAgentTrace(value: unknown): AgentTrace | undefined {
           .map(normalizeUndoFile)
           .filter((file): file is AgentUndoFile => file !== null)
       : [],
+    changes: Array.isArray(trace.changes)
+      ? trace.changes
+          .filter((change) => Boolean(change) && typeof change === "object")
+          .map((change) => ({
+            path: typeof change.path === "string" ? change.path : "",
+            kind:
+              typeof change.kind === "string" && change.kind
+                ? change.kind
+                : "modified",
+            restored: Boolean(change.restored),
+          }))
+          .filter((change) => change.path.length > 0)
+          .slice(0, 500)
+      : [],
     started_at: typeof trace.started_at === "number" ? trace.started_at : Date.now(),
     finished_at:
       typeof trace.finished_at === "number" ? trace.finished_at : null,
@@ -800,6 +814,11 @@ export function useChat() {
                   notice: null,
                   undo_available: event.payload.changed_files > 0,
                   undo_files: [],
+                  changes:
+                    Array.isArray(event.payload.changes) &&
+                    event.payload.changes.length
+                      ? event.payload.changes
+                      : message.agentTrace.changes,
                 }
               : null,
           }));
@@ -1039,6 +1058,7 @@ export function useChat() {
         undo_error: null,
         undo_summary: null,
         undo_files: [],
+        changes: [],
         started_at: now,
         finished_at: null,
       };
@@ -1281,6 +1301,16 @@ export function useChat() {
         undo_error: null,
         undo_summary: undoSummary(result),
         undo_files: result.files.length ? result.files : trace.undo_files,
+        changes: trace.changes.map((change) => {
+          const file = result.files.find((entry) => entry.path === change.path);
+          if (file) {
+            return {
+              ...change,
+              restored: file.state === "restored" || file.state === "kept",
+            };
+          }
+          return result.complete ? { ...change, restored: true } : change;
+        }),
       }));
     },
     [updateTraceByRun],
