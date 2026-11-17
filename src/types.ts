@@ -538,10 +538,15 @@ export interface McpActivityEvent {
 // ---------------------------------------------------------------------------
 
 export type AgentApprovalPolicy = "destructive" | "all" | "auto";
-export type AgentRisk = "read_only" | "mutating" | "destructive";
+export type AgentRisk =
+  | "read_only"
+  | "mutating"
+  | "destructive"
+  | "irreversible";
 export type AgentRunStatus =
   | "running"
   | "completed"
+  | "verification_failed"
   | "max_iterations"
   | "aborted"
   | "error";
@@ -592,6 +597,8 @@ export interface AgentPendingApproval {
   arguments: string;
   risk: AgentRisk;
   reason: string;
+  /** write_file/edit_file, which can be allowed for the rest of the run. */
+  file_edit?: boolean;
   preview?: AgentDiffPreview | null;
 }
 
@@ -629,6 +636,8 @@ export interface AgentPreferences {
   planningStep: boolean;
   autoCompact: boolean;
   compactionThreshold: number;
+  /** Runs after file edits before the agent may finish; empty disables it. */
+  verifyCommand: string;
 }
 
 export interface AgentRunRequest {
@@ -651,6 +660,7 @@ export interface AgentRunRequest {
   auto_compact: boolean;
   compaction_threshold: number;
   web_search: boolean;
+  verify_command: string;
   mcp_servers: McpServerInput[];
 }
 
@@ -659,6 +669,8 @@ export interface AgentApprovalReply {
   step_id: string;
   decision: "approve" | "reject" | "abort";
   feedback: string;
+  /** Only meaningful with "approve"; never applies to shell or MCP tools. */
+  allow_file_edits?: boolean;
 }
 
 export interface AgentPlanEvent {
@@ -694,6 +706,7 @@ export interface AgentApprovalEvent {
   arguments: string;
   risk: AgentRisk;
   reason: string;
+  file_edit: boolean;
   preview?: AgentDiffPreview | null;
 }
 
@@ -713,6 +726,8 @@ export interface AgentUndoAttempt {
 
 export interface AgentUndoFile {
   path: string;
+  /** `created`, `modified` or `deleted`, for the run-change summary. */
+  kind: "created" | "modified" | "deleted" | string;
   state: AgentUndoState;
   reason: string | null;
   attempts: number;

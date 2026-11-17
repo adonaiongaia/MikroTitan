@@ -922,15 +922,49 @@ function AgentConfiguration({
               className="field !px-2 !py-1.5 text-[10.5px]"
             >
               <option value="destructive">Ask for destructive actions</option>
-              <option value="all">Ask for all tools</option>
+              <option value="all">Ask for everything except reads</option>
               <option value="auto">Full auto</option>
             </select>
             <span className="block text-[10px] leading-4 text-slate-600">
               {preferences.approvalPolicy === "auto"
-                ? "Every tool runs without pausing. Use only in a workspace you trust."
+                ? "Every normal tool runs without pausing. Irreversible commands and sensitive paths still ask. Use only in a workspace you trust."
                 : preferences.approvalPolicy === "all"
-                  ? "Every tool call pauses for Approve, Reject or Abort."
-                  : "Read-only tools run automatically; writes, shell commands and MCP mutations pause."}
+                  ? "Writes, shell commands and MCP tools pause for approval. Read-only tools run automatically."
+                  : "Read-only tools run automatically. Writes, shell commands and MCP tools pause for approval."}
+            </span>
+            {preferences.approvalPolicy !== "auto" ? (
+              <span className="block text-[10px] leading-4 text-slate-600">
+                “Allow file edits for this run” covers only write_file and
+                edit_file. Shell commands and MCP tools still pause for
+                approval.
+              </span>
+            ) : null}
+            <span className="block text-[10px] leading-4 text-slate-600">
+              Sensitive paths (.env, .git, SSH keys, cloud credentials) always
+              ask when named in a tool path or command. Irreversible commands
+              (force-push, reset --hard, rm -rf, publishing, curl | sh) always
+              ask, even under Full auto. Tool output is scrubbed for likely
+              secrets before it reaches the trace or model.
+            </span>
+          </label>
+
+          <label className="block space-y-1">
+            <span className="block text-[10px] text-slate-500">
+              Verification command
+            </span>
+            <input
+              value={preferences.verifyCommand ?? ""}
+              onChange={(event) =>
+                onUpdate("verifyCommand", event.target.value)
+              }
+              placeholder="npm test"
+              spellCheck={false}
+              className="field !px-2 !py-1.5 font-mono text-[10.5px]"
+            />
+            <span className="block text-[10px] leading-4 text-slate-600">
+              Runs in the workspace after file edits, before the agent can
+              finish. Leave empty to disable. It is pre-authorised, so it runs
+              without an approval prompt.
             </span>
           </label>
 

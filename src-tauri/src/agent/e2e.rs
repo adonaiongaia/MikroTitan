@@ -196,6 +196,7 @@ fn request_with(workspace: &Path, policy: ApprovalPolicy) -> AgentRequest {
         auto_compact: false,
         compaction_threshold: 0.75,
         web_search: false,
+        verify_command: String::new(),
         mcp_servers: Vec::new(),
     }
 }
@@ -305,7 +306,7 @@ fn abort_when_requested(events: AgentEvents, control: Arc<RunControl>) -> Driver
 // ---------------------------------------------------------------------------
 
 #[test]
-fn tool_call_approval_and_duplicate_detection() {
+fn read_only_calls_skip_approval_and_duplicates_are_blocked() {
     let root = workspace("approval");
     std::fs::write(root.join("note.txt"), "hello agent\n").expect("write note");
 
@@ -349,9 +350,10 @@ fn tool_call_approval_and_duplicate_detection() {
         .iter()
         .filter(|event| event.name == "agent:approval_needed")
         .collect();
-    assert_eq!(approvals.len(), 1, "only the first call needs approval");
-    assert_eq!(approvals[0].payload["tool"], "read_file");
-    assert_eq!(approvals[0].payload["risk"], "read_only");
+    assert!(
+        approvals.is_empty(),
+        "read-only tools are blanket-approved even under the strict policy"
+    );
 
     assert_eq!(
         captured
@@ -671,7 +673,7 @@ fn file_edits_preview_and_undo() {
         .contains("+created"));
     assert_eq!(created["removed"].as_u64(), Some(0));
 
-    let result = undo_journal(&journal);
+    let result = journal.undo_all();
     assert_eq!(result.restored, 1);
     assert_eq!(result.deleted, 1);
     assert!(result.files.is_empty(), "{:?}", result.files);
@@ -683,12 +685,262 @@ fn file_edits_preview_and_undo() {
 }
 
 #[test]
+fn file_edit_allowance_does_not_cover_shell_commands() {
+    let root = workspace("allow-edits");
+
+    let turns = Arc::new(AtomicUsize::new(0));
+    let engine_turns = turns.clone();
+    let engine = FakeEngine::start(move |_request| {
+        match engine_turns.fetch_add(1, Ordering::SeqCst) {
+            0 => sse_tool(
+                "write_file",
+                r#"{"path":"note.txt","content":"written\n"}"#,
+                "call_1",
+            ),
+            1 => sse_tool("run_command", r#"{"command":"true"}"#, "call_2"),
+            _ => sse_text("Finished."),
+        }
+    });
+
+    let control = Arc::new(RunControl::default());
+    control.allow_file_edits();
+    let events = AgentEvents::capture();
+    let _approvals = approve_when_requested(events.clone(), control.clone());
+    let journal = RunJournal::default();
+    let mut request = request_with(&root, ApprovalPolicy::All);
+    request.max_iterations = 6;
+
+    let finish = execute_headless(
+        request,
+        engine.base_url(),
+        16_384,
+        control,
+        events.clone(),
+        &journal,
+    )
+    .expect("agent run should finish");
+
+    assert_eq!(finish.status, "completed");
+    assert_eq!(
+        std::fs::read_to_string(root.join("note.txt")).expect("read note"),
+        "written\n"
+    );
+    let approvals: Vec<_> = events
+        .captured()
+        .into_iter()
+        .filter(|event| event.name == "agent:approval_needed")
+        .collect();
+    assert_eq!(approvals.len(), 1, "only the shell command should pause");
+    assert_eq!(approvals[0].payload["tool"], "run_command");
+    assert_eq!(approvals[0].payload["file_edit"], false);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn verification_gate_blocks_completion_until_the_command_passes() {
+    let root = workspace("verify-gate");
+
+    let turns = Arc::new(AtomicUsize::new(0));
+    let engine_turns = turns.clone();
+    let engine = FakeEngine::start(move |_request| {
+        match engine_turns.fetch_add(1, Ordering::SeqCst) {
+            0 => sse_tool(
+                "write_file",
+                r#"{"path":"broken.txt","content":"needs a fix\n"}"#,
+                "call_1",
+            ),
+            1 => sse_text("Done. I wrote broken.txt."),
+            2 => sse_tool(
+                "write_file",
+                r#"{"path":"fixed.txt","content":"ok\n"}"#,
+                "call_2",
+            ),
+            _ => sse_text("Fixed the problem; verification should pass now."),
+        }
+    });
+
+    let control = Arc::new(RunControl::default());
+    let events = AgentEvents::capture();
+    let journal = RunJournal::default();
+    let mut request = request_with(&root, ApprovalPolicy::Auto);
+    request.max_iterations = 8;
+    request.verify_command = if cfg!(windows) {
+        "if exist fixed.txt (exit 0) else (exit 1)".into()
+    } else {
+        "test -f fixed.txt".into()
+    };
+
+    let finish = execute_headless(
+        request,
+        engine.base_url(),
+        16_384,
+        control,
+        events.clone(),
+        &journal,
+    )
+    .expect("agent run should finish");
+
+    assert_eq!(finish.status, "completed");
+    assert!(finish.final_content.contains("verification should pass"));
+
+    let captured = events.captured();
+    let verifications: Vec<&Value> = captured
+        .iter()
+        .filter(|event| {
+            event.name == "agent:tool_start" && event.payload["tool"] == "verify"
+        })
+        .map(|event| &event.payload)
+        .collect();
+    assert_eq!(verifications.len(), 2, "verification runs at each finish");
+    let results: Vec<&Value> = captured
+        .iter()
+        .filter(|event| {
+            event.name == "agent:tool_result" && event.payload["tool"] == "verify"
+        })
+        .map(|event| &event.payload)
+        .collect();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["ok"], false);
+    assert_eq!(results[1]["ok"], true);
+    assert!(
+        engine
+            .requests()
+            .iter()
+            .any(|request| request["messages"]
+                .to_string()
+                .contains("verification command failed")),
+        "the failure must be fed back to the model"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+#[cfg(unix)]
+fn irreversible_shell_commands_prompt_even_in_full_auto() {
+    let root = workspace("irreversible");
+    std::fs::write(root.join("doomed.txt"), "keep me\n").expect("write doomed");
+
+    let turns = Arc::new(AtomicUsize::new(0));
+    let engine_turns = turns.clone();
+    let engine = FakeEngine::start(move |_request| {
+        match engine_turns.fetch_add(1, Ordering::SeqCst) {
+            0 => sse_tool(
+                "run_command",
+                r#"{"command":"rm -rf doomed.txt"}"#,
+                "call_1",
+            ),
+            _ => sse_text("Removed the file."),
+        }
+    });
+
+    let control = Arc::new(RunControl::default());
+    let events = AgentEvents::capture();
+    let _approvals = approve_when_requested(events.clone(), control.clone());
+    let journal = RunJournal::default();
+    let mut request = request_with(&root, ApprovalPolicy::Auto);
+    request.max_iterations = 4;
+
+    let finish = execute_headless(
+        request,
+        engine.base_url(),
+        16_384,
+        control,
+        events.clone(),
+        &journal,
+    )
+    .expect("agent run should finish");
+
+    assert_eq!(finish.status, "completed");
+    let captured = events.captured();
+    let approvals: Vec<&Value> = captured
+        .iter()
+        .filter(|event| event.name == "agent:approval_needed")
+        .map(|event| &event.payload)
+        .collect();
+    assert_eq!(approvals.len(), 1, "Full auto must still stop here");
+    assert_eq!(approvals[0]["risk"], "irreversible");
+    assert!(approvals[0]["reason"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("Always confirm"));
+    assert!(!root.join("doomed.txt").exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn sensitive_files_prompt_and_their_output_is_redacted() {
+    let root = workspace("sensitive");
+    std::fs::write(root.join(".env"), "API_KEY=sk-testsecret1234567890\nSAFE=yes\n")
+        .expect("write env");
+
+    let turns = Arc::new(AtomicUsize::new(0));
+    let engine_turns = turns.clone();
+    let engine = FakeEngine::start(move |_request| {
+        match engine_turns.fetch_add(1, Ordering::SeqCst) {
+            0 => sse_tool("read_file", r#"{"path":".env"}"#, "call_1"),
+            _ => sse_text("Read the environment file."),
+        }
+    });
+
+    let control = Arc::new(RunControl::default());
+    let events = AgentEvents::capture();
+    let _approvals = approve_when_requested(events.clone(), control.clone());
+    let journal = RunJournal::default();
+    let mut request = request_with(&root, ApprovalPolicy::Auto);
+    request.max_iterations = 4;
+
+    let finish = execute_headless(
+        request,
+        engine.base_url(),
+        16_384,
+        control,
+        events.clone(),
+        &journal,
+    )
+    .expect("agent run should finish");
+
+    assert_eq!(finish.status, "completed");
+    let captured = events.captured();
+    let approvals: Vec<&Value> = captured
+        .iter()
+        .filter(|event| event.name == "agent:approval_needed")
+        .map(|event| &event.payload)
+        .collect();
+    assert_eq!(approvals.len(), 1, "a sensitive read must always ask");
+    assert!(approvals[0]["reason"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("Sensitive path guard"));
+    let result = captured
+        .iter()
+        .find(|event| {
+            event.name == "agent:tool_result" && event.payload["tool"] == "read_file"
+        })
+        .expect("read result");
+    let output = result.payload["output"].as_str().unwrap_or_default();
+    assert!(output.contains("[REDACTED]"), "{output}");
+    assert!(!output.contains("sk-testsecret1234567890"), "{output}");
+    assert!(
+        !engine
+            .requests()
+            .iter()
+            .any(|request| request.to_string().contains("sk-testsecret1234567890")),
+        "the secret must not reach the model"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn abort_stops_a_pending_approval() {
     let root = workspace("abort");
     std::fs::write(root.join("note.txt"), "hello agent\n").expect("write note");
 
     let engine = FakeEngine::start(|_| {
-        sse_tool("read_file", r#"{"path":"note.txt"}"#, "call_1")
+        sse_tool(
+            "write_file",
+            r#"{"path":"note.txt","content":"changed\n"}"#,
+            "call_1",
+        )
     });
 
     let control = Arc::new(RunControl::default());

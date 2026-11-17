@@ -239,13 +239,14 @@ export function ChatView({ engine, chat }: ChatViewProps) {
 
   const agentActions = useMemo<AgentActions>(
     () => ({
-      approve: async (runId, stepId) => {
+      approve: async (runId, stepId, options) => {
         try {
           await api.resolveAgentApproval({
             run_id: runId,
             step_id: stepId,
             decision: "approve",
             feedback: "",
+            allow_file_edits: options?.allowEdits ?? false,
           });
         } catch (err) {
           chat.setError(errorMessage(err));

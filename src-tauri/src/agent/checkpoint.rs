@@ -112,6 +112,10 @@ struct RunMetadata {
     /// checkpoints leave this empty and seed it from `attribution` on first use.
     #[serde(default)]
     undo_files: Vec<FileUndoEntry>,
+    /// Selective restores recorded by older checkpoints. Migrated into
+    /// `undo_files` the next time the checkpoint is read.
+    #[serde(default)]
+    restored_paths: Vec<PathBuf>,
     /// Filled when a metadata file is read; never serialized.
     #[serde(skip, default)]
     path: PathBuf,
@@ -155,6 +159,10 @@ pub struct UndoAttempt {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileUndoEntry {
     pub path: String,
+    /// `created`, `modified` or `deleted`, for the run-change summary. Older
+    /// checkpoints default to `modified` and are corrected from the diff.
+    #[serde(default = "default_change_kind")]
+    pub kind: String,
     pub state: FileUndoState,
     pub reason: Option<String>,
     pub attempts: u32,
@@ -162,9 +170,10 @@ pub struct FileUndoEntry {
 }
 
 impl FileUndoEntry {
-    fn pending(path: String) -> Self {
+    pub(crate) fn pending(path: String, kind: String) -> Self {
         Self {
             path,
+            kind,
             state: FileUndoState::Pending,
             reason: None,
             attempts: 0,
@@ -172,7 +181,11 @@ impl FileUndoEntry {
         }
     }
 
-    fn record(&mut self, action: UndoAction, state: FileUndoState, reason: Option<String>, at: u64) {
+    fn set_kind(&mut self, kind: &str) {
+        self.kind = kind.to_string();
+    }
+
+    pub(crate) fn record(&mut self, action: UndoAction, state: FileUndoState, reason: Option<String>, at: u64) {
         self.state = state;
         self.reason = reason.clone();
         self.attempts = self.attempts.saturating_add(1);
@@ -298,6 +311,7 @@ impl CheckpointStore {
             status: MetadataStatus::Running,
             attribution: None,
             undo_files: Vec::new(),
+            restored_paths: Vec::new(),
             path: PathBuf::new(),
         };
 
@@ -406,6 +420,12 @@ impl CheckpointStore {
             return Ok(());
         }
         metadata.undo_files = outcome.files.clone();
+        metadata.restored_paths = outcome
+            .files
+            .iter()
+            .filter(|file| file.state == FileUndoState::Restored)
+            .map(|file| PathBuf::from(&file.path))
+            .collect();
         self.write_metadata_at(&metadata.path, &metadata)?;
         let _ = self.cleanup_locked(Some(&metadata.checkpoint_id));
         Ok(())
@@ -424,7 +444,7 @@ impl CheckpointStore {
             .iter()
             .filter(|metadata| {
                 metadata.status == MetadataStatus::Complete
-                    && metadata.changed_files > 0
+                    && metadata_has_pending(metadata)
                     && metadata.post.is_some()
                     && metadata.workspace.is_dir()
                     && wanted.contains(metadata.run_id.as_str())
@@ -440,6 +460,20 @@ impl CheckpointStore {
     }
 
     pub fn has_complete(&self, run_id: &str) -> bool {
+        let Ok(_guard) = self.lock.lock() else {
+            return false;
+        };
+        self.find_complete_locked(run_id)
+            .ok()
+            .flatten()
+            .map(|metadata| metadata_has_pending(&metadata))
+            .unwrap_or(false)
+    }
+
+    /// True when a completed checkpoint exists for this run, even if every
+    /// file has already been restored. This keeps the in-memory journal from
+    /// making a fully restored run look undoable again.
+    pub fn has_record(&self, run_id: &str) -> bool {
         let Ok(_guard) = self.lock.lock() else {
             return false;
         };
@@ -1260,9 +1294,21 @@ impl RunCheckpoint {
             let mut metadata = store.read_metadata_path(&self.metadata_path)?;
             metadata.post = Some(post);
             metadata.changed_files = changed_files;
+            let kinds: HashMap<PathBuf, String> = entries
+                .iter()
+                .map(|entry| (entry.path.clone(), change_kind(entry).to_string()))
+                .collect();
             metadata.undo_files = kept
                 .iter()
-                .map(|path| FileUndoEntry::pending(path_label(&path.path)))
+                .map(|path| {
+                    FileUndoEntry::pending(
+                        path_label(&path.path),
+                        kinds
+                            .get(&path.path)
+                            .cloned()
+                            .unwrap_or_else(default_change_kind),
+                    )
+                })
                 .collect();
             metadata.attribution = Some(kept);
             metadata.status = MetadataStatus::Complete;
@@ -1414,10 +1460,59 @@ fn path_label(path: &Path) -> String {
 fn ensure_undo_files(metadata: &mut RunMetadata, entries: &[(DiffEntry, Option<AttributedPath>)]) {
     for (entry, _) in entries {
         let path = path_label(&entry.path);
-        if !metadata.undo_files.iter().any(|file| file.path == path) {
-            metadata.undo_files.push(FileUndoEntry::pending(path));
+        let kind = change_kind(entry);
+        if let Some(file) = metadata.undo_files.iter_mut().find(|file| file.path == path) {
+            // The diff is authoritative; this also backfills checkpoints saved
+            // before change kinds were recorded.
+            file.set_kind(kind);
+        } else {
+            let mut file = FileUndoEntry::pending(path, kind.to_string());
+            if metadata.restored_paths.contains(&entry.path) {
+                file.state = FileUndoState::Restored;
+                file.attempts = 1;
+                file.history.push(UndoAttempt {
+                    action: UndoAction::Restore,
+                    state: FileUndoState::Restored,
+                    reason: Some("restored by an earlier selective undo".into()),
+                    at: now_ms(),
+                });
+            }
+            metadata.undo_files.push(file);
         }
     }
+    metadata
+        .undo_files
+        .sort_by(|left, right| left.path.cmp(&right.path));
+}
+
+fn default_change_kind() -> String {
+    "modified".to_string()
+}
+
+fn change_kind(entry: &DiffEntry) -> &'static str {
+    if entry.old_mode == 0 {
+        "created"
+    } else if entry.new_mode == 0 {
+        "deleted"
+    } else {
+        "modified"
+    }
+}
+
+/// A checkpoint is offered for undo while at least one attributed file still
+/// needs a decision. Checkpoints written before per-file state existed fall
+/// back to their change count.
+fn metadata_has_pending(metadata: &RunMetadata) -> bool {
+    if metadata.changed_files == 0 {
+        return false;
+    }
+    if metadata.undo_files.is_empty() {
+        return metadata.changed_files > metadata.restored_paths.len() as u32;
+    }
+    metadata
+        .undo_files
+        .iter()
+        .any(|file| file.state.unresolved())
 }
 
 fn outcome_from_files(files: Vec<FileUndoEntry>) -> UndoOutcome {
@@ -1560,6 +1655,15 @@ fn restore_regular(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
         fs::set_permissions(&temp, permissions)
             .map_err(|error| format!("could not set restored file permissions: {error}"))?;
     }
+    // On Unix, rename atomically replaces the verified regular file. Avoid a
+    // remove-then-rename window that could lose the only copy on failure.
+    #[cfg(unix)]
+    if path.exists() || fs::symlink_metadata(path).is_ok() {
+        return fs::rename(&temp, path).map_err(|error| {
+            let _ = fs::remove_file(&temp);
+            format!("could not restore the file: {error}")
+        });
+    }
     if path.exists() || fs::symlink_metadata(path).is_ok() {
         remove_current(path)?;
     }
@@ -1577,11 +1681,13 @@ fn restore_symlink(path: &Path, target: &[u8]) -> Result<(), String> {
         .ok_or_else(|| "could not resolve the parent directory".to_string())?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("could not create the parent directory: {error}"))?;
-    if path.exists() || fs::symlink_metadata(path).is_ok() {
-        remove_current(path)?;
-    }
-    std::os::unix::fs::symlink(OsString::from_vec(target.to_vec()), path)
-        .map_err(|error| format!("could not restore the symlink: {error}"))
+    let temp = parent.join(format!(".janas-undo-{}.tmp", Uuid::new_v4().simple()));
+    std::os::unix::fs::symlink(OsString::from_vec(target.to_vec()), &temp)
+        .map_err(|error| format!("could not create the restored symlink: {error}"))?;
+    fs::rename(&temp, path).map_err(|error| {
+        let _ = fs::remove_file(&temp);
+        format!("could not restore the symlink: {error}")
+    })
 }
 
 #[cfg(not(unix))]
@@ -1957,6 +2063,10 @@ mod tests {
             .files
             .iter()
             .all(|file| file.state == FileUndoState::Pending));
+        assert!(initial
+            .files
+            .iter()
+            .all(|file| file.kind == "modified"));
 
         // Restoring one file leaves the other pending and keeps the checkpoint.
         let alpha = reopened.undo_path("run-per-file", "alpha.txt").expect("alpha");

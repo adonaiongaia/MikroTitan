@@ -27,7 +27,11 @@ import type {
 } from "../../types";
 
 export interface AgentActions {
-  approve: (runId: string, stepId: string) => void | Promise<void>;
+  approve: (
+    runId: string,
+    stepId: string,
+    options?: { allowEdits?: boolean },
+  ) => void | Promise<void>;
   reject: (runId: string, stepId: string, feedback: string) => void | Promise<void>;
   abort: (runId: string) => void | Promise<void>;
   undo: (runId: string) => void | Promise<void>;
@@ -50,6 +54,8 @@ function statusLabel(trace: AgentTrace): string {
   switch (trace.status) {
     case "completed":
       return "Finished";
+    case "verification_failed":
+      return "Verification failed";
     case "max_iterations":
       return "Step limit reached";
     case "aborted":
@@ -75,6 +81,8 @@ function statusTone(trace: AgentTrace): string {
       return "bg-emerald-400";
     case "error":
       return "bg-rose-400";
+    case "verification_failed":
+      return "bg-rose-400";
     case "aborted":
       return "bg-slate-500";
     case "max_iterations":
@@ -88,6 +96,7 @@ const RISK_LABEL: Record<AgentRisk, string> = {
   read_only: "read-only",
   mutating: "mutating",
   destructive: "destructive",
+  irreversible: "always confirm",
 };
 
 const UNDO_STATE_STYLE: Record<
@@ -321,6 +330,7 @@ function ApprovalCard({
   actions: AgentActions;
 }) {
   const [feedback, setFeedback] = useState("");
+  const [allowEdits, setAllowEdits] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
 
   const run = async (label: string, action: () => void | Promise<void>) => {
@@ -381,12 +391,29 @@ function ApprovalCard({
           className="field mt-0 block h-16 w-full resize-none !py-2 text-[10.5px] leading-5"
         />
 
+        {pending.file_edit ? (
+          <label className="mt-2 flex cursor-pointer items-center gap-1.5 text-[9.5px] text-slate-400">
+            <input
+              type="checkbox"
+              checked={allowEdits}
+              onChange={(event) => setAllowEdits(event.target.checked)}
+              className="h-3 w-3 accent-acid-400"
+            />
+            Allow file edits for this run
+            <span className="text-slate-600">
+              · skips approval for write_file and edit_file only
+            </span>
+          </label>
+        ) : null}
+
         <div className="mt-3 flex items-center gap-1.5">
           <button
             type="button"
             disabled={busy !== null}
             onClick={() =>
-              void run("approve", () => actions.approve(runId, pending.step_id))
+              void run("approve", () =>
+                actions.approve(runId, pending.step_id, { allowEdits }),
+              )
             }
             className="inline-flex h-7 flex-1 items-center justify-center gap-1.5 rounded-lg bg-acid-400 px-2 text-[10px] font-medium text-ink-950 transition hover:bg-acid-300 disabled:opacity-50"
           >
@@ -471,6 +498,18 @@ function UndoFileRow({
             UNDO_STATE_STYLE[file.state].dot,
           )}
         />
+        <span
+          className={cn(
+            "shrink-0 rounded border px-1 py-px text-[7.5px] uppercase tracking-wider",
+            file.kind === "created"
+              ? "border-emerald-400/20 bg-emerald-400/5 text-emerald-300/80"
+              : file.kind === "deleted"
+                ? "border-rose-400/20 bg-rose-400/5 text-rose-300/80"
+                : "border-amber-400/20 bg-amber-400/5 text-amber-300/80",
+          )}
+        >
+          {file.kind}
+        </span>
         <code
           className="min-w-0 flex-1 truncate font-mono text-[10px] text-slate-300"
           title={file.path}
@@ -761,6 +800,14 @@ export function AgentTraceView({ trace, streaming, actions }: AgentTraceProps) {
       {trace.undo_error ? (
         <p className="border-t border-rose-400/15 bg-rose-500/5 px-3 py-1.5 text-[9.5px] leading-4 text-rose-300">
           {trace.undo_error}
+        </p>
+      ) : null}
+
+      {trace.status === "verification_failed" ? (
+        <p className="flex items-center gap-1.5 border-t border-rose-400/15 bg-rose-500/5 px-3 py-1.5 text-[9.5px] leading-4 text-rose-300">
+          <AlertTriangle className="h-3 w-3 shrink-0" />
+          The configured verification command did not pass. Treat this run's
+          answer as unverified.
         </p>
       ) : null}
 

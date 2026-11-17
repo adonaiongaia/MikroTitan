@@ -96,7 +96,11 @@ function normalizeCitation(value: unknown): Citation | null {
 }
 
 function normalizeRisk(value: unknown): AgentStep["risk"] {
-  return value === "mutating" || value === "destructive" ? value : "read_only";
+  return value === "mutating" ||
+    value === "destructive" ||
+    value === "irreversible"
+    ? value
+    : "read_only";
 }
 
 function updateStep(
@@ -144,8 +148,8 @@ function undoSummary(result: AgentUndoResult): string {
     );
   }
   if (kept > 0) parts.push(`${kept} kept`);
-  // A journal undo is consumed by the attempt, so a file it could not revert
-  // is skipped rather than still pending; only a live checkpoint can retry.
+  // A journal result lists only failed entries; its successful restores are
+  // counted from result.restored.
   if (result.complete) {
     const skipped = files.filter(
       (file) => file.state === "skipped" || file.state === "failed",
@@ -173,6 +177,8 @@ function normalizeUndoFile(value: unknown): AgentUndoFile | null {
   const state = UNDO_STATES.includes(file.state as AgentUndoState)
     ? (file.state as AgentUndoState)
     : "pending";
+  const kind =
+    file.kind === "created" || file.kind === "deleted" ? file.kind : "modified";
   const history: AgentUndoAttempt[] = Array.isArray(file.history)
     ? file.history
         .filter((attempt) => Boolean(attempt) && typeof attempt === "object")
@@ -192,6 +198,7 @@ function normalizeUndoFile(value: unknown): AgentUndoFile | null {
     : [];
   return {
     path: file.path,
+    kind,
     state,
     reason: typeof file.reason === "string" ? file.reason : null,
     attempts:
@@ -231,6 +238,7 @@ function normalizeAgentTrace(value: unknown): AgentTrace | undefined {
     .slice(-60);
   const status =
     trace.status === "completed" ||
+    trace.status === "verification_failed" ||
     trace.status === "max_iterations" ||
     trace.status === "aborted" ||
     trace.status === "error"
@@ -680,6 +688,7 @@ export function useChat() {
               arguments: event.payload.arguments,
               risk: event.payload.risk,
               reason: event.payload.reason,
+              file_edit: Boolean(event.payload.file_edit),
               preview: event.payload.preview ?? null,
             },
             steps: updateStep(trace.steps, event.payload.step_id, {
@@ -1107,6 +1116,7 @@ export function useChat() {
             Math.max(0.5, options.agent.compactionThreshold),
           ),
           web_search: options.webSearch,
+          verify_command: (options.agent.verifyCommand ?? "").trim(),
           mcp_servers: options.mcpServers ?? [],
         });
       } catch (err) {

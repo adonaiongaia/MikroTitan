@@ -11,14 +11,17 @@ export const DEFAULT_AGENT_PREFERENCES: AgentPreferences = {
   planningStep: false,
   autoCompact: true,
   compactionThreshold: 0.75,
+  verifyCommand: "",
 };
 
 /** Agent configuration is machine-local, like the sampling preferences. */
 export function useAgentPreferences() {
-  const [preferences, setPreferences] = usePersistentState<AgentPreferences>(
+  const [stored, setPreferences] = usePersistentState<AgentPreferences>(
     "janas.agentPreferences.v1",
     DEFAULT_AGENT_PREFERENCES,
   );
+  // Merge defaults so preferences saved before a field existed still load.
+  const preferences = { ...DEFAULT_AGENT_PREFERENCES, ...stored };
 
   const update = useCallback(
     <K extends keyof AgentPreferences>(key: K, value: AgentPreferences[K]) => {
