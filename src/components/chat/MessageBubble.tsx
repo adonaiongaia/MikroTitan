@@ -1,5 +1,12 @@
 import { useState } from "react";
-import { Check, Copy, ExternalLink, Trash2 } from "lucide-react";
+import {
+  Check,
+  Copy,
+  ExternalLink,
+  Pencil,
+  RefreshCw,
+  Trash2,
+} from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -8,11 +15,16 @@ import { errorMessage } from "../../lib/format";
 import type { ChatMessage, Citation } from "../../types";
 import { Logo } from "../Logo";
 import { AgentTraceView, type AgentActions } from "./AgentTrace";
+import { ChatImage } from "./ChatImage";
 
 interface MessageBubbleProps {
   message: ChatMessage;
   streaming: boolean;
   onDelete?: (id: string) => void;
+  onRegenerate?: () => void | Promise<void>;
+  onEdit?: (text: string) => void | Promise<void>;
+  regenerable?: boolean;
+  editable?: boolean;
   agentActions?: AgentActions;
 }
 
@@ -47,10 +59,16 @@ export function MessageBubble({
   message,
   streaming,
   onDelete,
+  onRegenerate,
+  onEdit,
+  regenerable,
+  editable,
   agentActions,
 }: MessageBubbleProps) {
   const [copied, setCopied] = useState(false);
   const [linkError, setLinkError] = useState<string | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [editDraft, setEditDraft] = useState("");
   const isUser = message.role === "user";
   const content = typeof message.content === "string" ? message.content : "";
   const reasoning =
@@ -58,6 +76,18 @@ export function MessageBubble({
   const citations = safeCitations(message.citations);
   const trace = message.agentTrace ?? null;
   const empty = !content && !reasoning && !trace;
+
+  const beginEdit = () => {
+    setEditDraft(content);
+    setEditing(true);
+  };
+
+  const saveEdit = async () => {
+    const trimmed = editDraft.trim();
+    if (!trimmed || !onEdit) return;
+    await onEdit(trimmed);
+    setEditing(false);
+  };
 
   const copy = async () => {
     try {
@@ -80,6 +110,28 @@ export function MessageBubble({
 
   const actions = (
     <div className="flex items-center gap-0.5 opacity-0 transition group-hover:opacity-100 focus-within:opacity-100">
+      {onEdit && editable && !editing ? (
+        <button
+          type="button"
+          onClick={beginEdit}
+          className="inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-[10px] text-slate-600 transition hover:bg-white/5 hover:text-slate-300"
+          title="Edit and resend from this message"
+        >
+          <Pencil className="h-3 w-3" />
+          Edit
+        </button>
+      ) : null}
+      {onRegenerate && regenerable ? (
+        <button
+          type="button"
+          onClick={() => void onRegenerate()}
+          className="inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-[10px] text-slate-600 transition hover:bg-white/5 hover:text-slate-300"
+          title="Regenerate this reply with the current settings"
+        >
+          <RefreshCw className="h-3 w-3" />
+          Regenerate
+        </button>
+      ) : null}
       <button
         type="button"
         onClick={() => void copy()}
@@ -114,18 +166,51 @@ export function MessageBubble({
           {message.images?.length ? (
             <div className="mb-2 flex flex-wrap gap-1.5">
               {message.images.map((image, index) => (
-                <img
+                <ChatImage
                   key={`${image.name}-${index}`}
-                  src={image.data_url}
-                  alt={image.name}
+                  image={image}
                   className="h-20 w-20 rounded-lg border border-white/10 object-cover"
                 />
               ))}
             </div>
           ) : null}
-          <p className="whitespace-pre-wrap text-[13.5px] leading-6 text-slate-100">
-            {content}
-          </p>
+          {editing ? (
+            <div className="space-y-2">
+              <textarea
+                value={editDraft}
+                onChange={(event) => setEditDraft(event.target.value)}
+                rows={Math.min(10, Math.max(3, editDraft.split("\n").length))}
+                className="w-full resize-y rounded-lg border border-white/10 bg-ink-950/70 px-3 py-2 text-[13px] leading-6 text-slate-100 outline-none focus:border-acid-400/40"
+                autoFocus
+              />
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-[9px] leading-4 text-amber-300/70">
+                  Resending replaces every reply after this message.
+                </span>
+                <div className="flex gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => setEditing(false)}
+                    className="rounded-md px-2 py-1 text-[10px] text-slate-400 transition hover:bg-white/5 hover:text-slate-200"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void saveEdit()}
+                    disabled={!editDraft.trim()}
+                    className="rounded-md border border-acid-400/30 bg-acid-400/10 px-2 py-1 text-[10px] text-acid-200 transition hover:bg-acid-400/20 disabled:opacity-40"
+                  >
+                    Resend
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <p className="whitespace-pre-wrap text-[13.5px] leading-6 text-slate-100">
+              {content}
+            </p>
+          )}
           <p className="mt-1.5 text-right text-[10px] text-acid-200/40">
             {timeLabel(message.created_at)}
           </p>

@@ -231,7 +231,14 @@ export interface ChatMessage {
   reasoning: string;
   created_at: number;
   citations?: Citation[];
-  images?: Array<{ name: string; data_url: string; tokens: number }>;
+  images?: Array<{
+    name: string;
+    /** Present on freshly attached images; absent after a reload. */
+    data_url?: string;
+    /** Session-relative reference to an image stored on disk. */
+    asset?: string;
+    tokens: number;
+  }>;
   /** Structured agent trace. Absent on legacy chats and normal replies. */
   agentTrace?: AgentTrace | null;
 }
@@ -241,6 +248,8 @@ export interface ChatSession {
   title: string;
   created_at: number;
   updated_at: number;
+  /** Pinned chats stay at the top of the rail. */
+  pinned?: boolean;
   messages: ChatMessage[];
 }
 
@@ -288,6 +297,17 @@ export interface ChatErrorEvent {
 export interface ChatNotice {
   request_id: string;
   message: string;
+}
+
+/** A paused MCP tool call that needs the user's decision before it runs. */
+export interface ChatToolApproval {
+  request_id: string;
+  call_id: string;
+  server: string;
+  tool: string;
+  arguments: string;
+  risk: string;
+  reason: string;
 }
 
 export interface HfFile {
@@ -501,6 +521,8 @@ export interface McpServerConfig {
   /** One KEY=VALUE per line. */
   env: string;
   cwd: string;
+  /** Chat runs this server's tools without an approval card. Default false. */
+  autoApprove?: boolean;
 }
 
 export interface McpServerInput {
@@ -509,6 +531,7 @@ export interface McpServerInput {
   args: string[];
   env: string;
   cwd: string;
+  auto_approve: boolean;
 }
 
 export interface McpTool {

@@ -71,6 +71,7 @@ export function McpView() {
   const [args, setArgs] = useState("");
   const [env, setEnv] = useState("");
   const [cwd, setCwd] = useState("");
+  const [autoApprove, setAutoApprove] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
   const [probing, setProbing] = useState<string | null>(null);
@@ -89,6 +90,7 @@ export function McpView() {
     setArgs("");
     setEnv("");
     setCwd("");
+    setAutoApprove(false);
     setEditingId(null);
     setAdding(false);
     setError(null);
@@ -100,6 +102,7 @@ export function McpView() {
     setArgs(server.args.join(" "));
     setEnv(server.env ?? "");
     setCwd(server.cwd ?? "");
+    setAutoApprove(Boolean(server.autoApprove));
     setEditingId(server.id);
     setAdding(true);
     setError(null);
@@ -116,6 +119,7 @@ export function McpView() {
       args: splitArgs(args),
       env: env.trim(),
       cwd: cwd.trim(),
+      autoApprove,
     };
     const id = editingId ?? uid();
     setServers((previous) =>
@@ -148,6 +152,7 @@ export function McpView() {
         args: server.args,
         env: server.env ?? "",
         cwd: server.cwd ?? "",
+        auto_approve: Boolean(server.autoApprove),
       });
       setProbes((previous) => ({ ...previous, [server.id]: result }));
       appendMcpLog({
@@ -180,7 +185,8 @@ export function McpView() {
           <p className="mt-0.5 text-[10px] text-slate-600">
             Register local stdio servers. Probes allow 30 seconds for startup
             and report stderr and early exits. Enabled tools are offered to the
-            model in chat.
+            model in chat, which pauses for approval before running one unless
+            the server is explicitly marked auto-approve.
           </p>
         </div>
         <Button
@@ -247,7 +253,20 @@ export function McpView() {
                 />
               </label>
             </div>
-            <div className="mt-3 flex items-center gap-2">
+            <label className="mt-2 flex items-start gap-2 rounded-lg border border-amber-400/15 bg-amber-400/5 px-2.5 py-2">
+              <input
+                type="checkbox"
+                checked={autoApprove}
+                onChange={(event) => setAutoApprove(event.target.checked)}
+                className="mt-0.5 accent-amber-400"
+              />
+              <span className="text-[9.5px] leading-4 text-amber-200/70">
+                Run this server&apos;s tools without an approval card in chat.
+                Leave this off unless you trust the server with unattended
+                actions; a filesystem or shell server can change your machine.
+              </span>
+            </label>
+            <div className="mt-3 flex flex-wrap items-center gap-2">
               <Button size="sm" variant="primary" onClick={save}>
                 {editingId ? "Save" : "Add"}
               </Button>
@@ -312,6 +331,14 @@ export function McpView() {
                     <span className="truncate font-mono text-[9.5px] text-slate-600">
                       {server.command} {server.args.join(" ")}
                     </span>
+                    {server.autoApprove ? (
+                      <span
+                        className="rounded border border-amber-400/25 bg-amber-400/10 px-1 py-px text-[8px] uppercase tracking-wider text-amber-300/80"
+                        title="Chat runs this server's tools without an approval card."
+                      >
+                        auto-approve
+                      </span>
+                    ) : null}
                     <div className="ml-auto flex items-center gap-1.5">
                       <button
                         type="button"

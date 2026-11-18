@@ -13,6 +13,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
+use tokio::sync::oneshot;
 
 use crate::{
     error::{AppError, AppResult},
@@ -77,6 +78,23 @@ pub struct ChatNoticeEvent {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatToolApprovalEvent {
+    pub request_id: String,
+    pub call_id: String,
+    pub server: String,
+    pub tool: String,
+    pub arguments: String,
+    pub risk: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatApproval {
+    Approved,
+    Rejected,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct WireMessage {
     pub role: String,
@@ -113,6 +131,7 @@ pub struct EngineManager {
     child: Mutex<Option<Child>>,
     snapshot: Mutex<EngineSnapshot>,
     cancelled: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    approvals: Mutex<HashMap<String, oneshot::Sender<ChatApproval>>>,
     http: reqwest::Client,
 }
 
@@ -133,6 +152,7 @@ impl EngineManager {
                 started_at_ms: None,
             }),
             cancelled: Mutex::new(HashMap::new()),
+            approvals: Mutex::new(HashMap::new()),
             http,
         }
     }
@@ -372,6 +392,66 @@ impl EngineManager {
                 .entry(request_id.to_string())
                 .or_insert_with(|| Arc::new(AtomicBool::new(false)))
                 .store(true, Ordering::Relaxed);
+        }
+        self.cancel_chat_approvals(request_id);
+    }
+
+    fn approval_key(request_id: &str, call_id: &str) -> String {
+        format!("{request_id}:{call_id}")
+    }
+
+    fn request_chat_approval(
+        &self,
+        request_id: &str,
+        call_id: &str,
+    ) -> AppResult<oneshot::Receiver<ChatApproval>> {
+        let (sender, receiver) = oneshot::channel();
+        let mut guard = self
+            .approvals
+            .lock()
+            .map_err(|_| AppError::message("The tool approval gate is locked."))?;
+        guard.insert(Self::approval_key(request_id, call_id), sender);
+        Ok(receiver)
+    }
+
+    pub fn resolve_chat_approval(
+        &self,
+        request_id: &str,
+        call_id: &str,
+        approve: bool,
+    ) -> bool {
+        let key = Self::approval_key(request_id, call_id);
+        let sender = self
+            .approvals
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.remove(&key));
+        match sender {
+            Some(sender) => sender
+                .send(if approve {
+                    ChatApproval::Approved
+                } else {
+                    ChatApproval::Rejected
+                })
+                .is_ok(),
+            None => false,
+        }
+    }
+
+    fn cancel_chat_approvals(&self, request_id: &str) {
+        let prefix = format!("{request_id}:");
+        let Ok(mut guard) = self.approvals.lock() else {
+            return;
+        };
+        let keys: Vec<String> = guard
+            .keys()
+            .filter(|key| key.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for key in keys {
+            if let Some(sender) = guard.remove(&key) {
+                let _ = sender.send(ChatApproval::Rejected);
+            }
         }
     }
 
@@ -714,7 +794,16 @@ impl EngineManager {
                     break;
                 }
                 tool_rounds += 1;
-                let tool_run = run_tools(app, memory, mcp_runtime.as_mut(), &calls);
+                let tool_run = run_tools(
+                    self,
+                    app,
+                    memory,
+                    mcp_runtime.as_mut(),
+                    &request.request_id,
+                    cancel.as_ref(),
+                    &calls,
+                )
+                .await;
                 messages.push(serde_json::json!({
                     "role": "assistant",
                     "content": round.content,
@@ -722,6 +811,10 @@ impl EngineManager {
                 }));
                 messages.extend(tool_run.messages);
                 finish_reason.clear();
+                if cancel.load(Ordering::Relaxed) {
+                    cancelled = true;
+                    break;
+                }
                 continue;
             }
 
@@ -1601,10 +1694,13 @@ struct ToolRun {
     messages: Vec<serde_json::Value>,
 }
 
-fn run_tools(
+async fn run_tools(
+    engine: &EngineManager,
     app: &AppHandle,
     memory: &MemoryStore,
     mut mcp: Option<&mut McpRuntime>,
+    request_id: &str,
+    cancel: &AtomicBool,
     calls: &[ToolCallDraft],
 ) -> ToolRun {
     let selected: Vec<ToolCallDraft> = calls.iter().take(MAX_TOOL_CALLS).cloned().collect();
@@ -1662,61 +1758,109 @@ fn run_tools(
             }
         } else if let Some(runtime) = mcp.as_deref_mut() {
             if let Some(route) = runtime.route(&call.name) {
-                match parse_tool_arguments(&call.arguments) {
-                    Ok(arguments) if arguments.is_object() => {
-                        let _ = app.emit(
-                            "mcp://activity",
-                            McpActivityEvent {
-                                server: route.server.clone(),
-                                tool: route.tool.clone(),
-                                level: "info".into(),
-                                message: format!(
-                                    "Calling {} on {}...",
-                                    route.tool, route.server
-                                ),
-                            },
-                        );
-                        match runtime.call_tool(&call.name, arguments) {
-                            Ok(value) => {
-                                let is_error = value
-                                    .get("isError")
-                                    .and_then(serde_json::Value::as_bool)
-                                    .unwrap_or(false);
-                                let summary = mcp_result_summary(&value);
-                                let _ = app.emit(
-                                    "mcp://activity",
-                                    McpActivityEvent {
-                                        server: route.server.clone(),
-                                        tool: route.tool.clone(),
-                                        level: if is_error { "error".into() } else { "info".into() },
-                                        message: if is_error {
-                                            format!("{} returned an error: {summary}", route.tool)
-                                        } else {
-                                            format!("{} returned: {summary}", route.tool)
+                // A tool server can touch files or another system. Unless the
+                // user opted this server out of the gate, pause the stream and
+                // ask before executing it. Agent mode has its own policy.
+                let approved = if runtime.auto_approves(&route.server) {
+                    true
+                } else {
+                    match engine.request_chat_approval(request_id, &id) {
+                        Ok(receiver) => {
+                            let _ = app.emit(
+                                "chat://tool-approval",
+                                ChatToolApprovalEvent {
+                                    request_id: request_id.to_string(),
+                                    call_id: id.clone(),
+                                    server: route.server.clone(),
+                                    tool: route.tool.clone(),
+                                    arguments: truncate_line(&call.arguments, 2_000),
+                                    risk: chat_mcp_risk(&route.tool).into(),
+                                    reason: format!(
+                                        "The model wants to run `{}` on the `{}` MCP server. The reply is paused until you approve or deny it.",
+                                        route.tool, route.server
+                                    ),
+                                },
+                            );
+                            await_chat_approval(receiver, cancel).await
+                                == ChatApproval::Approved
+                        }
+                        Err(_) => false,
+                    }
+                };
+
+                if !approved {
+                    let message = if cancel.load(Ordering::Relaxed) {
+                        "The tool call was cancelled because the reply was stopped."
+                    } else {
+                        "The user rejected this tool call."
+                    };
+                    let _ = app.emit(
+                        "mcp://activity",
+                        McpActivityEvent {
+                            server: route.server.clone(),
+                            tool: route.tool.clone(),
+                            level: "info".into(),
+                            message: message.to_string(),
+                        },
+                    );
+                    serde_json::json!({ "ok": false, "error": message })
+                } else {
+                    match parse_tool_arguments(&call.arguments) {
+                        Ok(arguments) if arguments.is_object() => {
+                            let _ = app.emit(
+                                "mcp://activity",
+                                McpActivityEvent {
+                                    server: route.server.clone(),
+                                    tool: route.tool.clone(),
+                                    level: "info".into(),
+                                    message: format!(
+                                        "Calling {} on {}...",
+                                        route.tool, route.server
+                                    ),
+                                },
+                            );
+                            match runtime.call_tool(&call.name, arguments) {
+                                Ok(value) => {
+                                    let is_error = value
+                                        .get("isError")
+                                        .and_then(serde_json::Value::as_bool)
+                                        .unwrap_or(false);
+                                    let summary = mcp_result_summary(&value);
+                                    let _ = app.emit(
+                                        "mcp://activity",
+                                        McpActivityEvent {
+                                            server: route.server.clone(),
+                                            tool: route.tool.clone(),
+                                            level: if is_error { "error".into() } else { "info".into() },
+                                            message: if is_error {
+                                                format!("{} returned an error: {summary}", route.tool)
+                                            } else {
+                                                format!("{} returned: {summary}", route.tool)
+                                            },
                                         },
-                                    },
-                                );
-                                value
-                            }
-                            Err(err) => {
-                                let _ = app.emit(
-                                    "mcp://activity",
-                                    McpActivityEvent {
-                                        server: route.server.clone(),
-                                        tool: route.tool.clone(),
-                                        level: "error".into(),
-                                        message: format!("{} failed: {err}", route.tool),
-                                    },
-                                );
-                                serde_json::json!({ "ok": false, "error": err })
+                                    );
+                                    value
+                                }
+                                Err(err) => {
+                                    let _ = app.emit(
+                                        "mcp://activity",
+                                        McpActivityEvent {
+                                            server: route.server.clone(),
+                                            tool: route.tool.clone(),
+                                            level: "error".into(),
+                                            message: format!("{} failed: {err}", route.tool),
+                                        },
+                                    );
+                                    serde_json::json!({ "ok": false, "error": err })
+                                }
                             }
                         }
+                        Ok(_) => serde_json::json!({
+                            "ok": false,
+                            "error": "MCP tool arguments must be a JSON object.",
+                        }),
+                        Err(err) => serde_json::json!({ "ok": false, "error": err }),
                     }
-                    Ok(_) => serde_json::json!({
-                        "ok": false,
-                        "error": "MCP tool arguments must be a JSON object.",
-                    }),
-                    Err(err) => serde_json::json!({ "ok": false, "error": err }),
                 }
             } else {
                 serde_json::json!({
@@ -1743,6 +1887,44 @@ fn run_tools(
         assistant_calls,
         messages,
     }
+}
+
+async fn await_chat_approval(
+    mut receiver: oneshot::Receiver<ChatApproval>,
+    cancel: &AtomicBool,
+) -> ChatApproval {
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return ChatApproval::Rejected;
+        }
+        if Instant::now() >= deadline {
+            return ChatApproval::Rejected;
+        }
+        tokio::select! {
+            result = &mut receiver => {
+                return result.unwrap_or(ChatApproval::Rejected);
+            }
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+    }
+}
+
+fn chat_mcp_risk(tool: &str) -> &'static str {
+    const READ_PREFIXES: [&str; 14] = [
+        "read", "list", "get", "search", "find", "stat", "cat", "head", "tail",
+        "grep", "glob", "show", "describe", "inspect",
+    ];
+    let lower = tool.to_ascii_lowercase();
+    for prefix in READ_PREFIXES {
+        if lower == prefix
+            || lower.starts_with(&format!("{prefix}_"))
+            || lower.contains(&format!("_{prefix}"))
+        {
+            return "read_only";
+        }
+    }
+    "mutating"
 }
 
 pub(crate) fn parse_tool_arguments(raw: &str) -> Result<serde_json::Value, String> {
@@ -1854,6 +2036,24 @@ mod tests {
             estimated <= 11_776,
             "retry prompt still too large: {estimated}"
         );
+    }
+
+    #[test]
+    #[test]
+    fn chat_approvals_resolve_and_cancel() {
+        let manager = EngineManager::new(8080);
+        let mut receiver = manager
+            .request_chat_approval("request", "call")
+            .expect("register approval");
+        assert!(manager.resolve_chat_approval("request", "call", true));
+        assert_eq!(receiver.try_recv().expect("decision"), ChatApproval::Approved);
+
+        let mut receiver = manager
+            .request_chat_approval("request-2", "call-2")
+            .expect("register approval");
+        manager.cancel_chat_approvals("request-2");
+        assert_eq!(receiver.try_recv().expect("decision"), ChatApproval::Rejected);
+        assert!(!manager.resolve_chat_approval("request-2", "call-2", true));
     }
 
     #[test]

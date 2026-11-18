@@ -44,6 +44,7 @@ import { MessageBoundary } from "../MessageBoundary";
 import { MessageBubble } from "./MessageBubble";
 import { SessionsRail } from "./SessionsRail";
 import { TelemetryPanel } from "./TelemetryPanel";
+import { ToolApprovalCard } from "./ToolApprovalCard";
 
 interface ChatViewProps {
   engine: EngineController;
@@ -405,6 +406,57 @@ export function ChatView({ engine, chat }: ChatViewProps) {
     0,
   );
 
+  const buildOptions = useCallback(
+    (
+      text: string,
+      extras: {
+        images?: string[];
+        imageTokens?: number;
+        citations?: Citation[];
+        extraContext?: string;
+      } = {},
+    ) => {
+      const recalled = recallFacts(memory.facts, text);
+      const memoryBlock = recalled.length
+        ? `Facts you remember about this project. Use them when relevant, and ignore any that no longer apply:\n${recalled
+            .map((fact) => `- ${fact.text}`)
+            .join("\n")}`
+        : "";
+      const combinedSystemPrompt = [CORE_SYSTEM_PROMPT, systemPrompt, memoryBlock]
+        .filter(Boolean)
+        .join("\n\n");
+      const mcpInputs = mcpServers
+        .filter((server) => server.enabled && server.command.trim())
+        .map((server) => ({
+          name: server.name,
+          command: server.command,
+          args: server.args,
+          env: server.env ?? "",
+          cwd: server.cwd ?? "",
+          auto_approve: Boolean(server.autoApprove),
+        }));
+      return {
+        systemPrompt: combinedSystemPrompt,
+        temperature: preferences.temperature,
+        topP: preferences.topP,
+        topK: preferences.topK ?? 40,
+        minP: preferences.minP,
+        repeatPenalty: preferences.repeatPenalty,
+        thinking: preferences.thinking,
+        structuredOutput: preferences.structuredOutput,
+        contextPrefetch: preferences.contextPrefetch,
+        maxTokens: preferences.maxTokens,
+        contextWindow: contextMax,
+        images: extras.images,
+        imageTokens: extras.imageTokens,
+        extraContext: extras.extraContext ?? (project?.bundle ?? ""),
+        citations: extras.citations,
+        mcpServers: mcpInputs,
+      };
+    },
+    [contextMax, mcpServers, memory.facts, preferences, project, systemPrompt],
+  );
+
   const handleSend = useCallback(async () => {
     const text = input.trim();
     if (!text || chat.busy || !ready) return;
@@ -443,44 +495,11 @@ export function ChatView({ engine, chat }: ChatViewProps) {
       }
     }
 
-    const recalled = recallFacts(memory.facts, text);
-    const memoryBlock = recalled.length
-      ? `Facts you remember about this project. Use them when relevant, and ignore any that no longer apply:\n${recalled
-          .map((fact) => `- ${fact.text}`)
-          .join("\n")}`
-      : "";
-
-    const combinedSystemPrompt = [CORE_SYSTEM_PROMPT, systemPrompt, memoryBlock]
-      .filter(Boolean)
-      .join("\n\n");
-    const mcpInputs = mcpServers
-      .filter((server) => server.enabled && server.command.trim())
-      .map((server) => ({
-        name: server.name,
-        command: server.command,
-        args: server.args,
-        env: server.env ?? "",
-        cwd: server.cwd ?? "",
-      }));
-
     setActivity(null);
     if (agent.preferences.enabled) {
       try {
         await chat.sendAgent(text, {
-          systemPrompt: combinedSystemPrompt,
-          temperature: preferences.temperature,
-          topP: preferences.topP,
-          topK: preferences.topK ?? 40,
-          minP: preferences.minP,
-          repeatPenalty: preferences.repeatPenalty,
-          thinking: preferences.thinking,
-          structuredOutput: preferences.structuredOutput,
-          contextPrefetch: preferences.contextPrefetch,
-          maxTokens: preferences.maxTokens,
-          contextWindow: contextMax,
-          images: [],
-          extraContext: "",
-          mcpServers: mcpInputs,
+          ...buildOptions(text, { extraContext: "" }),
           agent: agent.preferences,
           webSearch: preferences.internet,
           onAccepted: () => {
@@ -496,22 +515,12 @@ export function ChatView({ engine, chat }: ChatViewProps) {
 
     try {
       await chat.send(text, {
-        systemPrompt: combinedSystemPrompt,
-        temperature: preferences.temperature,
-        topP: preferences.topP,
-        topK: preferences.topK ?? 40,
-        minP: preferences.minP,
-        repeatPenalty: preferences.repeatPenalty,
-        thinking: preferences.thinking,
-        structuredOutput: preferences.structuredOutput,
-        contextPrefetch: preferences.contextPrefetch,
-        maxTokens: preferences.maxTokens,
-        contextWindow: contextMax,
-        imageTokens,
-        images: images.map((image) => image.data_url),
-        extraContext,
-        citations,
-        mcpServers: mcpInputs,
+        ...buildOptions(text, {
+          images: images.map((image) => image.data_url),
+          imageTokens,
+          citations,
+          extraContext,
+        }),
         onAccepted: () => {
           setInput("");
           setImages([]);
@@ -522,18 +531,48 @@ export function ChatView({ engine, chat }: ChatViewProps) {
     }
   }, [
     agent.preferences,
+    buildOptions,
     chat,
-    contextMax,
     images,
     imageTokens,
     input,
-    mcpServers,
-    memory.facts,
-    preferences,
+    preferences.internet,
     project,
     ready,
-    systemPrompt,
   ]);
+
+  const handleRegenerateMessage = useCallback(
+    async (messageId: string) => {
+      if (!ready) return;
+      const index = chat.messages.findIndex(
+        (message) => message.id === messageId,
+      );
+      const previousUser = index > 0 ? chat.messages[index - 1] : undefined;
+      try {
+        await chat.regenerate(
+          messageId,
+          buildOptions(previousUser?.content ?? "", {
+            citations: chat.messages[index]?.citations,
+          }),
+        );
+      } catch (err) {
+        chat.setError(errorMessage(err));
+      }
+    },
+    [buildOptions, chat, ready],
+  );
+
+  const handleEditMessage = useCallback(
+    async (messageId: string, text: string) => {
+      if (!ready) return;
+      try {
+        await chat.editAndResend(messageId, text, buildOptions(text));
+      } catch (err) {
+        chat.setError(errorMessage(err));
+      }
+    },
+    [buildOptions, chat, ready],
+  );
 
   const messageChars = chat.messages.reduce(
     (total, message) =>
@@ -561,6 +600,11 @@ export function ChatView({ engine, chat }: ChatViewProps) {
         onSelect={chat.setActiveId}
         onNew={chat.newChat}
         onDelete={(id) => void chat.deleteChat(id)}
+        onRename={chat.renameChat}
+        onTogglePin={chat.togglePin}
+        onImport={chat.importChat}
+        onExport={chat.exportChat}
+        loading={chat.loading}
         memory={memory}
       />
 
@@ -678,7 +722,14 @@ export function ChatView({ engine, chat }: ChatViewProps) {
               </div>
             ) : null}
 
-            {!chat.messages.length ? (
+            {chat.loading ? (
+              <div className="flex flex-col items-center gap-3 py-24 text-center">
+                <Loader2 className="h-5 w-5 animate-spin text-slate-600" />
+                <p className="text-[11px] text-slate-500">
+                  Loading your chats from disk…
+                </p>
+              </div>
+            ) : !chat.messages.length ? (
               <EmptyState
                 modelName={modelName}
                 ready={ready}
@@ -700,6 +751,29 @@ export function ChatView({ engine, chat }: ChatViewProps) {
                         message.role === "assistant"
                       }
                       onDelete={chat.deleteMessage}
+                      onRegenerate={
+                        message.role === "assistant" &&
+                        index === chat.messages.length - 1
+                          ? () => handleRegenerateMessage(message.id)
+                          : undefined
+                      }
+                      onEdit={
+                        message.role === "user"
+                          ? (text) => handleEditMessage(message.id, text)
+                          : undefined
+                      }
+                      regenerable={
+                        message.role === "assistant" &&
+                        index === chat.messages.length - 1 &&
+                        !chat.streaming &&
+                        !message.agentTrace &&
+                        !agent.preferences.enabled
+                      }
+                      editable={
+                        message.role === "user" &&
+                        !chat.streaming &&
+                        !agent.preferences.enabled
+                      }
                       agentActions={agentActions}
                     />
                   </MessageBoundary>
@@ -709,6 +783,17 @@ export function ChatView({ engine, chat }: ChatViewProps) {
             <div ref={endRef} className="h-2" />
           </div>
         </div>
+
+        {chat.toolApproval ? (
+          <div className="shrink-0 px-6 pt-3">
+            <div className="mx-auto max-w-3xl">
+              <ToolApprovalCard
+                approval={chat.toolApproval}
+                onDecide={chat.resolveToolApproval}
+              />
+            </div>
+          </div>
+        ) : null}
 
         <Composer
           value={input}

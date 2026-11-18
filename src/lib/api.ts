@@ -10,6 +10,7 @@ import type {
   BinaryInstallResult,
   BinaryProbe,
   ChatRequestPayload,
+  ChatSession,
   EngineKind,
   ManagedBinaryProbe,
   ConversionStarted,
@@ -46,6 +47,7 @@ export const Events = {
   chatDone: "chat://done",
   chatError: "chat://error",
   chatNotice: "chat://notice",
+  chatToolApproval: "chat://tool-approval",
   memoryChanged: "memory://changed",
   convertStarted: "convert://started",
   convertLog: "convert://log",
@@ -104,6 +106,28 @@ export const api = {
     invoke<void>("stream_chat", { request }),
   cancelChat: (requestId: string) =>
     invoke<void>("cancel_chat", { request_id: requestId }),
+  resolveChatToolApproval: (
+    requestId: string,
+    callId: string,
+    decision: "approve" | "reject",
+  ) =>
+    invoke<boolean>("chat_tool_approval", {
+      request_id: requestId,
+      call_id: callId,
+      decision,
+    }),
+
+  chatSessionsList: () => invoke<ChatSession[]>("chat_sessions_list"),
+  chatSessionSave: (session: ChatSession) =>
+    invoke<ChatSession>("chat_session_save", { session }),
+  chatSessionDelete: (id: string) =>
+    invoke<boolean>("chat_session_delete", { id }),
+  chatAssetDataUrl: (asset: string) =>
+    invoke<string>("chat_asset_data_url", { asset }),
+  chatExportSession: (id: string, path: string) =>
+    invoke<void>("chat_export_session", { id, path }),
+  chatImportSession: (path: string) =>
+    invoke<ChatSession>("chat_import_session", { path }),
 
   startConversion: (request: ConvertRequest) =>
     invoke<ConversionStarted>("start_conversion", { request }),

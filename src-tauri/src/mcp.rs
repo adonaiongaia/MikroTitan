@@ -43,6 +43,10 @@ pub struct McpServerSpec {
     pub env: String,
     #[serde(default)]
     pub cwd: String,
+    /// Chat executes tools without an approval card only when the user opted
+    /// in for this server. Agent mode keeps its own approval policy.
+    #[serde(default)]
+    pub auto_approve: bool,
 }
 
 impl McpServerSpec {
@@ -487,6 +491,7 @@ pub struct McpRuntime {
     routes: HashMap<String, RuntimeRoute>,
     tools: Vec<Value>,
     warnings: Vec<String>,
+    auto_approve: HashSet<String>,
 }
 
 struct RuntimeRoute {
@@ -499,11 +504,15 @@ impl McpRuntime {
     pub fn connect(specs: &[McpServerSpec]) -> Self {
         let mut sessions = Vec::new();
         let mut warnings = Vec::new();
+        let mut auto_approve = HashSet::new();
 
         for spec in specs {
             if spec.command.trim().is_empty() {
                 warnings.push(format!("{}: the command is empty.", spec.display_name()));
                 continue;
+            }
+            if spec.auto_approve {
+                auto_approve.insert(spec.display_name());
             }
             match McpSession::start(spec) {
                 Ok(session) => sessions.push(session),
@@ -552,7 +561,13 @@ impl McpRuntime {
             routes,
             tools,
             warnings,
+            auto_approve,
         }
+    }
+
+    /// Whether the user opted this server out of the per-call approval card.
+    pub fn auto_approves(&self, server: &str) -> bool {
+        self.auto_approve.contains(server)
     }
 
     pub fn tool_definitions(&self) -> Vec<Value> {
@@ -818,6 +833,7 @@ mod tests {
             args: vec![script.to_string_lossy().to_string()],
             env: String::new(),
             cwd: String::new(),
+            auto_approve: false,
         };
         let probe = probe_server(&spec);
         assert!(!probe.ok);
@@ -863,6 +879,7 @@ done
             args: vec![script.to_string_lossy().to_string()],
             env: "MCP_TEST_VALUE=works".into(),
             cwd: String::new(),
+            auto_approve: false,
         };
         let mut runtime = McpRuntime::connect(&[spec]);
         assert!(runtime.warnings().is_empty());

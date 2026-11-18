@@ -32,6 +32,7 @@ import type {
 } from "../../types";
 import { Button } from "../ui/Button";
 import { GpuOffloadControl } from "../ui/GpuOffloadControl";
+import { EngineLogsPanel } from "./EngineLogsPanel";
 import { SetupPanel } from "./SetupPanel";
 import { ThemePicker } from "./ThemePicker";
 import { StatusPill } from "../ui/StatusPill";
@@ -342,6 +343,8 @@ export function SettingsView({ engine }: SettingsViewProps) {
         </Section>
 
         <SetupPanel />
+
+        <EngineLogsPanel engine={engine} />
 
         <Section
           title="Inference engine"

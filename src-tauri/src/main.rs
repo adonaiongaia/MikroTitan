@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod agent;
+mod chat_store;
 mod converter;
 mod capabilities;
 mod engine;
@@ -21,6 +22,7 @@ use std::sync::Arc;
 
 use tauri::{AppHandle, Emitter, Manager, State};
 
+use chat_store::{ChatStore, StoredSession};
 use converter::{ConversionStarted, ConvertRequest, ConverterManager};
 use memory::{MemoryFact, MemoryStore};
 use provision::Provisioner;
@@ -221,6 +223,53 @@ fn cancel_chat(engine: State<'_, Arc<EngineManager>>, request_id: String) {
     engine.cancel_chat(&request_id);
 }
 
+#[tauri::command(rename_all = "snake_case")]
+fn chat_tool_approval(
+    engine: State<'_, Arc<EngineManager>>,
+    request_id: String,
+    call_id: String,
+    decision: String,
+) -> bool {
+    engine.resolve_chat_approval(&request_id, &call_id, decision == "approve")
+}
+
+#[tauri::command]
+fn chat_sessions_list(store: State<'_, Arc<ChatStore>>) -> Vec<StoredSession> {
+    store.list()
+}
+
+#[tauri::command]
+fn chat_session_save(
+    store: State<'_, Arc<ChatStore>>,
+    session: StoredSession,
+) -> AppResult<StoredSession> {
+    store.save(session)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn chat_session_delete(store: State<'_, Arc<ChatStore>>, id: String) -> AppResult<bool> {
+    store.delete(&id)
+}
+
+#[tauri::command]
+fn chat_asset_data_url(store: State<'_, Arc<ChatStore>>, asset: String) -> AppResult<String> {
+    store.asset_data_url(&asset)
+}
+
+#[tauri::command]
+fn chat_export_session(
+    store: State<'_, Arc<ChatStore>>,
+    id: String,
+    path: String,
+) -> AppResult<()> {
+    store.export(&id, &path)
+}
+
+#[tauri::command]
+fn chat_import_session(store: State<'_, Arc<ChatStore>>, path: String) -> AppResult<StoredSession> {
+    store.import(&path)
+}
+
 #[tauri::command]
 fn start_conversion(
     app: AppHandle,
@@ -288,6 +337,7 @@ fn main() {
             let store = Arc::new(SettingsStore::load(config_dir, data_dir.clone())?);
             let port = store.get().port;
             let memory = MemoryStore::load(data_dir.join("memory.json"));
+            let chat_store = ChatStore::load(data_dir.join("chat-sessions"));
 
             engines::cleanup_stale_processes(app.handle())?;
             let engine = Arc::new(EngineManager::new(port));
@@ -296,6 +346,7 @@ fn main() {
             let provisioner = Arc::new(Provisioner::new());
 
             app.manage(store);
+            app.manage(Arc::new(chat_store));
             app.manage(Arc::new(memory));
             app.manage(engine);
             app.manage(supervisor.clone());
@@ -340,6 +391,13 @@ fn main() {
             capabilities::get_backend_capabilities,
             stream_chat,
             cancel_chat,
+            chat_tool_approval,
+            chat_sessions_list,
+            chat_session_save,
+            chat_session_delete,
+            chat_asset_data_url,
+            chat_export_session,
+            chat_import_session,
             memory_list,
             save_to_memory_bank,
             memory_update,

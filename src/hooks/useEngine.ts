@@ -8,9 +8,12 @@ import type {
   ActiveEngineInfo,
   AdapterWarningEvent,
   EngineKind,
+  EngineLog,
   EngineSnapshot,
   EngineTelemetry,
 } from "../types";
+
+const MAX_ENGINE_LOGS = 500;
 
 const INITIAL: EngineSnapshot = {
   status: "disconnected",
@@ -26,6 +29,8 @@ export interface EngineController {
   active: ActiveEngineInfo | null;
   telemetry: EngineTelemetry | null;
   adapterWarning: AdapterWarningEvent | null;
+  logs: EngineLog[];
+  clearLogs: () => void;
   busy: boolean;
   error: string | null;
   start: () => Promise<void>;
@@ -42,6 +47,7 @@ export function useEngine(): EngineController {
   const [telemetry, setTelemetry] = useState<EngineTelemetry | null>(null);
   const [adapterWarning, setAdapterWarning] =
     useState<AdapterWarningEvent | null>(null);
+  const [logs, setLogs] = useState<EngineLog[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -78,6 +84,14 @@ export function useEngine(): EngineController {
         Events.engineTelemetry,
         (event) => setTelemetry(event.payload),
       );
+      const logUnlisten = await listen<EngineLog>(Events.engineLog, (event) => {
+        setLogs((previous) => {
+          const next = [...previous, event.payload];
+          return next.length > MAX_ENGINE_LOGS
+            ? next.slice(next.length - MAX_ENGINE_LOGS)
+            : next;
+        });
+      });
       const warningUnlisten = await listen<AdapterWarningEvent>(
         Events.engineAdapterWarning,
         (event) => setAdapterWarning(event.payload),
@@ -97,6 +111,7 @@ export function useEngine(): EngineController {
         statusUnlisten();
         activeUnlisten();
         telemetryUnlisten();
+        logUnlisten();
         warningUnlisten();
         exitUnlisten();
       } else {
@@ -104,6 +119,7 @@ export function useEngine(): EngineController {
           statusUnlisten,
           activeUnlisten,
           telemetryUnlisten,
+          logUnlisten,
           warningUnlisten,
           exitUnlisten,
         );
@@ -163,12 +179,15 @@ export function useEngine(): EngineController {
 
   const clearError = useCallback(() => setError(null), []);
   const clearAdapterWarning = useCallback(() => setAdapterWarning(null), []);
+  const clearLogs = useCallback(() => setLogs([]), []);
 
   return {
     snapshot,
     active,
     telemetry,
     adapterWarning,
+    logs,
+    clearLogs,
     busy,
     error,
     start,

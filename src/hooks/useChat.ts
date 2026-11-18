@@ -29,13 +29,15 @@ import type {
   ChatMessage,
   ChatNotice,
   ChatSession,
+  ChatToolApproval,
   ChatUsage,
   Citation,
   McpActivityEvent,
   McpServerInput,
 } from "../types";
 
-const STORAGE_KEY = "janas.sessions.v1";
+/** Pre-disk-store history. Read once for migration and then removed. */
+const LEGACY_STORAGE_KEY = "janas.sessions.v1";
 const ACTIVE_KEY = "janas.activeSession.v1";
 
 export interface SendOptions {
@@ -120,6 +122,25 @@ type ActiveRequest = {
 async function cancelRequest(request: ActiveRequest) {
   if (request.mode === "agent") return api.abortAgent(request.requestId);
   return api.cancelChat(request.requestId);
+}
+
+/** Resolve stored image references for a turn the user is re-running. */
+async function imageDataUrls(
+  images: ChatMessage["images"] | undefined,
+): Promise<string[]> {
+  if (!images?.length) return [];
+  const resolved = await Promise.all(
+    images.map(async (image) => {
+      if (image.data_url) return image.data_url;
+      if (!image.asset) return null;
+      try {
+        return await api.chatAssetDataUrl(image.asset);
+      } catch {
+        return null;
+      }
+    }),
+  );
+  return resolved.filter((url): url is string => Boolean(url));
 }
 
 function undoSummary(result: AgentUndoResult): string {
@@ -316,18 +337,23 @@ function normalizeMessage(value: unknown): ChatMessage | null {
   if (!value || typeof value !== "object") return null;
   const message = value as Partial<ChatMessage>;
   if (message.role !== "user" && message.role !== "assistant") return null;
-  const images = Array.isArray(message.images)
-    ? message.images
+  const rawImages: unknown[] = Array.isArray(message.images)
+    ? (message.images as unknown[])
+    : [];
+  const images = rawImages.length
+    ? rawImages
         .filter(
-          (image): image is { name: string; data_url: string; tokens: number } =>
-            Boolean(image) &&
-            typeof image.name === "string" &&
-            typeof image.data_url === "string",
+          (image): image is Record<string, unknown> =>
+            Boolean(image) && typeof image === "object",
         )
         .map((image) => ({
-          ...image,
+          name: typeof image.name === "string" ? image.name : "image",
+          data_url:
+            typeof image.data_url === "string" ? image.data_url : undefined,
+          asset: typeof image.asset === "string" ? image.asset : undefined,
           tokens: typeof image.tokens === "number" ? image.tokens : 0,
         }))
+        .filter((image) => Boolean(image.data_url || image.asset))
     : undefined;
   return {
     id: typeof message.id === "string" ? message.id : uid(),
@@ -346,43 +372,40 @@ function normalizeMessage(value: unknown): ChatMessage | null {
   };
 }
 
-function loadSessions(): ChatSession[] {
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (raw) {
-      const parsed: unknown = JSON.parse(raw);
-      if (Array.isArray(parsed) && parsed.length) {
-        const sessions = parsed
-          .filter(
-            (session): session is ChatSession =>
-              Boolean(session) &&
-              typeof session === "object" &&
-              typeof (session as ChatSession).id === "string" &&
-              Array.isArray((session as ChatSession).messages),
-          )
-          .map((session) => ({
-            ...session,
-            title:
-              typeof session.title === "string" ? session.title : "New chat",
-            created_at:
-              typeof session.created_at === "number"
-                ? session.created_at
-                : Date.now(),
-            updated_at:
-              typeof session.updated_at === "number"
-                ? session.updated_at
-                : Date.now(),
-            messages: session.messages
-              .map(normalizeMessage)
-              .filter((message): message is ChatMessage => message !== null),
-          }));
-        if (sessions.length) return sessions;
-      }
-    }
-  } catch {
-    // A corrupt store should never stop the studio from opening.
+function normalizeSession(value: unknown): ChatSession | null {
+  if (!value || typeof value !== "object") return null;
+  const session = value as Partial<ChatSession>;
+  if (typeof session.id !== "string" || !Array.isArray(session.messages)) {
+    return null;
   }
-  return [createSession()];
+  const now = Date.now();
+  return {
+    id: session.id,
+    title: typeof session.title === "string" ? session.title : "New chat",
+    created_at:
+      typeof session.created_at === "number" ? session.created_at : now,
+    updated_at:
+      typeof session.updated_at === "number" ? session.updated_at : now,
+    pinned: Boolean(session.pinned),
+    messages: session.messages
+      .map(normalizeMessage)
+      .filter((message): message is ChatMessage => message !== null),
+  };
+}
+
+/** The old localStorage blob, read once so existing chats survive the move. */
+function readLegacySessions(): ChatSession[] {
+  try {
+    const raw = window.localStorage.getItem(LEGACY_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map(normalizeSession)
+      .filter((session): session is ChatSession => session !== null);
+  } catch {
+    return [];
+  }
 }
 
 function loadActive(sessions: ChatSession[]): string {
@@ -399,14 +422,9 @@ function loadActive(sessions: ChatSession[]): string {
 }
 
 export function useChat() {
-  const [sessions, setSessions] = useState<ChatSession[]>(loadSessions);
-  // Resolve the active chat against the sessions the state actually holds.
-  // Calling loadSessions() again here would mint a second, unrelated session
-  // on a fresh profile, leaving activeId pointing at a chat that is not in
-  // the list. Sending then had no session to append to and returned silently.
-  const [activeId, setActiveId] = useState<string>(() =>
-    loadActive(sessions),
-  );
+  const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const [activeId, setActiveId] = useState<string>("");
+  const [hydrated, setHydrated] = useState(false);
   const [streaming, setStreaming] = useState(false);
   const [streamingSessionId, setStreamingSessionId] = useState<string | null>(
     null,
@@ -418,39 +436,134 @@ export function useChat() {
   const [finishReason, setFinishReason] = useState<string | null>(null);
   const [liveBytes, setLiveBytes] = useState(0);
   const [startedAtMs, setStartedAtMs] = useState<number | null>(null);
+  const [toolApproval, setToolApproval] = useState<ChatToolApproval | null>(
+    null,
+  );
   const activeRequest = useRef<ActiveRequest | null>(null);
   const streamStartedAt = useRef<number | null>(null);
   const sessionsRef = useRef(sessions);
   sessionsRef.current = sessions;
   const activeIdRef = useRef(activeId);
   activeIdRef.current = activeId;
+  const savedRef = useRef<Map<string, ChatSession>>(new Map());
+  const saveTimers = useRef<Map<string, number>>(new Map());
+  const deletedRef = useRef<Set<string>>(new Set());
 
+  // Hydrate from the Rust store. Existing localStorage history is migrated
+  // once, then the old blob is removed so it can never go stale.
   useEffect(() => {
-    try {
-      // Keep the newest 60 sessions; messages are plain text.
-      window.localStorage.setItem(
-        STORAGE_KEY,
-        JSON.stringify(sessions.slice(0, 60)),
-      );
-    } catch {
-      // Storage can be full or disabled. The session still works in memory.
+    let cancelled = false;
+    void (async () => {
+      let loaded: ChatSession[] = [];
+      let loadError: string | null = null;
+      try {
+        const stored = await api.chatSessionsList();
+        loaded = Array.isArray(stored)
+          ? stored
+              .map(normalizeSession)
+              .filter((session): session is ChatSession => session !== null)
+          : [];
+      } catch (err) {
+        loadError = errorMessage(err);
+      }
+
+      // Migrate anything the disk store does not already have, even when the
+      // shelf is not empty. A partial write must not strand the rest of the
+      // old localStorage history.
+      const legacy = readLegacySessions();
+      if (legacy.length) {
+        const known = new Set(loaded.map((session) => session.id));
+        let complete = true;
+        for (const session of legacy) {
+          if (known.has(session.id)) continue;
+          try {
+            await api.chatSessionSave(session);
+            loaded.push(session);
+            known.add(session.id);
+          } catch {
+            complete = false;
+          }
+        }
+        if (complete) {
+          try {
+            window.localStorage.removeItem(LEGACY_STORAGE_KEY);
+          } catch {
+            // ignore
+          }
+        }
+      }
+
+      if (!loaded.length) loaded = [createSession()];
+      if (cancelled) return;
+      savedRef.current = new Map(loaded.map((session) => [session.id, session]));
+      setSessions(loaded);
+      setActiveId(loadActive(loaded));
+      setHydrated(true);
+      if (loadError) {
+        setError(`Chat history could not be loaded from disk: ${loadError}`);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const flushSession = useCallback(async (sessionId: string) => {
+    const timer = saveTimers.current.get(sessionId);
+    if (timer) {
+      window.clearTimeout(timer);
+      saveTimers.current.delete(sessionId);
     }
-  }, [sessions]);
+    const session = sessionsRef.current.find(
+      (candidate) => candidate.id === sessionId,
+    );
+    if (!session || deletedRef.current.has(sessionId)) return;
+    savedRef.current.set(session.id, session);
+    try {
+      await api.chatSessionSave(session);
+    } catch (err) {
+      savedRef.current.delete(session.id);
+      setError(`Chat history could not be saved: ${errorMessage(err)}`);
+    }
+  }, []);
+
+  // Only changed sessions are written. Streaming deltas replace one session
+  // object, so the debounce coalesces a burst of tokens into one small file
+  // write instead of serializing the whole shelf on every token.
+  useEffect(() => {
+    if (!hydrated) return;
+    for (const session of sessions) {
+      if (savedRef.current.get(session.id) === session) continue;
+      savedRef.current.set(session.id, session);
+      const existing = saveTimers.current.get(session.id);
+      if (existing) window.clearTimeout(existing);
+      const timer = window.setTimeout(() => {
+        saveTimers.current.delete(session.id);
+        if (deletedRef.current.has(session.id)) return;
+        void api.chatSessionSave(session).catch((err) => {
+          savedRef.current.delete(session.id);
+          setError(`Chat history could not be saved: ${errorMessage(err)}`);
+        });
+      }, 500);
+      saveTimers.current.set(session.id, timer);
+    }
+  }, [sessions, hydrated]);
 
   useEffect(() => {
+    if (!hydrated || !activeId) return;
     try {
       window.localStorage.setItem(ACTIVE_KEY, JSON.stringify(activeId));
     } catch {
       // ignore
     }
-  }, [activeId]);
+  }, [activeId, hydrated]);
 
   // Checkpoints live on disk and survive a restart, while the in-memory
   // journal does not. Ask Rust which persisted traces are still undoable once
   // the initially loaded sessions are available.
   const availabilityChecked = useRef(false);
   useEffect(() => {
-    if (availabilityChecked.current) return;
+    if (!hydrated || availabilityChecked.current) return;
     availabilityChecked.current = true;
     const runIds = Array.from(
       new Set(
@@ -513,7 +626,7 @@ export function useChat() {
       .catch(() => {
         // Older backends do not expose availability; the button stays hidden.
       });
-  }, [sessions]);
+  }, [sessions, hydrated]);
 
   useEffect(() => {
     let disposed = false;
@@ -586,7 +699,9 @@ export function useChat() {
         setFirstTokenMs(event.payload.first_token_ms);
         setFinishReason(event.payload.finish_reason);
         setError(null);
+        setToolApproval(null);
         activeRequest.current = null;
+        flushSession(request.sessionId);
       });
       const errorUnlisten = await listen<ChatErrorEvent>(
         Events.chatError,
@@ -596,7 +711,9 @@ export function useChat() {
           setError(event.payload.message);
           setStreaming(false);
           setStreamingSessionId(null);
+          setToolApproval(null);
           activeRequest.current = null;
+          flushSession(request.sessionId);
           updateMessage(request.requestId, request.sessionId, (message) =>
             message.content
               ? message
@@ -623,6 +740,14 @@ export function useChat() {
             kind: event.payload.level === "error" ? "error" : "tool",
             message: event.payload.message,
           });
+        },
+      );
+      const toolApprovalUnlisten = await listen<ChatToolApproval>(
+        Events.chatToolApproval,
+        (event) => {
+          const request = activeRequest.current;
+          if (!request || event.payload.request_id !== request.requestId) return;
+          setToolApproval(event.payload);
         },
       );
 
@@ -838,7 +963,9 @@ export function useChat() {
               .then((state) => applyUndoState(event.payload.run_id, state))
               .catch(() => undefined);
           }
+          setToolApproval(null);
           activeRequest.current = null;
+          flushSession(request.sessionId);
         },
       );
 
@@ -848,6 +975,7 @@ export function useChat() {
         errorUnlisten();
         noticeUnlisten();
         mcpActivityUnlisten();
+        toolApprovalUnlisten();
         planUnlisten();
         thoughtUnlisten();
         toolStartUnlisten();
@@ -864,6 +992,7 @@ export function useChat() {
           errorUnlisten,
           noticeUnlisten,
           mcpActivityUnlisten,
+          toolApprovalUnlisten,
           planUnlisten,
           thoughtUnlisten,
           toolStartUnlisten,
@@ -886,55 +1015,32 @@ export function useChat() {
     };
   }, []);
 
-  const send = useCallback(
-    async (text: string, options: SendOptions) => {
-      const trimmed = text.trim();
-      if (!trimmed || activeRequest.current) return false;
-
-      const requestedSessionId = activeIdRef.current;
-      // Fall back to the first chat if the stored active id is stale, so a
-      // message is never dropped without feedback.
-      const session =
-        sessionsRef.current.find(
-          (candidate) => candidate.id === requestedSessionId,
-        ) ?? sessionsRef.current[0];
-      if (!session) return false;
-      const sessionId = session.id;
-      if (sessionId !== requestedSessionId) setActiveId(sessionId);
-
-      const requestId = uid();
-      const now = Date.now();
-      const userMessage: ChatMessage = {
-        id: uid(),
-        role: "user",
-        content: trimmed,
-        reasoning: "",
-        created_at: now,
-        images: options.images?.length
-          ? options.images.map((dataUrl, index) => ({
-              name: `image-${index + 1}`,
-              data_url: dataUrl,
-              tokens: 0,
-            }))
-          : undefined,
-      };
-      const assistantMessage: ChatMessage = {
-        id: requestId,
-        role: "assistant",
-        content: "",
-        reasoning: "",
-        created_at: now,
-        citations: options.citations,
-      };
-
-      const history = [...session.messages, userMessage];
+  const runChatTurn = useCallback(
+    async (input: {
+      sessionId: string;
+      baseMessages: ChatMessage[];
+      assistant: ChatMessage;
+      options: SendOptions;
+      titleSource?: string;
+      titleOverride?: string;
+      images?: string[];
+    }) => {
+      if (activeRequest.current) return false;
+      const { sessionId, baseMessages, assistant, options } = input;
       const turnWindow = Math.max(1, options.contextPrefetch) * 2 + 1;
-      const windowed = history.slice(-turnWindow).filter(
+      const windowed = baseMessages.slice(-turnWindow).filter(
         (message) =>
           message.role === "user" ||
           message.content.trim().length > 0 ||
           message.reasoning.trim().length > 0,
       );
+      const current = baseMessages[baseMessages.length - 1];
+      const imageTokens =
+        options.imageTokens ??
+        (current?.images ?? []).reduce(
+          (total, image) => total + (image.tokens || 0),
+          0,
+        );
 
       const fitted = fitContext({
         contextWindow: options.contextWindow,
@@ -945,24 +1051,26 @@ export function useChat() {
           role: message.role,
           content: message.content,
         })),
-        imageTokens: options.imageTokens ?? 0,
+        imageTokens,
       });
       if (fitted.error) {
         setError(fitted.error);
         return false;
       }
 
+      const now = Date.now();
       setSessions((previous) =>
         previous.map((candidate) =>
           candidate.id === sessionId
             ? {
                 ...candidate,
                 title:
-                  candidate.messages.length === 0
-                    ? trimmed.slice(0, 56)
-                    : candidate.title,
+                  input.titleOverride ??
+                  (input.titleSource && candidate.messages.length === 0
+                    ? input.titleSource.slice(0, 56)
+                    : candidate.title),
                 updated_at: now,
-                messages: [...candidate.messages, userMessage, assistantMessage],
+                messages: [...baseMessages, assistant],
               }
             : candidate,
         ),
@@ -977,12 +1085,16 @@ export function useChat() {
       setFinishReason(null);
       setLiveBytes(0);
       setStartedAtMs(now);
-      activeRequest.current = { requestId, sessionId, mode: "chat" };
+      activeRequest.current = {
+        requestId: assistant.id,
+        sessionId,
+        mode: "chat",
+      };
       streamStartedAt.current = Date.now();
 
       try {
         await api.streamChat({
-          request_id: requestId,
+          request_id: assistant.id,
           messages: fitted.messages,
           system_prompt: fitted.systemPrompt || null,
           temperature: options.temperature,
@@ -992,7 +1104,10 @@ export function useChat() {
           repeat_penalty: options.repeatPenalty,
           structured: options.structuredOutput,
           thinking: options.thinking,
-          images: options.images ?? [],
+          images:
+            input.images ??
+            options.images ??
+            [],
           max_tokens: options.maxTokens,
           mcp_servers: options.mcpServers ?? [],
         });
@@ -1000,6 +1115,7 @@ export function useChat() {
         setError(errorMessage(err));
         setStreaming(false);
         setStreamingSessionId(null);
+        setToolApproval(null);
         activeRequest.current = null;
         setSessions((previous) =>
           previous.map((candidate) =>
@@ -1007,7 +1123,7 @@ export function useChat() {
               ? {
                   ...candidate,
                   messages: candidate.messages.map((message) =>
-                    message.id === requestId && !message.content
+                    message.id === assistant.id && !message.content
                       ? {
                           ...message,
                           content: "_The engine did not return a response._",
@@ -1024,10 +1140,150 @@ export function useChat() {
     [],
   );
 
+  const send = useCallback(
+    async (text: string, options: SendOptions) => {
+      const trimmed = text.trim();
+      if (!trimmed || activeRequest.current) return false;
+      if (!sessionsRef.current.length) {
+        setError("Chat history is still loading. Try again in a moment.");
+        return false;
+      }
+
+      const requestedSessionId = activeIdRef.current;
+      // Fall back to the first chat if the stored active id is stale, so a
+      // message is never dropped without feedback.
+      const session =
+        sessionsRef.current.find(
+          (candidate) => candidate.id === requestedSessionId,
+        ) ?? sessionsRef.current[0];
+      if (!session) return false;
+      const sessionId = session.id;
+      if (sessionId !== requestedSessionId) setActiveId(sessionId);
+
+      const now = Date.now();
+      const userMessage: ChatMessage = {
+        id: uid(),
+        role: "user",
+        content: trimmed,
+        reasoning: "",
+        created_at: now,
+        images: options.images?.length
+          ? options.images.map((dataUrl, index) => ({
+              name: `image-${index + 1}`,
+              data_url: dataUrl,
+              tokens: 0,
+            }))
+          : undefined,
+      };
+      const assistantMessage: ChatMessage = {
+        id: uid(),
+        role: "assistant",
+        content: "",
+        reasoning: "",
+        created_at: now,
+        citations: options.citations,
+      };
+
+      return runChatTurn({
+        sessionId,
+        baseMessages: [...session.messages, userMessage],
+        assistant: assistantMessage,
+        options,
+        titleSource: trimmed,
+        images: options.images,
+      });
+    },
+    [runChatTurn],
+  );
+
+  const regenerate = useCallback(
+    async (messageId: string, options: SendOptions) => {
+      if (activeRequest.current) return false;
+      const requestedSessionId = activeIdRef.current;
+      const session =
+        sessionsRef.current.find(
+          (candidate) => candidate.id === requestedSessionId,
+        ) ?? sessionsRef.current[0];
+      if (!session) return false;
+      const index = session.messages.findIndex(
+        (message) => message.id === messageId,
+      );
+      if (index <= 0) return false;
+      const target = session.messages[index];
+      const user = session.messages[index - 1];
+      if (
+        !target ||
+        target.role !== "assistant" ||
+        !user ||
+        user.role !== "user"
+      ) {
+        return false;
+      }
+
+      const assistant: ChatMessage = {
+        id: uid(),
+        role: "assistant",
+        content: "",
+        reasoning: "",
+        created_at: Date.now(),
+        citations: target.citations,
+      };
+      return runChatTurn({
+        sessionId: session.id,
+        baseMessages: session.messages.slice(0, index),
+        assistant,
+        options,
+        images: await imageDataUrls(user.images),
+      });
+    },
+    [runChatTurn],
+  );
+
+  const editAndResend = useCallback(
+    async (messageId: string, text: string, options: SendOptions) => {
+      const trimmed = text.trim();
+      if (!trimmed || activeRequest.current) return false;
+      const requestedSessionId = activeIdRef.current;
+      const session =
+        sessionsRef.current.find(
+          (candidate) => candidate.id === requestedSessionId,
+        ) ?? sessionsRef.current[0];
+      if (!session) return false;
+      const index = session.messages.findIndex(
+        (message) => message.id === messageId,
+      );
+      if (index < 0) return false;
+      const message = session.messages[index];
+      if (!message || message.role !== "user") return false;
+
+      const edited: ChatMessage = { ...message, content: trimmed, reasoning: "" };
+      const assistant: ChatMessage = {
+        id: uid(),
+        role: "assistant",
+        content: "",
+        reasoning: "",
+        created_at: Date.now(),
+      };
+      return runChatTurn({
+        sessionId: session.id,
+        baseMessages: [...session.messages.slice(0, index), edited],
+        assistant,
+        options,
+        titleOverride: index === 0 ? trimmed.slice(0, 56) : undefined,
+        images: await imageDataUrls(edited.images),
+      });
+    },
+    [runChatTurn],
+  );
+
   const sendAgent = useCallback(
     async (text: string, options: AgentSendOptions) => {
       const trimmed = text.trim();
       if (!trimmed || activeRequest.current) return false;
+      if (!sessionsRef.current.length) {
+        setError("Chat history is still loading. Try again in a moment.");
+        return false;
+      }
 
       const requestedSessionId = activeIdRef.current;
       const session =
@@ -1152,7 +1408,9 @@ export function useChat() {
         setError(message);
         setStreaming(false);
         setStreamingSessionId(null);
+        setToolApproval(null);
         activeRequest.current = null;
+        flushSession(sessionId);
         setSessions((previous) =>
           previous.map((candidate) =>
             candidate.id === sessionId
@@ -1178,7 +1436,7 @@ export function useChat() {
       }
       return true;
     },
-    [],
+    [flushSession],
   );
 
   const stop = useCallback(async () => {
@@ -1193,7 +1451,9 @@ export function useChat() {
         setStreamingSessionId(null);
       }
     }
-  }, []);
+    setToolApproval(null);
+    flushSession(request.sessionId);
+  }, [flushSession]);
 
   const clear = useCallback(async () => {
     if (activeRequest.current) {
@@ -1219,11 +1479,12 @@ export function useChat() {
     setFinishReason(null);
     setError(null);
     setLiveBytes(0);
+    setToolApproval(null);
   }, []);
 
   const newChat = useCallback(() => {
     const session = createSession();
-    setSessions((previous) => [session, ...previous].slice(0, 60));
+    setSessions((previous) => [session, ...previous]);
     setActiveId(session.id);
     setUsage(null);
     setElapsedMs(null);
@@ -1244,6 +1505,16 @@ export function useChat() {
       setStreaming(false);
       setStreamingSessionId(null);
     }
+    const timer = saveTimers.current.get(id);
+    if (timer) {
+      window.clearTimeout(timer);
+      saveTimers.current.delete(id);
+    }
+    savedRef.current.delete(id);
+    deletedRef.current.add(id);
+    void api.chatSessionDelete(id).catch((err) => {
+      setError(`That chat could not be deleted: ${errorMessage(err)}`);
+    });
     setSessions((previous) => {
       const remaining = previous.filter((session) => session.id !== id);
       const next = remaining.length ? remaining : [createSession()];
@@ -1269,6 +1540,73 @@ export function useChat() {
       ),
     );
   }, []);
+
+  const renameChat = useCallback((id: string, title: string) => {
+    const trimmed = title.trim();
+    if (!trimmed) return;
+    setSessions((previous) =>
+      previous.map((session) =>
+        session.id === id
+          ? { ...session, title: trimmed, updated_at: Date.now() }
+          : session,
+      ),
+    );
+  }, []);
+
+  const togglePin = useCallback((id: string) => {
+    setSessions((previous) =>
+      previous.map((session) =>
+        session.id === id
+          ? { ...session, pinned: !session.pinned }
+          : session,
+      ),
+    );
+  }, []);
+
+  const importChat = useCallback(async (path: string) => {
+    const imported = normalizeSession(await api.chatImportSession(path));
+    if (!imported) {
+      throw new Error("The imported chat could not be read.");
+    }
+    savedRef.current.set(imported.id, imported);
+    deletedRef.current.delete(imported.id);
+    setSessions((previous) => [imported, ...previous]);
+    setActiveId(imported.id);
+    return imported.id;
+  }, []);
+
+  const exportChat = useCallback(async (id: string, path: string) => {
+    const session = sessionsRef.current.find(
+      (candidate) => candidate.id === id,
+    );
+    // Export reads the file on disk, so write the latest in-memory turn first.
+    if (session && !deletedRef.current.has(id)) {
+      await api.chatSessionSave(session);
+      savedRef.current.set(id, session);
+    }
+    await api.chatExportSession(id, path);
+  }, []);
+
+  const resolveToolApproval = useCallback(
+    async (decision: "approve" | "reject") => {
+      const pending = toolApproval;
+      if (!pending) return;
+      setToolApproval(null);
+      try {
+        const accepted = await api.resolveChatToolApproval(
+          pending.request_id,
+          pending.call_id,
+          decision,
+        );
+        if (!accepted) {
+          setError("That tool approval was no longer waiting.");
+        }
+      } catch (err) {
+        setError(errorMessage(err));
+      }
+    },
+    [toolApproval],
+  );
 
   const updateTraceByRun = useCallback(
     (runId: string, updater: (trace: AgentTrace) => AgentTrace) => {
@@ -1377,6 +1715,7 @@ export function useChat() {
     sessions,
     activeId,
     messages,
+    loading: !hydrated,
     streaming: activeStreaming,
     busy: streaming,
     startedAtMs,
@@ -1390,7 +1729,15 @@ export function useChat() {
     streamStartedAt,
     setActiveId,
     send,
+    regenerate,
+    editAndResend,
     sendAgent,
+    toolApproval,
+    resolveToolApproval,
+    renameChat,
+    togglePin,
+    importChat,
+    exportChat,
     undoAgent,
     undoAgentFile,
     keepAgentFile,
