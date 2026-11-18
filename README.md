@@ -1,6 +1,8 @@
 # Janas Studio
 
-A local AI studio for the [Janas](https://github.com/prabanta-dev/janas) C inference engine, built with **Tauri 2**, **Rust**, **React 18**, **TypeScript**, and **Tailwind CSS**.
+Now with theme choices and an "agent mode!"  
+
+Janas-Studio is a local AI studio for the [Janas](https://github.com/prabanta-dev/janas) C inference engine, built with **Tauri 2**, **Rust**, **React 18**, **TypeScript**, and **Tailwind CSS**.
 
 Janas Studio manages the `janas-server` process, proxies its OpenAI-compatible SSE stream into the webview, browses GGUF repositories on Hugging Face, and drives `janas-convert` / upstream `gguf2jns` with a live console.
 
