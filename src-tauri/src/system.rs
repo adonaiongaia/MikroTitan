@@ -5,6 +5,7 @@
 //! explicitly enables.
 
 use std::{
+    collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -18,7 +19,7 @@ use tauri::State;
 
 use crate::{
     error::{AppError, AppResult},
-    settings::{expand_home, SettingsStore},
+    settings::{expand_home, AppSettings, SettingsStore},
     util::now_ms,
 };
 
@@ -1260,6 +1261,27 @@ pub struct LibraryModel {
     pub thinking: bool,
     pub tools: bool,
     pub capabilities_source: String,
+    /// Another file with the same model name and byte size exists.
+    pub duplicate: bool,
+    /// How many local files belong to the same Hugging Face repository.
+    pub same_repo_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelVerification {
+    pub path: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub expected: Option<String>,
+    pub ok: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LibraryDisk {
+    pub models_dir: String,
+    pub total_bytes: u64,
+    pub free_bytes: Option<u64>,
 }
 
 const QUANTS: &[&str] = &[
@@ -1525,9 +1547,34 @@ pub fn library_models(store: State<'_, std::sync::Arc<SettingsStore>>) -> Vec<Li
                 thinking,
                 tools,
                 capabilities_source,
+                duplicate: false,
+                same_repo_count: 1,
             }
         })
         .collect();
+
+    let mut repo_counts: HashMap<String, usize> = HashMap::new();
+    let mut copy_counts: HashMap<(String, u64), usize> = HashMap::new();
+    for model in &models {
+        if let Some(repo) = &model.repo {
+            *repo_counts.entry(repo.clone()).or_default() += 1;
+        }
+        *copy_counts
+            .entry((model.name.to_lowercase(), model.size_bytes))
+            .or_default() += 1;
+    }
+    for model in &mut models {
+        model.same_repo_count = model
+            .repo
+            .as_ref()
+            .and_then(|repo| repo_counts.get(repo).copied())
+            .unwrap_or(1);
+        model.duplicate = copy_counts
+            .get(&(model.name.to_lowercase(), model.size_bytes))
+            .copied()
+            .unwrap_or(1)
+            > 1;
+    }
 
     models.sort_by(|a, b| {
         b.size_bytes
@@ -1545,6 +1592,10 @@ pub struct DownloadRecord {
     pub saved_at: String,
     #[serde(default)]
     pub size_bytes: u64,
+    /// Expected SHA-256 for each repo-relative file, when Hugging Face's LFS
+    /// metadata provides it.
+    #[serde(default)]
+    pub checksums: HashMap<String, String>,
 }
 
 fn manifest_path(root: &Path) -> PathBuf {
@@ -1575,6 +1626,150 @@ pub fn record_download(root: &Path, record: DownloadRecord) {
     if let Ok(json) = serde_json::to_string_pretty(&records) {
         let _ = fs::write(path, json);
     }
+}
+
+/// Verify a local model against the checksum recorded when it was downloaded.
+#[tauri::command]
+pub async fn verify_local_model(
+    store: State<'_, std::sync::Arc<SettingsStore>>,
+    path: String,
+) -> AppResult<ModelVerification> {
+    let settings = store.get();
+    let target = validate_model_file(&settings, &path)?;
+    let size_bytes = fs::metadata(&target)?.len();
+    let manifest = read_download_manifest(&expand_home(&settings.models_dir));
+    let relative = manifest.iter().find_map(|record| {
+        record
+            .files
+            .iter()
+            .find(|file| target.ends_with(file.replace('/', std::path::MAIN_SEPARATOR_STR)))
+            .map(|file| (record, file.clone()))
+    });
+    let expected = relative
+        .as_ref()
+        .and_then(|(record, file)| record.checksums.get(file).cloned());
+    let hash_path = target.clone();
+    let actual = tauri::async_runtime::spawn_blocking(move || sha256_file(&hash_path))
+        .await
+        .map_err(|err| AppError::message(format!("Could not hash that model: {err}")))??;
+    let (ok, message) = match expected.as_deref() {
+        Some(expected) if !expected.eq_ignore_ascii_case(&actual) => (
+            false,
+            "Checksum mismatch. This file may be corrupt or was not downloaded by Janas Studio."
+                .to_string(),
+        ),
+        Some(_) => (true, "Verified against the download checksum.".to_string()),
+        None => (
+            true,
+            "No upstream checksum is recorded; the SHA-256 is shown for comparison.".to_string(),
+        ),
+    };
+    Ok(ModelVerification {
+        path: target.to_string_lossy().to_string(),
+        size_bytes,
+        sha256: actual,
+        expected,
+        ok,
+        message,
+    })
+}
+
+#[tauri::command]
+pub fn delete_local_model(
+    store: State<'_, std::sync::Arc<SettingsStore>>,
+    path: String,
+) -> AppResult<u64> {
+    let settings = store.get();
+    let target = validate_model_file(&settings, &path)?;
+    let active = [settings.model_path.as_str(), settings.llama_model_path.as_str()]
+        .iter()
+        .filter(|value| !value.trim().is_empty())
+        .filter_map(|value| expand_home(value).canonicalize().ok())
+        .any(|active| active == target);
+    if active {
+        return Err(AppError::message(
+            "That model is active. Select another model before deleting it.",
+        ));
+    }
+    let bytes = fs::metadata(&target)?.len();
+    fs::remove_file(&target)?;
+    Ok(bytes)
+}
+
+#[tauri::command]
+pub fn library_disk(store: State<'_, std::sync::Arc<SettingsStore>>) -> LibraryDisk {
+    let settings = store.get();
+    let root = expand_home(&settings.models_dir);
+    let mut files = Vec::new();
+    scan_library_files(&root, 0, &mut files);
+    let total_bytes = files
+        .iter()
+        .filter_map(|path| fs::metadata(path).ok())
+        .map(|meta| meta.len())
+        .sum();
+    LibraryDisk {
+        models_dir: root.to_string_lossy().to_string(),
+        total_bytes,
+        free_bytes: free_disk_bytes(&root),
+    }
+}
+
+fn validate_model_file(settings: &AppSettings, path: &str) -> AppResult<PathBuf> {
+    let root = expand_home(&settings.models_dir)
+        .canonicalize()
+        .map_err(|_| AppError::message("Set an existing models folder in Settings first."))?;
+    let target = expand_home(path)
+        .canonicalize()
+        .map_err(|err| AppError::message(format!("Could not find that model: {err}")))?;
+    if !target.starts_with(&root) {
+        return Err(AppError::message(
+            "Only models inside the configured models folder can be managed here.",
+        ));
+    }
+    let extension = target
+        .extension()
+        .map(|ext| ext.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if extension != "gguf" && extension != "jns" {
+        return Err(AppError::message("Only .gguf and .jns model files can be managed."));
+    }
+    if !target.is_file() {
+        return Err(AppError::message("That model path is not a file."));
+    }
+    Ok(target)
+}
+
+fn sha256_file(path: &Path) -> AppResult<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read as _;
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(unix)]
+fn free_disk_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } == 0 {
+        Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(unix))]
+fn free_disk_bytes(_path: &Path) -> Option<u64> {
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1721,6 +1916,20 @@ mod tests {
         assert!(validate_external_url("javascript:alert(1)").is_err());
         assert!(validate_external_url("file:///etc/passwd").is_err());
         assert!(validate_external_url("not a url").is_err());
+    }
+
+    #[test]
+    fn hashes_model_files_with_sha256() {
+        let path = std::env::temp_dir().join(format!(
+            "janas-sha-{}.bin",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::write(&path, b"abc").expect("write fixture");
+        assert_eq!(
+            sha256_file(&path).expect("hash"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let _ = fs::remove_file(path);
     }
 
     #[tokio::test]

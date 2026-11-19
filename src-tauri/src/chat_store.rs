@@ -22,10 +22,17 @@ use crate::util::now_ms;
 /// corrupt or hand-edited file from exhausting memory.
 const MAX_SESSION_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ASSET_BYTES: u64 = 32 * 1024 * 1024;
+const CURRENT_SCHEMA_VERSION: u32 = 2;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+fn default_schema_version() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StoredSession {
     pub id: String,
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     #[serde(default)]
     pub title: String,
     #[serde(default)]
@@ -36,6 +43,39 @@ pub struct StoredSession {
     pub pinned: bool,
     #[serde(default)]
     pub messages: Vec<Value>,
+    /// Inactive branches kept alive by a message edit or regenerate. The
+    /// active path stays in `messages`; this is the rest of the tree.
+    #[serde(default)]
+    pub archived_messages: Vec<Value>,
+    /// UI-owned fields such as draft text, attached project and per-chat
+    /// workspace/tool scope. Flattening them here means the backend preserves
+    /// future session fields without requiring a Rust change for each one.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatBackupInfo {
+    pub id: String,
+    pub title: String,
+    pub updated_at: u64,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatStoreStats {
+    pub sessions: usize,
+    pub session_bytes: u64,
+    pub asset_bytes: u64,
+    pub backups: usize,
+    pub backup_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatImportSummary {
+    pub imported: usize,
+    pub failed: usize,
+    pub errors: Vec<String>,
 }
 
 pub struct ChatStore {
@@ -46,6 +86,7 @@ impl ChatStore {
     pub fn load(root: PathBuf) -> Self {
         let _ = fs::create_dir_all(&root);
         let _ = fs::create_dir_all(root.join("assets"));
+        let _ = fs::create_dir_all(root.join("backups"));
         Self { root }
     }
 
@@ -80,6 +121,13 @@ impl ChatStore {
 
     pub fn save(&self, mut session: StoredSession) -> AppResult<StoredSession> {
         validate_id(&session.id)?;
+        if session.schema_version > CURRENT_SCHEMA_VERSION {
+            return Err(AppError::message(format!(
+                "That chat was written by a newer version of Janas Studio (schema {}).",
+                session.schema_version
+            )));
+        }
+        session.schema_version = CURRENT_SCHEMA_VERSION;
         if session.title.trim().is_empty() {
             session.title = "New chat".into();
         }
@@ -96,6 +144,11 @@ impl ChatStore {
             if existing.updated_at > session.updated_at {
                 return Ok(session);
             }
+        }
+        // Keep the previous on-disk version before replacing it. A failed
+        // copy is best-effort: it must not block the actual save.
+        if path.exists() {
+            let _ = self.backup_existing(&path, &session.id);
         }
         self.extract_images(&mut session)?;
 
@@ -126,6 +179,7 @@ impl ChatStore {
         if assets.exists() {
             let _ = fs::remove_dir_all(&assets);
         }
+        let _ = fs::remove_file(self.backup_path(id)?);
         Ok(removed)
     }
 
@@ -205,34 +259,206 @@ impl ChatStore {
         let raw = fs::read_to_string(source)?;
         let value: Value = serde_json::from_str(&raw)
             .map_err(|err| AppError::message(format!("That is not a chat export: {err}")))?;
-        let messages = value
-            .get("messages")
+        self.import_value(value)
+    }
+
+    /// Write every chat, with images inlined, into one portable backup file.
+    /// Returns the number of sessions written.
+    pub fn export_all(&self, path: &str) -> AppResult<usize> {
+        if path.trim().is_empty() {
+            return Err(AppError::message("Choose where to save the backup."));
+        }
+        let target = Path::new(path);
+        if target.is_dir() {
+            return Err(AppError::message("That backup path is a folder."));
+        }
+        let mut sessions = self.list();
+        let mut values = Vec::with_capacity(sessions.len());
+        for session in &mut sessions {
+            self.inline_images(session)?;
+            values.push(
+                serde_json::to_value(session)
+                    .map_err(|err| AppError::message(format!("Could not encode that chat: {err}")))?,
+            );
+        }
+        let payload = json!({
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "exported_at": now_ms(),
+            "sessions": values,
+        });
+        let bytes = serde_json::to_vec_pretty(&payload)
+            .map_err(|err| AppError::message(format!("Could not encode the backup: {err}")))?;
+        if let Some(parent) = target.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        write_atomic(target, &bytes)?;
+        Ok(sessions.len())
+    }
+
+    /// Import a backup produced by `export_all`. Every session gets a fresh
+    /// id, so restoring twice cannot overwrite the current shelf.
+    pub fn import_all(&self, path: &str) -> AppResult<ChatImportSummary> {
+        let source = Path::new(path);
+        let metadata = fs::metadata(source)
+            .map_err(|err| AppError::message(format!("Could not read that backup: {err}")))?;
+        if !metadata.is_file() {
+            return Err(AppError::message("That backup path is not a file."));
+        }
+        let raw = fs::read_to_string(source)?;
+        let value: Value = serde_json::from_str(&raw)
+            .map_err(|err| AppError::message(format!("That is not a chat backup: {err}")))?;
+        let sessions = value
+            .get("sessions")
             .and_then(Value::as_array)
             .cloned()
-            .ok_or_else(|| AppError::message("That chat export has no messages."))?;
-        let now = now_ms();
-        let title = value
-            .get("title")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|title| !title.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| "Imported chat".into());
-        let session = StoredSession {
-            id: uuid::Uuid::new_v4().simple().to_string(),
-            title,
-            created_at: value
-                .get("created_at")
-                .and_then(Value::as_u64)
-                .unwrap_or(now),
-            updated_at: now,
-            pinned: value
-                .get("pinned")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            messages,
+            .or_else(|| value.as_array().cloned())
+            .ok_or_else(|| AppError::message("That backup has no sessions."))?;
+        let mut summary = ChatImportSummary {
+            imported: 0,
+            failed: 0,
+            errors: Vec::new(),
         };
+        for session in sessions {
+            match self.import_value(session) {
+                Ok(_) => summary.imported += 1,
+                Err(err) => {
+                    summary.failed += 1;
+                    if summary.errors.len() < 8 {
+                        summary.errors.push(err.to_string());
+                    }
+                }
+            }
+        }
+        Ok(summary)
+    }
+
+    /// Copy the prefix ending at `message_id` into a fresh session. This is the
+    /// explicit "branch from here" action; normal edits keep their old suffix
+    /// in `archived_messages` instead of creating a second file.
+    pub fn branch_session(&self, id: &str, message_id: &str) -> AppResult<StoredSession> {
+        validate_id(id)?;
+        let mut source = self.read_session(&self.session_path(id)?)?;
+        let index = source
+            .messages
+            .iter()
+            .position(|message| message.get("id").and_then(Value::as_str) == Some(message_id))
+            .ok_or_else(|| AppError::message("That message is no longer in this chat."))?;
+        source.messages.truncate(index + 1);
+        source.archived_messages.clear();
+        source.extra.remove("draft");
+        let new_id = uuid::Uuid::new_v4().simple().to_string();
+        let old_id = source.id.clone();
+        source.id = new_id.clone();
+        source.title = format!("Branch of {}", source.title)
+            .chars()
+            .take(80)
+            .collect();
+        source.created_at = now_ms();
+        source.updated_at = source.created_at;
+        source.pinned = false;
+        source.schema_version = CURRENT_SCHEMA_VERSION;
+        self.copy_assets(&old_id, &new_id)?;
+        for message in &mut source.messages {
+            let Some(images) = message.get_mut("images").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for image in images {
+                let Some(object) = image.as_object_mut() else {
+                    continue;
+                };
+                let Some(asset) = object.get("asset").and_then(Value::as_str) else {
+                    continue;
+                };
+                if let Some((_, file_name)) = asset.split_once('/') {
+                    object.insert("asset".into(), json!(format!("{new_id}/{file_name}")));
+                }
+            }
+        }
+        self.save(source)
+    }
+
+    pub fn backup_list(&self) -> Vec<ChatBackupInfo> {
+        let directory = self.root.join("backups");
+        let Ok(entries) = fs::read_dir(directory) else {
+            return Vec::new();
+        };
+        let mut backups = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let id = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let Ok(session) = self.read_session(&path) else {
+                continue;
+            };
+            if session.id != id {
+                continue;
+            }
+            backups.push(ChatBackupInfo {
+                id,
+                title: session.title,
+                updated_at: session.updated_at,
+                bytes: fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0),
+            });
+        }
+        backups.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        backups
+    }
+
+    pub fn restore_backup(&self, id: &str) -> AppResult<StoredSession> {
+        validate_id(id)?;
+        let mut session = self.read_session(&self.backup_path(id)?)?;
+        session.id = id.to_string();
+        session.updated_at = now_ms();
+        session.schema_version = CURRENT_SCHEMA_VERSION;
         self.save(session)
+    }
+
+    /// Remove asset directories that no session references. A crash between
+    /// writing an image and saving its session leaves these behind.
+    pub fn gc_assets(&self) -> AppResult<u64> {
+        let mut live = HashSet::new();
+        for session in self.list() {
+            live.insert(session.id);
+        }
+        let directory = self.root.join("assets");
+        let Ok(entries) = fs::read_dir(directory) else {
+            return Ok(0);
+        };
+        let mut freed = 0u64;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !path.is_dir() || live.contains(&name) {
+                continue;
+            }
+            freed += directory_bytes(&path);
+            let _ = fs::remove_dir_all(&path);
+        }
+        Ok(freed)
+    }
+
+    pub fn stats(&self) -> ChatStoreStats {
+        let sessions = self.list();
+        let session_bytes = sessions
+            .iter()
+            .filter_map(|session| self.session_path(&session.id).ok())
+            .filter_map(|path| fs::metadata(path).ok())
+            .map(|meta| meta.len())
+            .sum();
+        let asset_bytes = directory_bytes(&self.root.join("assets"));
+        let backups = self.backup_list();
+        ChatStoreStats {
+            sessions: sessions.len(),
+            session_bytes,
+            asset_bytes,
+            backups: backups.len(),
+            backup_bytes: backups.iter().map(|backup| backup.bytes).sum(),
+        }
     }
 
     fn session_path(&self, id: &str) -> AppResult<PathBuf> {
@@ -246,60 +472,74 @@ impl ChatStore {
             return Err(AppError::message("That chat file is too large to open."));
         }
         let raw = fs::read_to_string(path)?;
-        let session: StoredSession = serde_json::from_str(&raw)
+        let mut session: StoredSession = serde_json::from_str(&raw)
             .map_err(|err| AppError::message(format!("Could not read that chat: {err}")))?;
+        if session.schema_version > CURRENT_SCHEMA_VERSION {
+            return Err(AppError::message(format!(
+                "That chat uses a newer schema ({}).",
+                session.schema_version
+            )));
+        }
+        session.schema_version = CURRENT_SCHEMA_VERSION;
         validate_id(&session.id)?;
         Ok(session)
     }
 
-    fn extract_images(&self, session: &mut StoredSession) -> AppResult<()> {
-        for message in &mut session.messages {
-            let Some(images) = message.get_mut("images").and_then(Value::as_array_mut) else {
-                continue;
-            };
-            for image in images {
-                let Some(object) = image.as_object_mut() else {
-                    continue;
-                };
-                let Some(data_url) = object.get("data_url").and_then(Value::as_str) else {
-                    continue;
-                };
-                let Some((header, payload)) = data_url.split_once(";base64,") else {
-                    continue;
-                };
-                if !header.starts_with("data:image/") {
-                    continue;
-                }
-                let mime = header.trim_start_matches("data:");
-                let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(payload) else {
-                    // Leave a malformed data URL untouched rather than losing it.
-                    continue;
-                };
-                if bytes.len() as u64 > MAX_ASSET_BYTES {
-                    return Err(AppError::message(
-                        "An attached image is too large to save. Remove it and try again.",
-                    ));
-                }
-                let extension = match mime {
-                    "image/png" => "png",
-                    "image/jpeg" => "jpg",
-                    "image/webp" => "webp",
-                    "image/gif" => "gif",
-                    _ => "bin",
-                };
-                // Content-addressed names make repeated saves of the same
-                // chat reuse one file instead of leaking a copy per turn.
-                let file_name = format!("{:016x}.{}", content_hash(&bytes), extension);
-                let directory = self.root.join("assets").join(&session.id);
-                fs::create_dir_all(&directory)?;
-                fs::write(directory.join(&file_name), bytes)?;
-                object.insert(
-                    "asset".into(),
-                    json!(format!("{}/{}", session.id, file_name)),
-                );
-                object.remove("data_url");
-            }
+    fn import_value(&self, value: Value) -> AppResult<StoredSession> {
+        let has_messages = value.get("messages").and_then(Value::as_array).is_some();
+        if !has_messages {
+            return Err(AppError::message("That chat export has no messages."));
         }
+        let mut session: StoredSession = serde_json::from_value(value)
+            .map_err(|err| AppError::message(format!("Could not read that chat export: {err}")))?;
+        let now = now_ms();
+        session.id = uuid::Uuid::new_v4().simple().to_string();
+        session.schema_version = CURRENT_SCHEMA_VERSION;
+        session.created_at = if session.created_at == 0 { now } else { session.created_at };
+        session.updated_at = now;
+        if session.title.trim().is_empty() {
+            session.title = "Imported chat".into();
+        }
+        self.save(session)
+    }
+
+    fn backup_path(&self, id: &str) -> AppResult<PathBuf> {
+        validate_id(id)?;
+        Ok(self.root.join("backups").join(format!("{id}.json")))
+    }
+
+    fn backup_existing(&self, path: &Path, id: &str) -> AppResult<()> {
+        let backup = self.backup_path(id)?;
+        if let Some(parent) = backup.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(path, &backup)?;
+        Ok(())
+    }
+
+    fn copy_assets(&self, from: &str, to: &str) -> AppResult<()> {
+        let source = self.root.join("assets").join(from);
+        if !source.is_dir() {
+            return Ok(());
+        }
+        let target = self.root.join("assets").join(to);
+        fs::create_dir_all(&target)?;
+        for entry in fs::read_dir(&source)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !entry.file_type().map(|kind| kind.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let name = entry.file_name();
+            fs::copy(&path, target.join(name))?;
+        }
+        Ok(())
+    }
+
+    fn extract_images(&self, session: &mut StoredSession) -> AppResult<()> {
+        let id = session.id.clone();
+        extract_images_in(&self.root, &id, &mut session.messages)?;
+        extract_images_in(&self.root, &id, &mut session.archived_messages)?;
         Ok(())
     }
 
@@ -311,21 +551,8 @@ impl ChatStore {
             return Ok(());
         }
         let mut keep = HashSet::new();
-        for message in &session.messages {
-            let Some(images) = message.get("images").and_then(Value::as_array) else {
-                continue;
-            };
-            for image in images {
-                let Some(asset) = image.get("asset").and_then(Value::as_str) else {
-                    continue;
-                };
-                if let Some((session_id, file_name)) = asset.split_once('/') {
-                    if session_id == session.id {
-                        keep.insert(file_name.to_string());
-                    }
-                }
-            }
-        }
+        collect_assets(&session.id, &session.messages, &mut keep);
+        collect_assets(&session.id, &session.archived_messages, &mut keep);
         for entry in fs::read_dir(&directory)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().to_string();
@@ -337,27 +564,117 @@ impl ChatStore {
     }
 
     fn inline_images(&self, session: &mut StoredSession) -> AppResult<()> {
-        for message in &mut session.messages {
-            let Some(images) = message.get_mut("images").and_then(Value::as_array_mut) else {
+        inline_images_in(self, &mut session.messages);
+        inline_images_in(self, &mut session.archived_messages);
+        Ok(())
+    }
+}
+
+fn extract_images_in(root: &Path, session_id: &str, messages: &mut [Value]) -> AppResult<()> {
+    for message in messages {
+        let Some(images) = message.get_mut("images").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for image in images {
+            let Some(object) = image.as_object_mut() else {
                 continue;
             };
-            for image in images {
-                let Some(object) = image.as_object_mut() else {
-                    continue;
-                };
-                let Some(asset) = object.get("asset").and_then(Value::as_str) else {
-                    continue;
-                };
-                // A missing image should not block exporting the text of a
-                // conversation. Leave the reference so the UI can say so.
-                if let Ok(data_url) = self.asset_data_url(asset) {
-                    object.insert("data_url".into(), json!(data_url));
-                    object.remove("asset");
+            let Some(data_url) = object.get("data_url").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some((header, payload)) = data_url.split_once(";base64,") else {
+                continue;
+            };
+            if !header.starts_with("data:image/") {
+                continue;
+            }
+            let mime = header.trim_start_matches("data:");
+            let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(payload) else {
+                // Leave a malformed data URL untouched rather than losing it.
+                continue;
+            };
+            if bytes.len() as u64 > MAX_ASSET_BYTES {
+                return Err(AppError::message(
+                    "An attached image is too large to save. Remove it and try again.",
+                ));
+            }
+            let extension = match mime {
+                "image/png" => "png",
+                "image/jpeg" => "jpg",
+                "image/webp" => "webp",
+                "image/gif" => "gif",
+                _ => "bin",
+            };
+            // Content-addressed names make repeated saves of the same
+            // chat reuse one file instead of leaking a copy per turn.
+            let file_name = format!("{:016x}.{}", content_hash(&bytes), extension);
+            let directory = root.join("assets").join(session_id);
+            fs::create_dir_all(&directory)?;
+            fs::write(directory.join(&file_name), bytes)?;
+            object.insert("asset".into(), json!(format!("{session_id}/{file_name}")));
+            object.remove("data_url");
+        }
+    }
+    Ok(())
+}
+
+fn collect_assets(session_id: &str, messages: &[Value], keep: &mut HashSet<String>) {
+    for message in messages {
+        let Some(images) = message.get("images").and_then(Value::as_array) else {
+            continue;
+        };
+        for image in images {
+            let Some(asset) = image.get("asset").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Some((owner, file_name)) = asset.split_once('/') {
+                if owner == session_id {
+                    keep.insert(file_name.to_string());
                 }
             }
         }
-        Ok(())
     }
+}
+
+fn inline_images_in(store: &ChatStore, messages: &mut [Value]) {
+    for message in messages {
+        let Some(images) = message.get_mut("images").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for image in images {
+            let Some(object) = image.as_object_mut() else {
+                continue;
+            };
+            let Some(asset) = object.get("asset").and_then(Value::as_str) else {
+                continue;
+            };
+            // A missing image should not block exporting the text of a
+            // conversation. Leave the reference so the UI can say so.
+            if let Ok(data_url) = store.asset_data_url(asset) {
+                object.insert("data_url".into(), json!(data_url));
+                object.remove("asset");
+            }
+        }
+    }
+}
+
+fn directory_bytes(path: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.is_dir() {
+            total = total.saturating_add(directory_bytes(&path));
+        } else if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    total
 }
 
 fn content_hash(bytes: &[u8]) -> u64 {
@@ -456,7 +773,52 @@ mod tests {
                     "tokens": 3
                 }]
             })],
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn empty_mcp_scope_survives_save_export_import_and_branch() {
+        let store = store("mcp-scope");
+        let mut session = session_with_image("scoped");
+        session.extra.insert("mcp_server_ids".into(), json!([]));
+        session.extra.insert(
+            "mcp_server_names".into(),
+            json!({ "server-1": "Files" }),
+        );
+        store.save(session).expect("save");
+
+        let loaded = store
+            .list()
+            .into_iter()
+            .find(|candidate| candidate.id == "scoped")
+            .expect("saved session");
+        assert_eq!(loaded.extra.get("mcp_server_ids"), Some(&json!([])));
+        assert_eq!(
+            loaded.extra.get("mcp_server_names"),
+            Some(&json!({ "server-1": "Files" }))
+        );
+
+        let export = store.root.join("scoped-export.json");
+        store
+            .export("scoped", export.to_str().expect("path"))
+            .expect("export");
+        let imported = store.import(export.to_str().expect("path")).expect("import");
+        assert_eq!(imported.extra.get("mcp_server_ids"), Some(&json!([])));
+        assert_eq!(
+            imported.extra.get("mcp_server_names"),
+            Some(&json!({ "server-1": "Files" }))
+        );
+
+        let branch = store
+            .branch_session("scoped", "m1")
+            .expect("branch");
+        assert_eq!(branch.extra.get("mcp_server_ids"), Some(&json!([])));
+        assert_eq!(
+            branch.extra.get("mcp_server_names"),
+            Some(&json!({ "server-1": "Files" }))
+        );
+        let _ = fs::remove_dir_all(&store.root);
     }
 
     #[test]
@@ -556,6 +918,7 @@ mod tests {
             updated_at: 0,
             pinned: false,
             messages: Vec::new(),
+            ..Default::default()
         }).is_err());
         let _ = fs::remove_dir_all(&store.root);
     }
@@ -573,6 +936,101 @@ mod tests {
         assert!(store.delete("gone").expect("delete"));
         assert!(store.asset_data_url(&asset).is_err());
         assert!(store.list().is_empty());
+        let _ = fs::remove_dir_all(&store.root);
+    }
+
+    #[test]
+    fn schema_version_is_upgraded_on_save() {
+        let store = store("schema");
+        let mut session = session_with_image("versioned");
+        session.schema_version = 1;
+        let saved = store.save(session).expect("save");
+        assert_eq!(saved.schema_version, CURRENT_SCHEMA_VERSION);
+        let loaded = store.list();
+        assert_eq!(loaded[0].schema_version, CURRENT_SCHEMA_VERSION);
+        let _ = fs::remove_dir_all(&store.root);
+    }
+
+    #[test]
+    fn branch_keeps_prefix_and_copies_asset() {
+        let store = store("branch");
+        let mut session = session_with_image("root");
+        session.messages.push(json!({
+            "id": "m2",
+            "role": "assistant",
+            "content": "later answer",
+            "reasoning": "",
+            "created_at": 2
+        }));
+        let saved = store.save(session).expect("save");
+        let asset = saved.messages[0]["images"][0]["asset"]
+            .as_str()
+            .expect("asset")
+            .to_string();
+        let branch = store
+            .branch_session("root", "m1")
+            .expect("branch from first message");
+        assert_ne!(branch.id, "root");
+        assert_eq!(branch.messages.len(), 1);
+        assert!(branch.title.starts_with("Branch of"));
+        let copied = branch.messages[0]["images"][0]["asset"]
+            .as_str()
+            .expect("copied asset");
+        assert!(copied.starts_with(&format!("{}/", branch.id)));
+        assert!(store.asset_data_url(copied).is_ok());
+        assert!(store.asset_data_url(&asset).is_ok());
+        let _ = fs::remove_dir_all(&store.root);
+    }
+
+    #[test]
+    fn export_all_and_import_all_round_trip() {
+        let store = store("all");
+        store
+            .save(session_with_image("one"))
+            .expect("first");
+        store
+            .save(session_with_image("two"))
+            .expect("second");
+        let path = store.root.join("backup.json");
+        assert_eq!(store.export_all(path.to_str().expect("path")).expect("export"), 2);
+        let summary = store
+            .import_all(path.to_str().expect("path"))
+            .expect("import");
+        assert_eq!(summary.imported, 2);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(store.list().len(), 4);
+        let _ = fs::remove_dir_all(&store.root);
+    }
+
+    #[test]
+    fn save_keeps_one_previous_backup_and_restores_it() {
+        let store = store("backup");
+        let mut first = session_with_image("chat");
+        first.title = "First title".into();
+        store.save(first).expect("first save");
+        let mut second = session_with_image("chat");
+        second.title = "Second title".into();
+        second.updated_at = 3;
+        store.save(second).expect("second save");
+        let backups = store.backup_list();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(backups[0].title, "First title");
+        let restored = store.restore_backup("chat").expect("restore");
+        assert_eq!(restored.title, "First title");
+        let _ = fs::remove_dir_all(&store.root);
+    }
+
+    #[test]
+    fn gc_removes_only_orphaned_asset_directories() {
+        let store = store("gc");
+        store.save(session_with_image("live")).expect("save");
+        let orphan = store.root.join("assets").join("orphan");
+        fs::create_dir_all(&orphan).expect("orphan dir");
+        fs::write(orphan.join("a.png"), b"orphan").expect("orphan file");
+        let freed = store.gc_assets().expect("gc");
+        assert!(freed > 0);
+        assert!(!orphan.exists());
+        assert!(store.root.join("assets").join("live").exists());
         let _ = fs::remove_dir_all(&store.root);
     }
 }

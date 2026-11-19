@@ -10,6 +10,7 @@ use std::{
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter};
 use tokio::io::AsyncWriteExt;
 
@@ -103,6 +104,8 @@ struct TreeEntry {
 struct LfsInfo {
     #[serde(default)]
     size: Option<u64>,
+    #[serde(default)]
+    oid: Option<String>,
 }
 
 fn metadata_client() -> reqwest::Client {
@@ -203,6 +206,28 @@ async fn fetch_quants(
         .json()
         .await?;
     Ok(build_quants(entries))
+}
+
+async fn fetch_checksums(
+    client: &reqwest::Client,
+    repo: &str,
+) -> HashMap<String, String> {
+    let url = format!("{HF_API}/{repo}/tree/main?recursive=true&expand=true");
+    let Ok(response) = client
+        .get(url)
+        .timeout(Duration::from_secs(8))
+        .send()
+        .await
+    else {
+        return HashMap::new();
+    };
+    let Ok(entries) = response.json::<Vec<TreeEntry>>().await else {
+        return HashMap::new();
+    };
+    entries
+        .into_iter()
+        .filter_map(|entry| entry.lfs.and_then(|lfs| lfs.oid).map(|oid| (entry.path, oid)))
+        .collect()
 }
 
 fn build_quants(entries: Vec<TreeEntry>) -> Vec<HfQuant> {
@@ -393,6 +418,7 @@ impl DownloadManager {
                 files: files.iter().map(|file| file.path.clone()).collect(),
                 saved_at: crate::util::now_ms().to_string(),
                 size_bytes: files.iter().map(|file| file.size).sum(),
+                checksums: HashMap::new(),
             },
         );
 
@@ -499,6 +525,8 @@ async fn run_download(
         },
     );
 
+    let expected = fetch_checksums(&client, &repo).await;
+    let mut checksums: HashMap<String, String> = HashMap::new();
     let mut downloaded_total = 0u64;
 
     for (index, file) in files.iter().enumerate() {
@@ -610,6 +638,7 @@ async fn run_download(
         let mut file_downloaded = 0u64;
         let mut last_emit = Instant::now();
         let mut failed = None;
+        let mut hasher = Sha256::new();
 
         while let Some(chunk) = stream.next().await {
             if pause.load(Ordering::Relaxed) {
@@ -707,6 +736,7 @@ async fn run_download(
                 break;
             }
             let length = chunk.len() as u64;
+            hasher.update(&chunk);
             file_downloaded = file_downloaded.saturating_add(length);
             downloaded_total = downloaded_total.saturating_add(length);
 
@@ -758,6 +788,23 @@ async fn run_download(
         }
         drop(handle);
 
+        let digest = format!("{:x}", hasher.finalize());
+        if let Some(expected_hash) = expected.get(&file.path) {
+            if !expected_hash.eq_ignore_ascii_case(&digest) {
+                let _ = tokio::fs::remove_file(&part).await;
+                emit_error(
+                    &app,
+                    &id,
+                    &repo,
+                    file,
+                    files_total,
+                    "Checksum mismatch. The downloaded file was discarded.".into(),
+                );
+                return;
+            }
+        }
+        checksums.insert(file.path.clone(), digest);
+
         if let Err(err) = tokio::fs::rename(&part, &destination).await {
             let _ = tokio::fs::remove_file(&part).await;
             emit_error(
@@ -797,7 +844,7 @@ async fn run_download(
         &app,
         DownloadProgress {
             id,
-            repo,
+            repo: repo.clone(),
             file: String::new(),
             downloaded: downloaded_total,
             total: known_total.unwrap_or(downloaded_total),
@@ -807,6 +854,18 @@ async fn run_download(
             status: "complete".into(),
             message: format!("Downloaded {files_total} file(s). Convert them to .jns in the Compiler tab."),
             saved_path: Some(root.to_string_lossy().to_string()),
+        },
+    );
+
+    crate::system::record_download(
+        &models_dir,
+        crate::system::DownloadRecord {
+            repo: repo.clone(),
+            quant: quant_from_files(&files),
+            files: files.iter().map(|file| file.path.clone()).collect(),
+            saved_at: crate::util::now_ms().to_string(),
+            size_bytes: files.iter().map(|file| file.size).sum(),
+            checksums,
         },
     );
 }

@@ -21,9 +21,12 @@ import { usePersistentState } from "../../hooks/usePersistentState";
 import { useSettings } from "../../hooks/useSettings";
 import { useTelemetry } from "../../hooks/useTelemetry";
 import { api } from "../../lib/api";
+import { cn } from "../../lib/cn";
 import { errorMessage, basename } from "../../lib/format";
 import { recallFacts, useMemory } from "../../lib/memory";
 import { buildWebContext, CORE_SYSTEM_PROMPT } from "../../lib/prompts";
+import { siblingsFor } from "../../lib/chatSessions";
+import { mcpServerInputs, mcpServersInScope } from "../../lib/mcpScope";
 import type {
   AppSettings,
   Citation,
@@ -31,7 +34,6 @@ import type {
   LibraryModel,
   LocalModel,
   McpServerConfig,
-  ProjectIngest,
   StorageBenchmark,
 } from "../../types";
 import { Logo } from "../Logo";
@@ -84,7 +86,46 @@ export function ChatView({ engine, chat }: ChatViewProps) {
     "janas.mcpServers.v1",
     [],
   );
-  const [input, setInput] = useState("");
+  const activeMcpServers = useMemo(
+    () => mcpServersInScope(mcpServers, chat.mcpServerIds),
+    [chat.mcpServerIds, mcpServers],
+  );
+  const availableMcpServers = useMemo(
+    () => mcpServersInScope(mcpServers, undefined),
+    [mcpServers],
+  );
+  const mcpScopeLabel =
+    availableMcpServers.length === 0
+      ? null
+      : chat.mcpServerIds === undefined
+        ? "All"
+        : activeMcpServers.length === 0
+          ? "None"
+          : `${activeMcpServers.length}/${availableMcpServers.length}`;
+  const mcpScopeHint =
+    mcpScopeLabel === null
+      ? undefined
+      : mcpScopeLabel === "None"
+        ? "No MCP tools are enabled for this chat."
+        : mcpScopeLabel === "All"
+          ? "This chat can use every enabled MCP server."
+          : `${activeMcpServers.length} of ${availableMcpServers.length} enabled MCP servers are enabled for this chat.`;
+
+  useEffect(() => {
+    if (chat.loading) return;
+    chat.reconcileMcpScopes(mcpServers);
+  }, [
+    chat.loading,
+    chat.reconcileMcpScopes,
+    chat.sessions.length,
+    mcpServers,
+  ]);
+
+  const input = chat.draft.text;
+  const setInput = chat.setDraft;
+  const images = chat.draft.images.filter(
+    (image): image is ComposerImage => Boolean(image.data_url),
+  );
   const [models, setModels] = useState<LocalModel[]>([]);
   const [llamaModels, setLlamaModels] = useState<LibraryModel[]>([]);
   const [switchingModel, setSwitchingModel] = useState(false);
@@ -102,10 +143,9 @@ export function ChatView({ engine, chat }: ChatViewProps) {
     false,
   );
 
-  const [project, setProject] = useState<ProjectIngest | null>(null);
+  const project = chat.project;
   const [projectBusy, setProjectBusy] = useState(false);
   const [activity, setActivity] = useState<string | null>(null);
-  const [images, setImages] = useState<ComposerImage[]>([]);
   const [benchmark, setBenchmark] = useState<StorageBenchmark | null>(null);
   const [benchmarkBusy, setBenchmarkBusy] = useState(false);
   const [mcpOpen, setMcpOpen] = useState(false);
@@ -128,6 +168,8 @@ export function ChatView({ engine, chat }: ChatViewProps) {
 
   const ready = engine.snapshot.status === "ready";
   const activeKind = engine.active?.kind ?? null;
+  const workspaceRoot =
+    chat.workspaceRoot || agent.preferences.workspaceRoot;
   const currentModelPath = settings?.model_path ?? "";
   const llamaModelPath = settings?.llama_model_path ?? "";
   const selectedModelPath =
@@ -222,7 +264,7 @@ export function ChatView({ engine, chat }: ChatViewProps) {
       setActivity("Parsing the project tree and building a semantic bundle…");
       try {
         const ingest = await api.ingestProject(path);
-        setProject(ingest);
+        chat.setSessionProject(ingest);
       } catch (err) {
         chat.setError(errorMessage(err));
       } finally {
@@ -253,7 +295,10 @@ export function ChatView({ engine, chat }: ChatViewProps) {
     }
     try {
       const picked = await open({ multiple: false, directory: true });
-      if (typeof picked === "string") agent.update("workspaceRoot", picked);
+      if (typeof picked === "string") {
+        chat.setSessionWorkspace(picked);
+        agent.update("workspaceRoot", picked);
+      }
     } catch (err) {
       chat.setError(errorMessage(err));
     }
@@ -425,16 +470,7 @@ export function ChatView({ engine, chat }: ChatViewProps) {
       const combinedSystemPrompt = [CORE_SYSTEM_PROMPT, systemPrompt, memoryBlock]
         .filter(Boolean)
         .join("\n\n");
-      const mcpInputs = mcpServers
-        .filter((server) => server.enabled && server.command.trim())
-        .map((server) => ({
-          name: server.name,
-          command: server.command,
-          args: server.args,
-          env: server.env ?? "",
-          cwd: server.cwd ?? "",
-          auto_approve: Boolean(server.autoApprove),
-        }));
+      const mcpInputs = mcpServerInputs(mcpServers, chat.mcpServerIds);
       return {
         systemPrompt: combinedSystemPrompt,
         temperature: preferences.temperature,
@@ -454,7 +490,15 @@ export function ChatView({ engine, chat }: ChatViewProps) {
         mcpServers: mcpInputs,
       };
     },
-    [contextMax, mcpServers, memory.facts, preferences, project, systemPrompt],
+    [
+      chat.mcpServerIds,
+      contextMax,
+      mcpServers,
+      memory.facts,
+      preferences,
+      project,
+      systemPrompt,
+    ],
   );
 
   const handleSend = useCallback(async () => {
@@ -500,11 +544,10 @@ export function ChatView({ engine, chat }: ChatViewProps) {
       try {
         await chat.sendAgent(text, {
           ...buildOptions(text, { extraContext: "" }),
-          agent: agent.preferences,
+          agent: { ...agent.preferences, workspaceRoot },
           webSearch: preferences.internet,
           onAccepted: () => {
-            setInput("");
-            setImages([]);
+            chat.clearDraft();
           },
         });
       } catch (err) {
@@ -522,8 +565,7 @@ export function ChatView({ engine, chat }: ChatViewProps) {
           extraContext,
         }),
         onAccepted: () => {
-          setInput("");
-          setImages([]);
+          chat.clearDraft();
         },
       });
     } catch (err) {
@@ -539,6 +581,7 @@ export function ChatView({ engine, chat }: ChatViewProps) {
     preferences.internet,
     project,
     ready,
+    workspaceRoot,
   ]);
 
   const handleRegenerateMessage = useCallback(
@@ -681,8 +724,23 @@ export function ChatView({ engine, chat }: ChatViewProps) {
               variant="ghost"
               onClick={() => setMcpOpen((value) => !value)}
               icon={<Terminal className="h-3.5 w-3.5" />}
+              title={mcpScopeHint}
             >
               Tools
+              {mcpScopeLabel ? (
+                <span
+                  className={cn(
+                    "ml-0.5 rounded border px-1 py-px text-[8px] font-semibold uppercase tracking-wider",
+                    mcpScopeLabel === "None"
+                      ? "border-rose-400/25 bg-rose-400/10 text-rose-300/80"
+                      : mcpScopeLabel === "All"
+                        ? "border-white/10 bg-white/5 text-slate-500"
+                        : "border-acid-400/25 bg-acid-400/10 text-acid-200/80",
+                  )}
+                >
+                  {mcpScopeLabel}
+                </span>
+              ) : null}
             </Button>
             <Button
               size="sm"
@@ -737,12 +795,16 @@ export function ChatView({ engine, chat }: ChatViewProps) {
               />
             ) : (
               <div className="space-y-7">
-                {chat.messages.map((message, index) => (
-                  <MessageBoundary
-                    key={message.id}
-                    text={message.content}
-                    resetKey={message.id}
-                  >
+                {chat.messages.map((message, index) => {
+                  const siblings = chat.activeSession
+                    ? siblingsFor(chat.activeSession, message)
+                    : [message];
+                  return (
+                    <MessageBoundary
+                      key={message.id}
+                      text={message.content}
+                      resetKey={message.id}
+                    >
                     <MessageBubble
                       message={message}
                       streaming={
@@ -774,10 +836,23 @@ export function ChatView({ engine, chat }: ChatViewProps) {
                         !chat.streaming &&
                         !agent.preferences.enabled
                       }
+                      versionIndex={siblings.findIndex(
+                        (sibling) => sibling.id === message.id,
+                      )}
+                      versionIds={siblings.map((sibling) => sibling.id)}
+                      onSelectVersion={(siblingId) =>
+                        chat.switchVersion(message.id, siblingId)
+                      }
+                      onBranch={
+                        message.role === "user" && !chat.streaming
+                          ? () => void chat.branchFromMessage(message.id)
+                          : undefined
+                      }
                       agentActions={agentActions}
                     />
-                  </MessageBoundary>
-                ))}
+                    </MessageBoundary>
+                  );
+                })}
               </div>
             )}
             <div ref={endRef} className="h-2" />
@@ -809,16 +884,18 @@ export function ChatView({ engine, chat }: ChatViewProps) {
           agentMode={agent.preferences.enabled}
           onAgentModeChange={(value) => agent.update("enabled", value)}
           images={images}
-          onAddImages={setImages}
+          onAddImages={(next) => chat.setDraftImages(next)}
           onRemoveImage={(index) =>
-            setImages((previous) => previous.filter((_, i) => i !== index))
+            chat.setDraftImages(
+              images.filter((_, imageIndex) => imageIndex !== index),
+            )
           }
           projectName={project?.name ?? null}
           projectTokens={project?.tokens ?? 0}
-          workspaceRoot={agent.preferences.workspaceRoot}
+          workspaceRoot={workspaceRoot}
           workspaceLocked={workspaceLocked}
           onPickProject={() => void pickProject()}
-          onClearProject={() => setProject(null)}
+          onClearProject={() => chat.setSessionProject(null)}
           activity={activity}
           error={chat.error ?? modelError}
           onDismissError={() => {
@@ -871,7 +948,17 @@ export function ChatView({ engine, chat }: ChatViewProps) {
         startedAtMs={chat.startedAtMs}
       />
 
-      <McpLogDrawer open={mcpOpen} onClose={() => setMcpOpen(false)} />
+      <McpLogDrawer
+        open={mcpOpen}
+        onClose={() => setMcpOpen(false)}
+        servers={mcpServers.filter(
+          (server) => server.enabled && server.command.trim(),
+        )}
+        selectedIds={chat.mcpServerIds}
+        onChangeScope={(ids) =>
+          chat.setSessionMcpServerIds(ids, mcpServers)
+        }
+      />
     </div>
   );
 }

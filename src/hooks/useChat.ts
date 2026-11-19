@@ -2,7 +2,16 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import { api, Events } from "../lib/api";
+import {
+  appendTurn,
+  forkAssistantTurn,
+  forkUserTurn,
+  normalizeSession as normalizeStoredSession,
+  switchMessageVersion,
+  updateStep,
+} from "../lib/chatSessions";
 import { fitContext } from "../lib/contextBudget";
+import { mcpScopeNames, reconcileMcpScope } from "../lib/mcpScope";
 import { errorMessage, uid } from "../lib/format";
 import { appendMcpLog } from "../lib/mcpLog";
 import type {
@@ -19,12 +28,11 @@ import type {
   AgentToolResultEvent,
   AgentToolStartEvent,
   AgentTrace,
-  AgentUndoAttempt,
   AgentUndoFile,
   AgentUndoResult,
-  AgentUndoState,
   ChatDelta,
   ChatDone,
+  ChatDraftImage,
   ChatErrorEvent,
   ChatMessage,
   ChatNotice,
@@ -33,7 +41,9 @@ import type {
   ChatUsage,
   Citation,
   McpActivityEvent,
+  McpServerConfig,
   McpServerInput,
+  ProjectIngest,
 } from "../types";
 
 /** Pre-disk-store history. Read once for migration and then removed. */
@@ -76,41 +86,6 @@ function createSession(): ChatSession {
     updated_at: now,
     messages: [],
   };
-}
-
-function normalizeCitation(value: unknown): Citation | null {
-  if (!value || typeof value !== "object") return null;
-  const citation = value as Partial<Citation>;
-  if (
-    typeof citation.url !== "string" ||
-    !/^https?:\/\//i.test(citation.url)
-  ) {
-    return null;
-  }
-  return {
-    title:
-      typeof citation.title === "string" && citation.title.trim()
-        ? citation.title
-        : citation.url,
-    url: citation.url,
-    snippet: typeof citation.snippet === "string" ? citation.snippet : undefined,
-  };
-}
-
-function normalizeRisk(value: unknown): AgentStep["risk"] {
-  return value === "mutating" ||
-    value === "destructive" ||
-    value === "irreversible"
-    ? value
-    : "read_only";
-}
-
-function updateStep(
-  steps: AgentStep[],
-  stepId: string,
-  patch: Partial<AgentStep>,
-): AgentStep[] {
-  return steps.map((step) => (step.id === stepId ? { ...step, ...patch } : step));
 }
 
 type ActiveRequest = {
@@ -183,216 +158,6 @@ function undoSummary(result: AgentUndoResult): string {
   return parts.length ? parts.join(" · ") : "nothing needed reverting";
 }
 
-const UNDO_STATES: AgentUndoState[] = [
-  "pending",
-  "restored",
-  "skipped",
-  "failed",
-  "kept",
-];
-
-function normalizeUndoFile(value: unknown): AgentUndoFile | null {
-  if (!value || typeof value !== "object") return null;
-  const file = value as Partial<AgentUndoFile>;
-  if (typeof file.path !== "string" || !file.path) return null;
-  const state = UNDO_STATES.includes(file.state as AgentUndoState)
-    ? (file.state as AgentUndoState)
-    : "pending";
-  const kind =
-    file.kind === "created" || file.kind === "deleted" ? file.kind : "modified";
-  const history: AgentUndoAttempt[] = Array.isArray(file.history)
-    ? file.history
-        .filter((attempt) => Boolean(attempt) && typeof attempt === "object")
-        .map((attempt) => {
-          const entry = attempt as Partial<AgentUndoAttempt>;
-          return {
-            action:
-              entry.action === "keep" ? ("keep" as const) : ("restore" as const),
-            state: UNDO_STATES.includes(entry.state as AgentUndoState)
-              ? (entry.state as AgentUndoState)
-              : state,
-            reason: typeof entry.reason === "string" ? entry.reason : null,
-            at: typeof entry.at === "number" ? entry.at : Date.now(),
-          };
-        })
-        .slice(-20)
-    : [];
-  return {
-    path: file.path,
-    kind,
-    state,
-    reason: typeof file.reason === "string" ? file.reason : null,
-    attempts:
-      typeof file.attempts === "number" ? file.attempts : history.length,
-    history,
-  };
-}
-
-function normalizeAgentTrace(value: unknown): AgentTrace | undefined {
-  if (!value || typeof value !== "object") return undefined;
-  const trace = value as Partial<AgentTrace>;
-  if (!Array.isArray(trace.steps)) return undefined;
-  const stepStatuses: AgentStepStatus[] = [
-    "running",
-    "awaiting_approval",
-    "succeeded",
-    "failed",
-    "rejected",
-    "blocked",
-  ];
-  const steps: AgentStep[] = trace.steps
-    .filter((step): step is AgentStep => Boolean(step) && typeof step === "object")
-    .map((step) => ({
-      id: typeof step.id === "string" ? step.id : uid(),
-      iteration: typeof step.iteration === "number" ? step.iteration : 0,
-      thought: typeof step.thought === "string" ? step.thought : "",
-      tool: typeof step.tool === "string" ? step.tool : "tool",
-      arguments: typeof step.arguments === "string" ? step.arguments : "{}",
-      risk: normalizeRisk(step.risk),
-      status: stepStatuses.includes(step.status) ? step.status : "succeeded",
-      output: typeof step.output === "string" ? step.output : null,
-      duration_ms: typeof step.duration_ms === "number" ? step.duration_ms : null,
-      truncated: Boolean(step.truncated),
-      created_at:
-        typeof step.created_at === "number" ? step.created_at : Date.now(),
-    }))
-    .slice(-60);
-  const status =
-    trace.status === "completed" ||
-    trace.status === "verification_failed" ||
-    trace.status === "max_iterations" ||
-    trace.status === "aborted" ||
-    trace.status === "error"
-      ? trace.status
-      : // A reloaded "running" trace never resumes; it was interrupted.
-        "aborted";
-  return {
-    run_id: typeof trace.run_id === "string" ? trace.run_id : "",
-    status,
-    iterations: typeof trace.iterations === "number" ? trace.iterations : 0,
-    max_iterations:
-      typeof trace.max_iterations === "number" ? trace.max_iterations : 10,
-    plan: Array.isArray(trace.plan)
-      ? trace.plan.filter((item): item is string => typeof item === "string").slice(0, 20)
-      : [],
-    steps,
-    compactions: Array.isArray(trace.compactions)
-      ? trace.compactions
-          .filter((event) => Boolean(event) && typeof event === "object")
-          .map((event) => ({
-            id: typeof event.id === "string" ? event.id : uid(),
-            dropped_messages:
-              typeof event.dropped_messages === "number" ? event.dropped_messages : 0,
-            estimated_tokens:
-              typeof event.estimated_tokens === "number" ? event.estimated_tokens : 0,
-            context_window:
-              typeof event.context_window === "number" ? event.context_window : 0,
-            summary: typeof event.summary === "string" ? event.summary : "",
-            created_at:
-              typeof event.created_at === "number" ? event.created_at : Date.now(),
-          }))
-          .slice(-12)
-      : [],
-    pending: null,
-    live_text: "",
-    live_reasoning: "",
-    notice: null,
-    error: typeof trace.error === "string" ? trace.error : null,
-    // The startup availability query fills this in for traces whose on-disk
-    // checkpoint still exists; live runs set it when agent:done arrives.
-    undo_available: false,
-    undone: Boolean(trace.undone),
-    undo_error:
-      typeof trace.undo_error === "string" ? trace.undo_error : null,
-    undo_summary:
-      typeof trace.undo_summary === "string" ? trace.undo_summary : null,
-    undo_files: Array.isArray(trace.undo_files)
-      ? trace.undo_files
-          .map(normalizeUndoFile)
-          .filter((file): file is AgentUndoFile => file !== null)
-      : [],
-    workspace_root:
-      typeof trace.workspace_root === "string" ? trace.workspace_root : "",
-    changes: Array.isArray(trace.changes)
-      ? trace.changes
-          .filter((change) => Boolean(change) && typeof change === "object")
-          .map((change) => ({
-            path: typeof change.path === "string" ? change.path : "",
-            kind:
-              typeof change.kind === "string" && change.kind
-                ? change.kind
-                : "modified",
-            restored: Boolean(change.restored),
-          }))
-          .filter((change) => change.path.length > 0)
-          .slice(0, 500)
-      : [],
-    started_at: typeof trace.started_at === "number" ? trace.started_at : Date.now(),
-    finished_at:
-      typeof trace.finished_at === "number" ? trace.finished_at : null,
-  };
-}
-
-function normalizeMessage(value: unknown): ChatMessage | null {
-  if (!value || typeof value !== "object") return null;
-  const message = value as Partial<ChatMessage>;
-  if (message.role !== "user" && message.role !== "assistant") return null;
-  const rawImages: unknown[] = Array.isArray(message.images)
-    ? (message.images as unknown[])
-    : [];
-  const images = rawImages.length
-    ? rawImages
-        .filter(
-          (image): image is Record<string, unknown> =>
-            Boolean(image) && typeof image === "object",
-        )
-        .map((image) => ({
-          name: typeof image.name === "string" ? image.name : "image",
-          data_url:
-            typeof image.data_url === "string" ? image.data_url : undefined,
-          asset: typeof image.asset === "string" ? image.asset : undefined,
-          tokens: typeof image.tokens === "number" ? image.tokens : 0,
-        }))
-        .filter((image) => Boolean(image.data_url || image.asset))
-    : undefined;
-  return {
-    id: typeof message.id === "string" ? message.id : uid(),
-    role: message.role,
-    content: typeof message.content === "string" ? message.content : "",
-    reasoning: typeof message.reasoning === "string" ? message.reasoning : "",
-    created_at:
-      typeof message.created_at === "number" ? message.created_at : Date.now(),
-    citations: Array.isArray(message.citations)
-      ? message.citations
-          .map(normalizeCitation)
-          .filter((citation): citation is Citation => citation !== null)
-      : undefined,
-    images,
-    agentTrace: normalizeAgentTrace(message.agentTrace),
-  };
-}
-
-function normalizeSession(value: unknown): ChatSession | null {
-  if (!value || typeof value !== "object") return null;
-  const session = value as Partial<ChatSession>;
-  if (typeof session.id !== "string" || !Array.isArray(session.messages)) {
-    return null;
-  }
-  const now = Date.now();
-  return {
-    id: session.id,
-    title: typeof session.title === "string" ? session.title : "New chat",
-    created_at:
-      typeof session.created_at === "number" ? session.created_at : now,
-    updated_at:
-      typeof session.updated_at === "number" ? session.updated_at : now,
-    pinned: Boolean(session.pinned),
-    messages: session.messages
-      .map(normalizeMessage)
-      .filter((message): message is ChatMessage => message !== null),
-  };
-}
-
 /** The old localStorage blob, read once so existing chats survive the move. */
 function readLegacySessions(): ChatSession[] {
   try {
@@ -401,7 +166,7 @@ function readLegacySessions(): ChatSession[] {
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
     return parsed
-      .map(normalizeSession)
+      .map(normalizeStoredSession)
       .filter((session): session is ChatSession => session !== null);
   } catch {
     return [];
@@ -460,7 +225,7 @@ export function useChat() {
         const stored = await api.chatSessionsList();
         loaded = Array.isArray(stored)
           ? stored
-              .map(normalizeSession)
+              .map(normalizeStoredSession)
               .filter((session): session is ChatSession => session !== null)
           : [];
       } catch (err) {
@@ -557,6 +322,45 @@ export function useChat() {
       // ignore
     }
   }, [activeId, hydrated]);
+
+  // Settings can import or restore chats while the chat view is unmounted.
+  // Refresh the rail without dropping a live stream or an unsaved draft.
+  useEffect(() => {
+    const reload = () => {
+      if (activeRequest.current) return;
+      void (async () => {
+        try {
+          const stored = await api.chatSessionsList();
+          const normalized = stored
+            .map(normalizeStoredSession)
+            .filter((session): session is ChatSession => session !== null);
+          const byId = new Map(normalized.map((session) => [session.id, session]));
+          setSessions((previous) => {
+            const next = previous.map((session) => byId.get(session.id) ?? session);
+            for (const session of normalized) {
+              if (!next.some((candidate) => candidate.id === session.id)) {
+                next.unshift(session);
+              }
+            }
+            return next;
+          });
+          for (const session of normalized) {
+            const timer = saveTimers.current.get(session.id);
+            if (timer) {
+              window.clearTimeout(timer);
+              saveTimers.current.delete(session.id);
+            }
+            savedRef.current.set(session.id, session);
+          }
+        } catch (err) {
+          setError(`Chat history could not be refreshed: ${errorMessage(err)}`);
+        }
+      })();
+    };
+    window.addEventListener("janas:chat-history-changed", reload);
+    return () =>
+      window.removeEventListener("janas:chat-history-changed", reload);
+  }, []);
 
   // Checkpoints live on disk and survive a restart, while the in-memory
   // journal does not. Ask Rust which persisted traces are still undoable once
@@ -1018,23 +822,23 @@ export function useChat() {
   const runChatTurn = useCallback(
     async (input: {
       sessionId: string;
-      baseMessages: ChatMessage[];
-      assistant: ChatMessage;
+      nextSession: ChatSession;
+      requestMessages: ChatMessage[];
+      assistantId: string;
       options: SendOptions;
-      titleSource?: string;
-      titleOverride?: string;
       images?: string[];
     }) => {
       if (activeRequest.current) return false;
-      const { sessionId, baseMessages, assistant, options } = input;
+      const { sessionId, nextSession, requestMessages, assistantId, options } =
+        input;
       const turnWindow = Math.max(1, options.contextPrefetch) * 2 + 1;
-      const windowed = baseMessages.slice(-turnWindow).filter(
+      const windowed = requestMessages.slice(-turnWindow).filter(
         (message) =>
           message.role === "user" ||
           message.content.trim().length > 0 ||
           message.reasoning.trim().length > 0,
       );
-      const current = baseMessages[baseMessages.length - 1];
+      const current = requestMessages[requestMessages.length - 1];
       const imageTokens =
         options.imageTokens ??
         (current?.images ?? []).reduce(
@@ -1061,18 +865,7 @@ export function useChat() {
       const now = Date.now();
       setSessions((previous) =>
         previous.map((candidate) =>
-          candidate.id === sessionId
-            ? {
-                ...candidate,
-                title:
-                  input.titleOverride ??
-                  (input.titleSource && candidate.messages.length === 0
-                    ? input.titleSource.slice(0, 56)
-                    : candidate.title),
-                updated_at: now,
-                messages: [...baseMessages, assistant],
-              }
-            : candidate,
+          candidate.id === sessionId ? nextSession : candidate,
         ),
       );
       options.onAccepted?.();
@@ -1086,7 +879,7 @@ export function useChat() {
       setLiveBytes(0);
       setStartedAtMs(now);
       activeRequest.current = {
-        requestId: assistant.id,
+        requestId: assistantId,
         sessionId,
         mode: "chat",
       };
@@ -1094,7 +887,7 @@ export function useChat() {
 
       try {
         await api.streamChat({
-          request_id: assistant.id,
+          request_id: assistantId,
           messages: fitted.messages,
           system_prompt: fitted.systemPrompt || null,
           temperature: options.temperature,
@@ -1104,10 +897,7 @@ export function useChat() {
           repeat_penalty: options.repeatPenalty,
           structured: options.structuredOutput,
           thinking: options.thinking,
-          images:
-            input.images ??
-            options.images ??
-            [],
+          images: input.images ?? options.images ?? [],
           max_tokens: options.maxTokens,
           mcp_servers: options.mcpServers ?? [],
         });
@@ -1123,7 +913,7 @@ export function useChat() {
               ? {
                   ...candidate,
                   messages: candidate.messages.map((message) =>
-                    message.id === assistant.id && !message.content
+                    message.id === assistantId && !message.content
                       ? {
                           ...message,
                           content: "_The engine did not return a response._",
@@ -1184,12 +974,17 @@ export function useChat() {
         citations: options.citations,
       };
 
+      const nextSession = appendTurn(session, userMessage, assistantMessage);
+      const titled =
+        session.messages.length === 0
+          ? { ...nextSession, title: trimmed.slice(0, 56) }
+          : nextSession;
       return runChatTurn({
         sessionId,
-        baseMessages: [...session.messages, userMessage],
-        assistant: assistantMessage,
+        nextSession: titled,
+        requestMessages: titled.messages.slice(0, -1),
+        assistantId: assistantMessage.id,
         options,
-        titleSource: trimmed,
         images: options.images,
       });
     },
@@ -1228,10 +1023,12 @@ export function useChat() {
         created_at: Date.now(),
         citations: target.citations,
       };
+      const nextSession = forkAssistantTurn(session, index, assistant);
       return runChatTurn({
         sessionId: session.id,
-        baseMessages: session.messages.slice(0, index),
-        assistant,
+        nextSession,
+        requestMessages: nextSession.messages.slice(0, -1),
+        assistantId: assistant.id,
         options,
         images: await imageDataUrls(user.images),
       });
@@ -1256,7 +1053,12 @@ export function useChat() {
       const message = session.messages[index];
       if (!message || message.role !== "user") return false;
 
-      const edited: ChatMessage = { ...message, content: trimmed, reasoning: "" };
+      const edited: ChatMessage = {
+        ...message,
+        id: uid(),
+        content: trimmed,
+        reasoning: "",
+      };
       const assistant: ChatMessage = {
         id: uid(),
         role: "assistant",
@@ -1264,12 +1066,17 @@ export function useChat() {
         reasoning: "",
         created_at: Date.now(),
       };
+      const nextSession = forkUserTurn(session, index, edited, assistant);
+      const titled =
+        index === 0
+          ? { ...nextSession, title: trimmed.slice(0, 56) }
+          : nextSession;
       return runChatTurn({
         sessionId: session.id,
-        baseMessages: [...session.messages.slice(0, index), edited],
-        assistant,
+        nextSession: titled,
+        requestMessages: titled.messages.slice(0, -1),
+        assistantId: assistant.id,
         options,
-        titleOverride: index === 0 ? trimmed.slice(0, 56) : undefined,
         images: await imageDataUrls(edited.images),
       });
     },
@@ -1335,6 +1142,12 @@ export function useChat() {
         agentTrace: trace,
       };
 
+      const nextSession = appendTurn(session, userMessage, assistantMessage);
+      const titled =
+        session.messages.length === 0
+          ? { ...nextSession, title: trimmed.slice(0, 56) }
+          : nextSession;
+
       // The Rust loop appends the goal itself; only prior turns are history.
       const history = session.messages
         .slice(-Math.max(1, options.contextPrefetch) * 2)
@@ -1350,17 +1163,7 @@ export function useChat() {
 
       setSessions((previous) =>
         previous.map((candidate) =>
-          candidate.id === sessionId
-            ? {
-                ...candidate,
-                title:
-                  candidate.messages.length === 0
-                    ? trimmed.slice(0, 56)
-                    : candidate.title,
-                updated_at: now,
-                messages: [...candidate.messages, userMessage, assistantMessage],
-              }
-            : candidate,
+          candidate.id === sessionId ? titled : candidate,
         ),
       );
       options.onAccepted?.();
@@ -1564,7 +1367,7 @@ export function useChat() {
   }, []);
 
   const importChat = useCallback(async (path: string) => {
-    const imported = normalizeSession(await api.chatImportSession(path));
+    const imported = normalizeStoredSession(await api.chatImportSession(path));
     if (!imported) {
       throw new Error("The imported chat could not be read.");
     }
@@ -1586,6 +1389,140 @@ export function useChat() {
     }
     await api.chatExportSession(id, path);
   }, []);
+
+  const updateActiveSession = useCallback(
+    (updater: (session: ChatSession) => ChatSession) => {
+      const id = activeIdRef.current;
+      if (!id) return;
+      setSessions((previous) =>
+        previous.map((session) =>
+          session.id === id ? updater(session) : session,
+        ),
+      );
+    },
+    [],
+  );
+
+  const setDraft = useCallback(
+    (text: string) => {
+      updateActiveSession((session) => ({
+        ...session,
+        draft: {
+          text,
+          images: session.draft?.images ?? [],
+          updated_at: Date.now(),
+        },
+      }));
+    },
+    [updateActiveSession],
+  );
+
+  const setDraftImages = useCallback(
+    (images: ChatDraftImage[]) => {
+      updateActiveSession((session) => ({
+        ...session,
+        draft: {
+          text: session.draft?.text ?? "",
+          images,
+          updated_at: Date.now(),
+        },
+      }));
+    },
+    [updateActiveSession],
+  );
+
+  const clearDraft = useCallback(() => {
+    updateActiveSession((session) => ({
+      ...session,
+      draft: { text: "", images: [], updated_at: Date.now() },
+    }));
+  }, [updateActiveSession]);
+
+  const setSessionProject = useCallback(
+    (project: ProjectIngest | null) => {
+      updateActiveSession((session) => ({
+        ...session,
+        project: project ?? undefined,
+      }));
+    },
+    [updateActiveSession],
+  );
+
+  const setSessionWorkspace = useCallback(
+    (workspaceRoot: string) => {
+      updateActiveSession((session) => ({
+        ...session,
+        workspace_root: workspaceRoot.trim() || undefined,
+      }));
+    },
+    [updateActiveSession],
+  );
+
+  const setSessionMcpServerIds = useCallback(
+    (ids: string[] | undefined, servers: McpServerConfig[] = []) => {
+      updateActiveSession((session) => ({
+        ...session,
+        mcp_server_ids: ids,
+        mcp_server_names: mcpScopeNames(ids, servers),
+      }));
+    },
+    [updateActiveSession],
+  );
+
+  const reconcileMcpScopes = useCallback((servers: McpServerConfig[]) => {
+    setSessions((previous) => {
+      let changed = false;
+      const next = previous.map((session) => {
+        const reconciled = reconcileMcpScope(
+          session.mcp_server_ids,
+          session.mcp_server_names,
+          servers,
+        );
+        if (!reconciled.changed) return session;
+        changed = true;
+        return {
+          ...session,
+          mcp_server_ids: reconciled.ids,
+          mcp_server_names: reconciled.names,
+        };
+      });
+      return changed ? next : previous;
+    });
+  }, []);
+
+  const switchVersion = useCallback((messageId: string, siblingId: string) => {
+    setSessions((previous) =>
+      previous.map((session) =>
+        session.id === activeIdRef.current
+          ? switchMessageVersion(session, messageId, siblingId)
+          : session,
+      ),
+    );
+  }, []);
+
+  const branchFromMessage = useCallback(async (messageId: string) => {
+    const sessionId = activeIdRef.current;
+    if (!sessionId) return null;
+    const branch = normalizeStoredSession(
+      await api.chatBranchSession(sessionId, messageId),
+    );
+    if (!branch) throw new Error("That branch could not be read.");
+    savedRef.current.set(branch.id, branch);
+    deletedRef.current.delete(branch.id);
+    setSessions((previous) => [branch, ...previous]);
+    setActiveId(branch.id);
+    return branch.id;
+  }, []);
+
+  /** Force every dirty session to disk, for window close and app shutdown. */
+  const flushAll = useCallback(async () => {
+    const pending = sessionsRef.current.filter(
+      (session) =>
+        saveTimers.current.has(session.id) ||
+        savedRef.current.get(session.id) !== session,
+    );
+    await Promise.all(pending.map((session) => flushSession(session.id)));
+  }, [flushSession]);
 
   const resolveToolApproval = useCallback(
     async (decision: "approve" | "reject") => {
@@ -1714,6 +1651,12 @@ export function useChat() {
   return {
     sessions,
     activeId,
+    activeSession: activeSession ?? null,
+    archivedMessages: activeSession?.archived_messages ?? [],
+    draft: activeSession?.draft ?? { text: "", images: [], updated_at: 0 },
+    project: activeSession?.project ?? null,
+    workspaceRoot: activeSession?.workspace_root ?? "",
+    mcpServerIds: activeSession?.mcp_server_ids,
     messages,
     loading: !hydrated,
     streaming: activeStreaming,
@@ -1736,6 +1679,16 @@ export function useChat() {
     resolveToolApproval,
     renameChat,
     togglePin,
+    setDraft,
+    setDraftImages,
+    clearDraft,
+    setSessionProject,
+    setSessionWorkspace,
+    setSessionMcpServerIds,
+    reconcileMcpScopes,
+    switchVersion,
+    branchFromMessage,
+    flushAll,
     importChat,
     exportChat,
     undoAgent,

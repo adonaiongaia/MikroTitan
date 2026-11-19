@@ -11,6 +11,9 @@ import type {
   BinaryProbe,
   ChatRequestPayload,
   ChatSession,
+  ChatBackupInfo,
+  ChatImportSummary,
+  ChatStoreStats,
   EngineKind,
   ManagedBinaryProbe,
   ConversionStarted,
@@ -22,9 +25,11 @@ import type {
   HfModel,
   HfQuant,
   LibraryModel,
+  LibraryDisk,
   LocalModel,
   McpProbe,
   McpServerInput,
+  ModelVerification,
   MemoryFact,
   ProjectIngest,
   SearchRequest,
@@ -128,6 +133,20 @@ export const api = {
     invoke<void>("chat_export_session", { id, path }),
   chatImportSession: (path: string) =>
     invoke<ChatSession>("chat_import_session", { path }),
+  chatBranchSession: (id: string, messageId: string) =>
+    invoke<ChatSession>("chat_branch_session", {
+      id,
+      message_id: messageId,
+    }),
+  chatExportAll: (path: string) =>
+    invoke<number>("chat_export_all", { path }),
+  chatImportAll: (path: string) =>
+    invoke<ChatImportSummary>("chat_import_all", { path }),
+  chatBackupList: () => invoke<ChatBackupInfo[]>("chat_backup_list"),
+  chatRestoreBackup: (id: string) =>
+    invoke<ChatSession>("chat_restore_backup", { id }),
+  chatStoreGc: () => invoke<number>("chat_store_gc"),
+  chatStoreStats: () => invoke<ChatStoreStats>("chat_store_stats"),
 
   startConversion: (request: ConvertRequest) =>
     invoke<ConversionStarted>("start_conversion", { request }),
@@ -168,6 +187,11 @@ export const api = {
       mime,
     }),
   libraryModels: () => invoke<LibraryModel[]>("library_models"),
+  libraryDisk: () => invoke<LibraryDisk>("library_disk"),
+  verifyLocalModel: (path: string) =>
+    invoke<ModelVerification>("verify_local_model", { path }),
+  deleteLocalModel: (path: string) =>
+    invoke<number>("delete_local_model", { path }),
   mcpProbe: (server: McpServerInput) =>
     invoke<McpProbe>("mcp_probe", { server }),
 

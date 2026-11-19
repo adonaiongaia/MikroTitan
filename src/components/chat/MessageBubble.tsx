@@ -1,8 +1,11 @@
 import { useState } from "react";
 import {
   Check,
+  ChevronLeft,
+  ChevronRight,
   Copy,
   ExternalLink,
+  GitBranch,
   Pencil,
   RefreshCw,
   Trash2,
@@ -23,6 +26,10 @@ interface MessageBubbleProps {
   onDelete?: (id: string) => void;
   onRegenerate?: () => void | Promise<void>;
   onEdit?: (text: string) => void | Promise<void>;
+  onBranch?: () => void | Promise<void>;
+  versionIds?: string[];
+  versionIndex?: number;
+  onSelectVersion?: (siblingId: string) => void;
   regenerable?: boolean;
   editable?: boolean;
   agentActions?: AgentActions;
@@ -61,6 +68,10 @@ export function MessageBubble({
   onDelete,
   onRegenerate,
   onEdit,
+  onBranch,
+  versionIds,
+  versionIndex = 0,
+  onSelectVersion,
   regenerable,
   editable,
   agentActions,
@@ -76,6 +87,11 @@ export function MessageBubble({
   const citations = safeCitations(message.citations);
   const trace = message.agentTrace ?? null;
   const empty = !content && !reasoning && !trace;
+  const versions = versionIds?.length ? versionIds : [message.id];
+  const activeVersion = Math.max(
+    0,
+    Math.min(versions.length - 1, versionIndex),
+  );
 
   const beginEdit = () => {
     setEditDraft(content);
@@ -121,6 +137,17 @@ export function MessageBubble({
           Edit
         </button>
       ) : null}
+      {onBranch ? (
+        <button
+          type="button"
+          onClick={() => void onBranch()}
+          className="inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-[10px] text-slate-600 transition hover:bg-white/5 hover:text-slate-300"
+          title="Copy this point into a new chat"
+        >
+          <GitBranch className="h-3 w-3" />
+          Branch
+        </button>
+      ) : null}
       {onRegenerate && regenerable ? (
         <button
           type="button"
@@ -162,6 +189,16 @@ export function MessageBubble({
   if (isUser) {
     return (
       <div className="group flex animate-fade-in flex-col items-end gap-1">
+        {versions.length > 1 && onSelectVersion ? (
+          <VersionSwitcher
+            index={activeVersion}
+            count={versions.length}
+            onSelect={(next) => {
+              const sibling = versions[next];
+              if (sibling) onSelectVersion(sibling);
+            }}
+          />
+        ) : null}
         <div className="max-w-[82%] rounded-2xl rounded-br-md border border-acid-400/20 bg-acid-400/10 px-4 py-3">
           {message.images?.length ? (
             <div className="mb-2 flex flex-wrap gap-1.5">
@@ -185,7 +222,7 @@ export function MessageBubble({
               />
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <span className="text-[9px] leading-4 text-amber-300/70">
-                  Resending replaces every reply after this message.
+                  Resending keeps the old continuation as a branch.
                 </span>
                 <div className="flex gap-1.5">
                   <button
@@ -234,6 +271,16 @@ export function MessageBubble({
               <span className="h-1 w-1 animate-pulse-soft rounded-full bg-acid-400" />
               generating
             </span>
+          ) : null}
+          {versions.length > 1 && onSelectVersion ? (
+            <VersionSwitcher
+              index={activeVersion}
+              count={versions.length}
+              onSelect={(next) => {
+                const sibling = versions[next];
+                if (sibling) onSelectVersion(sibling);
+              }}
+            />
           ) : null}
         </div>
 
@@ -339,4 +386,43 @@ function timeLabel(timestamp: number): string {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+function VersionSwitcher({
+  index,
+  count,
+  onSelect,
+}: {
+  index: number;
+  count: number;
+  onSelect: (index: number) => void;
+}) {
+  return (
+    <span
+      className="inline-flex items-center gap-0.5 rounded-full border border-white/10 bg-white/[0.03] px-1 py-0.5 text-[9px] text-slate-500"
+      title="Switch between saved versions"
+    >
+      <button
+        type="button"
+        onClick={() => onSelect(index - 1)}
+        disabled={index <= 0}
+        className="rounded p-0.5 transition hover:text-slate-200 disabled:opacity-30"
+        aria-label="Previous version"
+      >
+        <ChevronLeft className="h-2.5 w-2.5" />
+      </button>
+      <span className="font-mono">
+        {index + 1}/{count}
+      </span>
+      <button
+        type="button"
+        onClick={() => onSelect(index + 1)}
+        disabled={index >= count - 1}
+        className="rounded p-0.5 transition hover:text-slate-200 disabled:opacity-30"
+        aria-label="Next version"
+      >
+        <ChevronRight className="h-2.5 w-2.5" />
+      </button>
+    </span>
+  );
 }

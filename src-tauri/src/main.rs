@@ -22,7 +22,9 @@ use std::sync::Arc;
 
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use chat_store::{ChatStore, StoredSession};
+use chat_store::{
+    ChatBackupInfo, ChatImportSummary, ChatStore, ChatStoreStats, StoredSession,
+};
 use converter::{ConversionStarted, ConvertRequest, ConverterManager};
 use memory::{MemoryFact, MemoryStore};
 use provision::Provisioner;
@@ -270,6 +272,48 @@ fn chat_import_session(store: State<'_, Arc<ChatStore>>, path: String) -> AppRes
     store.import(&path)
 }
 
+#[tauri::command(rename_all = "snake_case")]
+fn chat_branch_session(
+    store: State<'_, Arc<ChatStore>>,
+    id: String,
+    message_id: String,
+) -> AppResult<StoredSession> {
+    store.branch_session(&id, &message_id)
+}
+
+#[tauri::command]
+fn chat_export_all(store: State<'_, Arc<ChatStore>>, path: String) -> AppResult<usize> {
+    store.export_all(&path)
+}
+
+#[tauri::command]
+fn chat_import_all(store: State<'_, Arc<ChatStore>>, path: String) -> AppResult<ChatImportSummary> {
+    store.import_all(&path)
+}
+
+#[tauri::command]
+fn chat_backup_list(store: State<'_, Arc<ChatStore>>) -> Vec<ChatBackupInfo> {
+    store.backup_list()
+}
+
+#[tauri::command]
+fn chat_restore_backup(
+    store: State<'_, Arc<ChatStore>>,
+    id: String,
+) -> AppResult<StoredSession> {
+    store.restore_backup(&id)
+}
+
+#[tauri::command]
+fn chat_store_gc(store: State<'_, Arc<ChatStore>>) -> AppResult<u64> {
+    store.gc_assets()
+}
+
+#[tauri::command]
+fn chat_store_stats(store: State<'_, Arc<ChatStore>>) -> ChatStoreStats {
+    store.stats()
+}
+
 #[tauri::command]
 fn start_conversion(
     app: AppHandle,
@@ -398,6 +442,13 @@ fn main() {
             chat_asset_data_url,
             chat_export_session,
             chat_import_session,
+            chat_branch_session,
+            chat_export_all,
+            chat_import_all,
+            chat_backup_list,
+            chat_restore_backup,
+            chat_store_gc,
+            chat_store_stats,
             memory_list,
             save_to_memory_bank,
             memory_update,
@@ -418,6 +469,9 @@ fn main() {
             system::open_external,
             system::transcribe_audio,
             system::library_models,
+            system::library_disk,
+            system::verify_local_model,
+            system::delete_local_model,
             mcp::mcp_probe,
             engines::binary::download_and_extract_binary,
             engines::binary::rollback_binary,

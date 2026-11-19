@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
+import { ask, open } from "@tauri-apps/plugin-dialog";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -33,6 +33,7 @@ import type {
 import { Button } from "../ui/Button";
 import { GpuOffloadControl } from "../ui/GpuOffloadControl";
 import { EngineLogsPanel } from "./EngineLogsPanel";
+import { ChatHistoryPanel } from "./ChatHistoryPanel";
 import { SetupPanel } from "./SetupPanel";
 import { ThemePicker } from "./ThemePicker";
 import { StatusPill } from "../ui/StatusPill";
@@ -241,10 +242,11 @@ export function SettingsView({ engine }: SettingsViewProps) {
     }
   };
 
-  const resetDefaults = () => {
+  const resetDefaults = async () => {
     if (!form) return;
-    const confirmed = window.confirm(
+    const confirmed = await ask(
       "Reset all settings to their defaults?\n\nThis clears binary and model paths, the local API key, ports and runtime flags in the form. Your models folder is kept. Nothing is saved until you click Save changes.",
+      { title: "Reset settings", kind: "warning" },
     );
     if (!confirmed) return;
     setForm({
@@ -291,7 +293,7 @@ export function SettingsView({ engine }: SettingsViewProps) {
               variant="secondary"
               size="sm"
               disabled={saving}
-              onClick={resetDefaults}
+              onClick={() => void resetDefaults()}
               title="Load default settings into this form; Save changes to apply"
               icon={<RotateCcw className="h-3.5 w-3.5" />}
             >
@@ -345,6 +347,8 @@ export function SettingsView({ engine }: SettingsViewProps) {
         <SetupPanel />
 
         <EngineLogsPanel engine={engine} />
+
+        <ChatHistoryPanel />
 
         <Section
           title="Inference engine"

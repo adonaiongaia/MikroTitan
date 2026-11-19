@@ -44,6 +44,20 @@ export function DownloadDialog({
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [downloadId, setDownloadId] = useState<string | null>(null);
+  const [freeBytes, setFreeBytes] = useState<number | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .libraryDisk()
+      .then((disk) => {
+        if (!cancelled) setFreeBytes(disk.free_bytes);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -88,6 +102,8 @@ export function DownloadDialog({
   const finished = job?.status === "complete";
 
   const destination = `${modelsDir.replace(/\/+$/, "")}/${model.id}`;
+  const insufficient =
+    active != null && freeBytes != null && active.size_bytes > freeBytes;
 
   const start = async () => {
     if (!active) return;
@@ -294,6 +310,21 @@ export function DownloadDialog({
                     </div>
                   </div>
 
+                  {insufficient ? (
+                    <div className="flex items-start gap-2 rounded-xl border border-rose-400/20 bg-rose-500/5 px-3 py-2 text-[10px] leading-4 text-rose-300">
+                      <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                      <span>
+                        This download needs {formatBytes(active.size_bytes)} but
+                        only {formatBytes(freeBytes ?? 0)} is free in the models
+                        folder. Free space before downloading.
+                      </span>
+                    </div>
+                  ) : freeBytes != null ? (
+                    <p className="px-1 text-[9px] text-slate-600">
+                      {formatBytes(freeBytes)} free in the models folder.
+                    </p>
+                  ) : null}
+
                   <div className="rounded-xl border border-white/5 bg-white/[0.02] px-3 py-2.5">
                     <p className="label">Memory estimate</p>
                     <div className="mt-2 grid grid-cols-2 gap-2">
@@ -337,7 +368,7 @@ export function DownloadDialog({
                 size="sm"
                 variant="primary"
                 busy={starting}
-                disabled={!active}
+                disabled={!active || insufficient}
                 onClick={() => void start()}
                 icon={<Download className="h-3.5 w-3.5" />}
               >

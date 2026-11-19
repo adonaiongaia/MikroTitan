@@ -6,14 +6,21 @@ import {
   HardDrive,
   RefreshCw,
   Search,
+  ShieldCheck,
+  Trash2,
   Wrench,
   type LucideIcon,
 } from "lucide-react";
 
 import { api } from "../../lib/api";
+import { ask } from "@tauri-apps/plugin-dialog";
 import { cn } from "../../lib/cn";
 import { errorMessage, formatBytes, formatRelativeDate } from "../../lib/format";
-import type { LibraryModel } from "../../types";
+import type {
+  LibraryDisk,
+  LibraryModel,
+  ModelVerification,
+} from "../../types";
 import { Button } from "../ui/Button";
 
 interface ModelLibraryViewProps {
@@ -26,11 +33,22 @@ export function ModelLibraryView({ onUseModel }: ModelLibraryViewProps) {
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [using, setUsing] = useState<string | null>(null);
+  const [disk, setDisk] = useState<LibraryDisk | null>(null);
+  const [verifying, setVerifying] = useState<string | null>(null);
+  const [verifications, setVerifications] = useState<
+    Record<string, ModelVerification>
+  >({});
+  const [deleting, setDeleting] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      setModels(await api.libraryModels());
+      const [nextModels, nextDisk] = await Promise.all([
+        api.libraryModels(),
+        api.libraryDisk(),
+      ]);
+      setModels(nextModels);
+      setDisk(nextDisk);
       setError(null);
     } catch (err) {
       setError(errorMessage(err));
@@ -42,6 +60,48 @@ export function ModelLibraryView({ onUseModel }: ModelLibraryViewProps) {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  const verify = async (model: LibraryModel) => {
+    setVerifying(model.path);
+    setError(null);
+    try {
+      const result = await api.verifyLocalModel(model.path);
+      setVerifications((previous) => ({
+        ...previous,
+        [model.path]: result,
+      }));
+      if (!result.ok) setError(result.message);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setVerifying(null);
+    }
+  };
+
+  const remove = async (model: LibraryModel) => {
+    const confirmed = await ask(
+      `Delete “${model.name}”?\n\nThis removes ${formatBytes(
+        model.size_bytes,
+      )} from ${model.path}. It cannot be undone.`,
+      { title: "Delete model", kind: "warning" },
+    );
+    if (!confirmed) return;
+    setDeleting(model.path);
+    setError(null);
+    try {
+      await api.deleteLocalModel(model.path);
+      setVerifications((previous) => {
+        const next = { ...previous };
+        delete next[model.path];
+        return next;
+      });
+      await refresh();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setDeleting(null);
+    }
+  };
 
   const filtered = useMemo(() => {
     const needle = query.trim().toLowerCase();
@@ -86,6 +146,9 @@ export function ModelLibraryView({ onUseModel }: ModelLibraryViewProps) {
             <Boxes className="h-3 w-3 text-acid-500/70" />
             {models.length} local model{models.length === 1 ? "" : "s"} ·{" "}
             {formatBytes(totalBytes)} on this machine
+            {disk?.free_bytes != null
+              ? ` · ${formatBytes(disk.free_bytes)} free`
+              : ""}
           </span>
           <span className="inline-flex flex-wrap items-center gap-2">
             <span className="inline-flex items-center gap-1 text-violet-300/80">
@@ -118,19 +181,20 @@ export function ModelLibraryView({ onUseModel }: ModelLibraryViewProps) {
           </div>
         ) : filtered.length ? (
           <div className="overflow-hidden rounded-xl border border-white/5">
-            <div className="grid grid-cols-[minmax(200px,2fr)_100px_90px_120px_110px_110px] gap-3 border-b border-white/5 bg-white/[0.02] px-4 py-2 text-[9px] uppercase tracking-wider text-slate-600">
+            <div className="grid grid-cols-[minmax(200px,2fr)_100px_90px_120px_110px_110px_170px] gap-3 border-b border-white/5 bg-white/[0.02] px-4 py-2 text-[9px] uppercase tracking-wider text-slate-600">
               <span>Model</span>
               <span>Architecture</span>
               <span>Params</span>
               <span>Publisher</span>
               <span>Quant</span>
               <span className="text-right">Size</span>
+              <span className="text-right">Actions</span>
             </div>
             <div className="divide-y divide-white/5">
               {filtered.map((model) => (
                 <div
                   key={model.path}
-                  className="group grid grid-cols-[minmax(200px,2fr)_100px_90px_120px_110px_110px] items-center gap-3 px-4 py-3 transition hover:bg-white/[0.02]"
+                  className="group grid grid-cols-[minmax(200px,2fr)_100px_90px_120px_110px_110px_170px] items-center gap-3 px-4 py-3 transition hover:bg-white/[0.02]"
                 >
                   <div className="min-w-0">
                     <div className="flex items-center gap-2">
@@ -178,6 +242,39 @@ export function ModelLibraryView({ onUseModel }: ModelLibraryViewProps) {
                         ) : null}
                       </div>
                     ) : null}
+                    {model.duplicate ||
+                    model.same_repo_count > 1 ||
+                    verifications[model.path] ? (
+                      <div className="mt-1 flex flex-wrap items-center gap-1">
+                        {model.duplicate ? (
+                          <span className="rounded border border-amber-400/20 bg-amber-400/5 px-1 py-0.5 text-[8px] text-amber-300/80">
+                            duplicate
+                          </span>
+                        ) : null}
+                        {model.same_repo_count > 1 ? (
+                          <span className="rounded border border-white/10 bg-white/5 px-1 py-0.5 text-[8px] text-slate-500">
+                            {model.same_repo_count} in repo
+                          </span>
+                        ) : null}
+                        {verifications[model.path] ? (
+                          <span
+                            title={verifications[model.path].message}
+                            className={cn(
+                              "rounded border px-1 py-0.5 text-[8px]",
+                              verifications[model.path].ok
+                                ? "border-emerald-400/20 bg-emerald-400/5 text-emerald-300/80"
+                                : "border-rose-400/20 bg-rose-500/5 text-rose-300/80",
+                            )}
+                          >
+                            {verifications[model.path].ok
+                              ? verifications[model.path].expected
+                                ? "checksum ok"
+                                : "sha-256 only"
+                              : "checksum mismatch"}
+                          </span>
+                        ) : null}
+                      </div>
+                    ) : null}
                   </div>
                   <span className="truncate text-[10.5px] text-slate-400">
                     {model.architecture}
@@ -191,11 +288,39 @@ export function ModelLibraryView({ onUseModel }: ModelLibraryViewProps) {
                   <span className="font-mono text-[10px] text-slate-400">
                     {model.quant}
                   </span>
-                  <div className="flex items-center justify-end gap-2">
-                    <span className="flex items-center gap-1 font-mono text-[10px] text-slate-500">
-                      <HardDrive className="h-3 w-3 text-slate-700" />
-                      {formatBytes(model.size_bytes)}
-                    </span>
+                  <span className="flex items-center justify-end gap-1 font-mono text-[10px] text-slate-500">
+                    <HardDrive className="h-3 w-3 text-slate-700" />
+                    {formatBytes(model.size_bytes)}
+                  </span>
+                  <div className="flex items-center justify-end gap-1">
+                    <button
+                      type="button"
+                      title="Verify this file against its download checksum"
+                      onClick={() => void verify(model)}
+                      disabled={verifying === model.path || deleting === model.path}
+                      className="inline-flex items-center gap-1 rounded-md border border-white/10 bg-white/5 px-1.5 py-0.5 text-[9px] text-slate-300 transition hover:bg-white/10 disabled:opacity-40"
+                    >
+                      {verifying === model.path ? (
+                        <RefreshCw className="h-2.5 w-2.5 animate-spin" />
+                      ) : (
+                        <ShieldCheck className="h-2.5 w-2.5" />
+                      )}
+                      Verify
+                    </button>
+                    <button
+                      type="button"
+                      title="Delete this model file"
+                      onClick={() => void remove(model)}
+                      disabled={verifying === model.path || deleting === model.path}
+                      className="inline-flex items-center gap-1 rounded-md border border-rose-400/15 bg-rose-500/5 px-1.5 py-0.5 text-[9px] text-rose-300/80 transition hover:bg-rose-500/10 disabled:opacity-40"
+                    >
+                      {deleting === model.path ? (
+                        <RefreshCw className="h-2.5 w-2.5 animate-spin" />
+                      ) : (
+                        <Trash2 className="h-2.5 w-2.5" />
+                      )}
+                      Delete
+                    </button>
                     <button
                       type="button"
                       title={

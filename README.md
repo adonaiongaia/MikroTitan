@@ -1,12 +1,39 @@
 # Janas Studio
 
-Now with theme choices and an "agent mode!"  
+A local AI studio with **agent mode**, branching chat history, per-chat workspaces and MCP tool scopes, crash-safe session storage, and three themes.
 
-Janas-Studio is a local AI studio for the [Janas](https://github.com/prabanta-dev/janas) C inference engine, built with **Tauri 2**, **Rust**, **React 18**, **TypeScript**, and **Tailwind CSS**.
+Janas Studio is a local AI studio for the [Janas](https://github.com/prabanta-dev/janas) C inference engine, built with **Tauri 2**, **Rust**, **React 18**, **TypeScript**, and **Tailwind CSS**.
 
 Janas Studio manages the `janas-server` process, proxies its OpenAI-compatible SSE stream into the webview, browses GGUF repositories on Hugging Face, and drives `janas-convert` / upstream `gguf2jns` with a live console.
 
 ![Janas Studio](src-tauri/icons/128x128@2x.png)
+
+## Highlights
+
+- **Agent mode** — a bounded Think → Act → Observe loop with workspace tools, a live trace, risk-aware approvals, planning, auto-compaction, verification and per-file undo.
+- **Branching chats** — edit a prompt or regenerate a reply without losing the old path; switch versions with arrows or branch a new chat from any message.
+- **Per-chat context** — drafts, project bundles, workspace roots and MCP tool scopes follow the chat instead of the window.
+- **Crash-safe history** — one JSON file per chat, schema v2, atomic writes, automatic previous-version backups, image assets on disk, and export/import/restore.
+- **MCP scope controls** — a Tools badge, All/None controls, per-chat server selection, and automatic reconciliation when servers are removed or re-created.
+- **Three themes** — Acid, Ember and Tide.
+
+See [CHANGELOG.md](CHANGELOG.md) for the release history.
+
+## Screenshots
+
+Screenshots use a demo workspace and a demo model.
+
+![Chat workspace with branching history, a per-chat draft, and the MCP scope badge](docs/screenshots/chat-workspace.png)
+
+*Chat workspace: branching history, per-chat drafts, and the MCP scope badge.*
+
+![Agent run trace with plan, tool calls, context compaction, and changed files](docs/screenshots/agent-mode.png)
+
+*Agent mode: plan, read/edit/run tool calls, context compaction, and run changes.*
+
+![Per-chat MCP tool scope with All and None controls](docs/screenshots/mcp-scope.png)
+
+*Per-chat MCP scope: All/None controls, enabled servers, and server-level auto-approve.*
 
 ## Dual-engine architecture: Janas and llama.cpp
 
@@ -140,9 +167,27 @@ The config path stays unsuffixed; Tauri selects the file matching the build targ
 
 ## This build adds
 
+### Agent mode
+
+The composer's **Agent** toggle turns a chat into a bounded tool-running loop. Instead of one completion, the model plans, calls tools, reads observations and continues until it finishes, hits the step limit or is stopped. The run is shown inline as a trace attached to the reply.
+
+- Built-in workspace tools: `read_file`, `write_file`, `edit_file`, `list_directory`, `search_files` and `run_command`. `web_search` is exposed only when the Internet toggle is on; enabled MCP tools in the chat's scope join the same tool list.
+- **Workspace root:** file, search and shell tools stay disabled until a folder is chosen. A run pins that folder and cannot switch while it is active or has pending undo state. Each chat can override the global workspace, and `AGENTS.md` or `.janas/instructions.md` in the workspace is injected into the agent prompt.
+- **Approval policies:** *destructive* (read-only tools run automatically; writes, shell and MCP ask), *all* (everything except reads asks), or *full auto*. Irreversible commands (force-push, hard reset, recursive delete, publishing, `curl | sh`) and sensitive paths (`.env`, `.git`, SSH keys, cloud credentials) always ask, even under full auto. Tool output is scrubbed for likely secrets before it reaches the trace or model.
+- **File-edit shortcut:** approving a `write_file` or `edit_file` with “allow file edits for this run” skips later file-edit prompts for that run; shell and MCP calls remain gated.
+- **Diff previews:** file-edit approvals show a bounded diff with added and removed line counts before you approve or reject.
+- **Planning and limits:** an optional `<plan>` checklist before the first tool call, a 1–25 iteration cap, optional auto-compaction at a configurable share of the context window, and an optional verification command that runs after edits and before the agent may finish.
+- **Trace:** plan, thoughts, each tool call with its risk and duration, approval cards, compaction notices, final status and changed files. The trace is stored with the chat message.
+- **Undo:** workspace checkpoints keep bounded pre-images for a whole-run undo or per-file restore/keep. A run with pending changes locks the workspace root until those changes are undone or kept.
+- **Broad model support:** engines with native tool calling use it directly; models without a tool template get a prompt-mode tool catalogue and fenced-JSON protocol. Tool schemas are budgeted against the active context window.
+- **Safety:** paths resolve inside the pinned workspace, symlink escapes are rejected, commands run in their own process group and are killed on timeout or abort, and the approval matrix is covered by Rust tests.
+
 ### Chat workspace
 
-- **Chat sessions rail** (left, collapsible) with multiple chats, per-chat deletion, and a **Memory** tab.
+- **Chat sessions rail** (left, collapsible) with multiple chats, search, rename, pinning, per-chat deletion, per-chat import/export, and a **Memory** tab.
+- **Rust-backed chat store (schema v2):** each chat is one JSON file under the app data directory, with images extracted to `assets/<chat-id>/`. Saves are atomic and keep one previous version per chat. Settings → Chat history and backups exposes size stats, whole-shelf export/import, restore of the previous version, and orphaned-image cleanup.
+- **Branching and version history:** editing a user turn or regenerating a reply preserves the old suffix as an archived branch. Previous/next arrows switch sibling versions; **Branch** creates a new chat from the selected message's prefix. Branches inherit the source chat's project, workspace and MCP scope but not its draft.
+- **Per-chat drafts and context:** composer text and pending images are saved per chat and restored after restart. Attached projects, workspace roots and MCP server scopes are also per chat, while sampling settings remain global. A debounced save plus close-time flush keeps pending edits from being lost when the window closes.
 - **Token-aware context budget**: every send reserves space for the reply, keeps the system prompt and current turn, trims attached project/web context first, then drops or truncates the oldest turns until the prompt fits the **context the running engine was actually launched with**, not an edited setting that has not been restarted. If the current message and system prompt alone cannot fit, the send is stopped before it is added to the transcript, and the input stays editable. The Rust proxy is also a safety net: if either server still returns HTTP 400 with its context size, the prompt is rebuilt around the current turn and retried once automatically. MCP tool definitions count as prompt input too; when an enabled server's schema cannot fit, the turn runs without those tools and the app explains why instead of sending an impossible request.
 - **Engine Settings** (right, collapsible): temperature, top-p, top-k, min-p, repeat penalty, max reply, thinking mode, structured JSON output, context-prefetch window, LRU/LFU eviction, and a system prompt — all applied per request. Sampling controls the active engine does not advertise are hidden at runtime. Server runtime flags are edited here too: `--ctx`, `--cache`, `--mtp` / `--no-mtp`, draft model, `--prompt-on` / `--reply-on` / `--drafts-on`, `--npu-int8`, `--mode`, plus Janas's `JANAS_ATTN` and `JANAS_KV` overrides, with an explicit restart action. When llama.cpp is active, the panel also has the llama-only Direct CPU MoE Compute toggle, `--cpu-moe` / `--moe-cache-mib` / `--moe-cache-cpu-share` launch pipeline, and `--threads` cap; those values never reach Janas. A trash button in the header restores the sampling, context and runtime defaults and clears the editable system prompt; Settings also has a Reset defaults action that loads the AppSettings defaults into the form for review before Save changes.
 - **System Telemetry** (bottom, collapsible): a separate **prompt-read** and **reply-write** token ticker, SSD read throughput and IOPS sampled from the engine's `/proc/<pid>/io`, RSS/CPU, GPU/NPU counters from sysfs when the driver exposes them, an estimated RAM-vs-disk layer split, an expert-routing heatmap, and a 64 MB storage benchmark that warns when a drive will bottleneck 48 GB or 70 B+ mixtures.
@@ -151,15 +196,24 @@ The config path stays unsuffixed; Tauri selects the file matching the build targ
 - **Persistent memory**: the model can call its `save_to_memory_bank` tool to store durable facts in a Rust-managed JSON bank on disk. Facts are recalled by local vector similarity, injected into the next relevant turn, and can be added, corrected, or forgotten from the Memory tab. The system prompt tells the model when to save and forbids storing secrets.
 - **Streaming resilience**: the Rust SSE proxy tolerates CRLF, split chunks, raw newline-delimited JSON, malformed frames, final chunks without a newline, reasoning aliases, and content arrays. Malformed chunks are counted instead of crashing the app, and the chat view is wrapped in a render boundary so one bad reply cannot blank the window.
 - **Project ingestion**: drop a folder on the window (or pick it) and the studio walks the tree, skips build/vendor noise, and builds a semantic bundle with a token estimate before sending it to the prefill layer.
-- **Message actions** under every prompt and reply (copy, delete).
+- **Message actions** under every prompt and reply: copy, edit and resend, delete, branch, and previous/next version arrows for sibling replies.
 
 ### Models and tools
 
 - **Download pause/resume** in the download dialog and the tray; pausing keeps the stream open and resume continues from the same byte.
 - **RAM/VRAM estimate** and destination preview for every quantization before download.
 - **Model Library** view: local `.jns`/`.gguf` files with architecture, parameter count, publisher, size and quantization, plus one-click activation. Thinking and Tools badges come from a GGUF chat template when present, otherwise from the model family/name; the badge tooltip says which source was used.
-- **MCP Server Hub**: register stdio servers with arguments, per-server environment variables and an optional working directory. Probes allow 30 seconds for startup, capture stderr and report early exits. Enabled servers' tools are namespaced into the chat model's tool list, executed through the same stdio session during the turn, and shown in the activity drawer.
+- **Integrity checks and cleanup:** verify any local model against the SHA-256 recorded in the download manifest, with a clear result when no upstream checksum was recorded. Delete a model with an awaited confirmation; the action is blocked while that file is the active model.
+- **MCP Server Hub**: register stdio servers with arguments, per-server environment variables and an optional working directory. Probes allow 30 seconds for startup, capture stderr and report early exits. Enabled servers' tools are namespaced into the chat model's tool list, executed through the same stdio session during the turn, and shown in the activity drawer. Per-server auto-approve skips the approval card for normal chat tool calls.
+- **Per-chat MCP tool scope:** the Tools drawer shows an All/None/count badge, a zero-tools warning, and checkboxes for the enabled servers. An empty selection stores `[]` and sends no MCP tools; leaving the scope untouched means all enabled servers. Scopes are applied to both normal and agent requests. On chat load, servers that no longer exist are pruned and servers re-created under the same name are remapped to their new ID.
 - **Bundled binaries**: `janas-server`, `gguf2jns` and `janas-mcp` ship as Tauri resources, so the AppImage works without pointing Settings at an external build (a binary on `PATH` or an explicit path still wins).
+
+### Appearance, settings and history
+
+- **Themes:** Acid (lime/graphite), Ember (copper/soot) and Tide (cyan/deep water), selectable in Settings and persisted locally.
+- **Agent configuration:** max iterations, approval policy, workspace root, planning step, auto-compaction threshold and verification command live in the Engine Settings panel.
+- **Chat history and backups:** live size statistics, per-chat previous versions with restore, whole-shelf export/import, and orphaned-image cleanup.
+- **Reset defaults:** the Engine Settings trash action restores sampling, context and runtime defaults and clears the editable system prompt; Settings also previews AppSettings defaults before saving.
 
 ## What is included
 
@@ -204,6 +258,8 @@ The config path stays unsuffixed; Tauri selects the file matching the build targ
 - Engine and converter binary paths with a `--version` probe.
 - Active `.jns` model, models folder, server host/port, extra arguments, and local API key.
 - Scan for local `.jns` models and select one.
+- Theme picker (Acid, Ember, Tide), agent preferences, and reset-defaults actions.
+- Chat history statistics, whole-shelf backup/export/import, previous-version restore, and orphaned-image cleanup.
 
 ## Requirements
 
@@ -264,27 +320,38 @@ Run it with `chmod +x` and execute directly. The image bundles its WebKitGTK/GTK
 
 ```
 src/
-  types.ts                 shared IPC types
+  types.ts                 shared IPC and UI types
   lib/api.ts               typed invoke wrappers + event names
-  hooks/                   engine, settings, chat SSE, downloads, converter
-  components/chat/         workspace, messages, composer, parameters
-  components/models/       marketplace, cards, download dialog/tray
+  lib/chatSessions.ts      session normalization, branching, versions, drafts
+  lib/mcpScope.ts          per-chat MCP filtering, request inputs, reconciliation
+  hooks/                   engine, settings, chat, agent, downloads, converter
+  components/chat/         workspace, messages, composer, agent trace, MCP drawer, sessions rail
+  components/models/       marketplace, library, download dialog/tray
+  components/mcp/          server hub
   components/converter/    compiler form and console
-  components/settings/     runtime configuration
+  components/settings/     runtime, theme, and chat-history panels
 src-tauri/src/
   main.rs                  Tauri setup, state, command registration
-  engine.rs                janas-server lifecycle + SSE proxy
+  engine.rs                Janas lifecycle, SSE proxy and tool loop
+  agent.rs                 agent loop, workspace tools, approvals and safety
+  agent/checkpoint.rs      per-run file pre-images and undo state
+  engines/                 dual-engine supervisor, Janas/llama adapters, binary installer
+  chat_store.rs            schema-v2 chat sessions, assets, backups, export/import
+  mcp.rs                   stdio MCP client/runtime and probes
+  provision.rs             startup hardware detection and engine provisioning
   converter.rs             janas-convert job runner
   huggingface.rs           Hub search, quant discovery, downloads
+  capabilities.rs          runtime sampling-capability probing
   settings.rs              persisted config, binary resolution, probing
   memory.rs                persistent memory bank + save_to_memory_bank handler
-  system.rs                telemetry, benchmark, ingest, web search, library, MCP, source opener
+  system.rs                telemetry, benchmark, ingest, web search, library, model verify/delete, MCP, source opener
   error.rs                 serializable command errors
 ```
 
 New UI pieces: `chat/SessionsRail`, `chat/EnginePanel`, `chat/TelemetryPanel`,
-`chat/TokenTicker`, `chat/Composer` (multimodal), `chat/McpLogDrawer`,
-`models/ModelLibraryView`, and `mcp/McpView`.
+`chat/TokenTicker`, `chat/Composer` (multimodal), `chat/AgentTrace`,
+`chat/McpLogDrawer`, `models/ModelLibraryView`, `mcp/McpView`,
+`settings/ThemePicker`, and `settings/ChatHistoryPanel`.
 
 ### IPC/event contract
 
@@ -302,6 +369,11 @@ New UI pieces: `chat/SessionsRail`, `chat/EnginePanel`, `chat/TelemetryPanel`,
 | `open_external` | open a citation in the system browser |
 | `library_models`, `mcp_probe` | local model shelf with thinking/tool badges and MCP handshake with stderr/exit diagnostics |
 | `get_backend_capabilities` | dynamic sampling-control availability from the active engine |
+| `chat_sessions_list`, `chat_session_save`, `chat_session_delete`, `chat_asset_data_url` | schema-v2 session store and image assets |
+| `chat_export_session`, `chat_import_session`, `chat_branch_session`, `chat_export_all`, `chat_import_all`, `chat_backup_list`, `chat_restore_backup`, `chat_store_gc`, `chat_store_stats` | branching, backup, export/import and maintenance |
+| `verify_local_model`, `delete_local_model` | SHA-256 verification and model deletion |
+| `agent_start`, `agent_resolve_approval`, `agent_abort` | agent run, approval decisions and cancellation |
+| `agent_undo`, `agent_undo_file`, `agent_keep_file`, `agent_undo_availability`, `agent_undo_state` | per-run and per-file agent undo |
 
 | Event | Payload |
 | --- | --- |
@@ -311,28 +383,33 @@ New UI pieces: `chat/SessionsRail`, `chat/EnginePanel`, `chat/TelemetryPanel`,
 | `memory://changed` | the full memory list after a model or user write |
 | `convert://log` / `convert://progress` / `convert://finished` | build console |
 | `download://progress` | aggregate download status |
+| `chat://notice` / `chat://tool-approval` | context/tool notices and MCP approval requests |
+| `mcp://activity` | MCP handshake and tool activity |
+| `agent:plan` / `agent:thought` / `agent:tool_start` / `agent:tool_result` | agent plan, live reasoning and tool steps |
+| `agent:approval_needed` / `agent:context_compacted` / `agent:done` / `agent:error` / `agent:notice` | agent approvals, compaction and completion |
 
 ## Verification performed
 
-- `tsc --noEmit && vite build` — production frontend bundle built successfully with the new workspace, hooks and views.
-- `cargo test` — 69 parser, streaming, tool-call, memory, search, lifecycle, path-safety, quantization, release-asset selection, library-SONAME alias, Janas install/restore, mock-runtime harness, failed-update rollback, sampling-capability discovery, context-error parsing, prompt-retry trimming, oversized-MCP-tool schema, Janas attention/KV environment, GGUF sliding-window detection, llama Vulkan KV-cache guard and llama Direct CPU MoE tests pass.
-- The latest llama.cpp build (b12387) was reproduced aborting on the configured 4 B sliding-window GGUF with `pre-allocated tensor (cache_k_l1 (view)) in a buffer (Vulkan0) that cannot run the operation (SET_ROWS)`; b12236 with its own libraries serves the same model. `--device none` and `-nkvo` both load and answer `/v1/chat/completions`, while `--fit off`, `--no-kv-unified`, `--swa-full` and `--flash-attn off`/`on` still abort. A network-marked live search smoke test is ignored unless explicitly requested.
-- `npm run appimage` — release build and AppImage bundling completed (90,118,648 bytes / 85.94 MiB; SHA-256 `cfbc4ed2bd7a52ae017ca6c8ac1f24251b1d6cfca4005b440124a52e485fc67f`; build ID `7a307e6c008749df8d44f088bbafd66b368e749c`).
-- A live `janas-server` launched with `--ctx 16384` rejected a 30,011-token conversation with HTTP 400 `context_length_exceeded`, and the retry parser read the reported 16,384-token limit. The trimmer test keeps the rebuilt prompt under 7,680 estimated tokens while preserving the system instruction and current user turn.
-- A 229-tool MCP server was measured locally: its retained definitions were large enough to turn a fresh 16k-token chat into a 74k-token request on both engines. The proxy now omits MCP tool schemas when they do not fit the active window; the synthetic oversized-tool test covers that threshold.
-- The release binary contains both the retry prompt marker and the MCP-tool budget notice, and the bundled frontend reads `context_window` from the active engine, so the running engine's real launch context reaches the budget ring.
-- The AppImage was extracted with `--appimage-extract`; `janas-server`, `gguf2jns` and `janas-mcp` are present under `usr/lib/Janas Studio/binaries/` with mode `755`.
-- The extracted desktop entry, icon and executable were inspected. A graphical launch still requires a desktop session with WebKitGTK, GPU drivers and FUSE (or `--appimage-extract-and-run`).
-- `janas-server` was run with the same flags this app uses against an official Qwen3-0.6B `.jns` model. `GET /health` returned `{"status":"ok"}` and a streamed chat request with a system message, temperature, top-p, `stream_options`, and `max_tokens` returned `delta.content`, `finish_reason`, `usage`, and `[DONE]` frames.
+- `npm run check` — TypeScript typecheck passed.
+- `npm test` — 23 Vitest tests pass across chat-session normalization/branching and MCP scope/reconciliation, including empty-scope request building and persistence-boundary checks.
+- `cargo test` — 143 tests pass, 0 failed; one network-dependent live-search smoke test is ignored by default.
+- `npm run appimage` — release build and AppImage bundling completed:
+  - Artifact: `src-tauri/target/release/bundle/appimage/Janas Studio_0.1.0_amd64.AppImage`
+  - Size: 90,397,176 bytes (86.21 MiB)
+  - SHA-256: `79988fe824edcc2d6791f4d02c87d43b11884953609300ee32e2cb76780378a9`
+- Runtime passes in an isolated profile exercised branching and version switching, per-chat drafts and MCP scope, backup restore and export/import, close-time saving, and model verify/delete. The delete confirmation now awaits the Tauri dialog, and window close flushes pending chat writes before destroying the window.
+- The Tools badge, All/None controls, zero-tools hint and scope reconciliation are covered by typecheck, unit tests and the production build; the final AppImage was not visually rechecked for these last UI additions.
+- Engine-specific checks from earlier builds (llama.cpp Vulkan KV-cache guard, context retry, MCP schema budget, bundled binaries) remain covered by the Rust suite.
 
 ## Notes and limitations
 
 - The Janas binaries are bundled in the AppImage under `binaries/`; the `.jns` model weights are still yours to download.
 - Some telemetry is necessarily an estimate: `janas-server` does not expose expert IDs or per-layer residency, so the RAM/disk split and the expert heatmap are labelled estimates. SSD throughput and IOPS come from the kernel; GPU/NPU counters only appear when the driver publishes them under `/sys/class/drm` or `/sys/class/accel`.
 - llama.cpp image input needs a vision-capable GGUF plus its matching `--mmproj` projector selected in Settings; otherwise the engine's error is shown verbatim.
-- Persistent memory is an in-app hashed TF-IDF vector store, not ChromaDB, so there is no Python sidecar. It persists in `localStorage` and never leaves the machine.
+- Persistent memory is an in-app hashed TF-IDF vector store, not ChromaDB, so there is no Python sidecar. Facts live in `memory.json` under the app data directory and never leave the machine.
 - The app assumes a single local engine instance and a single active model.
-- Chat sessions, memory and sampling values are persisted in `localStorage`; server settings live in the platform config directory.
+- Chat sessions and their images live under `chat-sessions/` in the app data directory, one JSON file per chat plus `assets/<chat-id>/`, with one previous version kept per chat. Engine/agent preferences, theme choice and other UI state live in `localStorage`; memory facts live in `memory.json`; server settings live in the platform config directory.
+- Per-chat MCP scopes store server IDs and names. On chat load, missing servers are pruned and servers re-created under the same name are remapped automatically.
 - Janas writes its own cache under `~/.cache/janas`. Converting large models can need roughly three times the model size in free disk space, as documented upstream.
 - Only GGUF quantizations supported by the installed converter will compile.
 - The AppImage is unsigned.

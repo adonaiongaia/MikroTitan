@@ -241,16 +241,46 @@ export interface ChatMessage {
   }>;
   /** Structured agent trace. Absent on legacy chats and normal replies. */
   agentTrace?: AgentTrace | null;
+  /** Parent in the conversation tree. Null/undefined marks a root message. */
+  parent_id?: string | null;
+  /** The child that was active when this message was last on the main path. */
+  active_child_id?: string | null;
+}
+
+export interface ChatDraftImage {
+  name: string;
+  data_url?: string;
+  asset?: string;
+  tokens: number;
+}
+
+export interface ChatDraft {
+  text: string;
+  images: ChatDraftImage[];
+  updated_at: number;
 }
 
 export interface ChatSession {
   id: string;
+  schema_version?: number;
   title: string;
   created_at: number;
   updated_at: number;
   /** Pinned chats stay at the top of the rail. */
   pinned?: boolean;
   messages: ChatMessage[];
+  /** Inactive branches preserved by an edit or regenerate. */
+  archived_messages?: ChatMessage[];
+  /** Composer text and pending images, persisted per chat. */
+  draft?: ChatDraft;
+  /** Project bundle attached to this chat, not the whole window. */
+  project?: ProjectIngest;
+  /** Per-chat agent sandbox override; falls back to the global preference. */
+  workspace_root?: string;
+  /** MCP servers this chat may use; undefined means all enabled, [] none. */
+  mcp_server_ids?: string[];
+  /** Server names captured with the scope, used to remap re-created servers. */
+  mcp_server_names?: Record<string, string>;
 }
 
 export interface ChatOutboundMessage {
@@ -507,6 +537,44 @@ export interface LibraryModel {
   thinking: boolean;
   tools: boolean;
   capabilities_source: string;
+  duplicate: boolean;
+  same_repo_count: number;
+}
+
+export interface ModelVerification {
+  path: string;
+  size_bytes: number;
+  sha256: string;
+  expected: string | null;
+  ok: boolean;
+  message: string;
+}
+
+export interface LibraryDisk {
+  models_dir: string;
+  total_bytes: number;
+  free_bytes: number | null;
+}
+
+export interface ChatBackupInfo {
+  id: string;
+  title: string;
+  updated_at: number;
+  bytes: number;
+}
+
+export interface ChatStoreStats {
+  sessions: number;
+  session_bytes: number;
+  asset_bytes: number;
+  backups: number;
+  backup_bytes: number;
+}
+
+export interface ChatImportSummary {
+  imported: number;
+  failed: number;
+  errors: string[];
 }
 
 /** Backend-advertised sampling controls. Missing keys are treated as false. */

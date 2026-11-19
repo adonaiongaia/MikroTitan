@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Loader2, Play, Square, X } from "lucide-react";
 
 import { ChatView } from "./components/chat/ChatView";
@@ -56,6 +56,65 @@ export default function App() {
   const downloads = useDownloads();
   const [view, setView] = useState<ViewId>("chat");
   const [toast, setToast] = useState<string | null>(null);
+  const closing = useRef(false);
+
+  // A debounced save can still be waiting when the window closes. Flush the
+  // dirty sessions on blur/visibility and, for Tauri, wait for the write before
+  // letting the close request through.
+  useEffect(() => {
+    const flush = () => {
+      void chat.flushAll();
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") flush();
+    };
+    window.addEventListener("beforeunload", flush);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("beforeunload", flush);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [chat.flushAll]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void import("@tauri-apps/api/window")
+      .then(({ getCurrentWindow }) => {
+        const window = getCurrentWindow();
+        return window.onCloseRequested(async (event) => {
+          if (closing.current) return;
+          closing.current = true;
+          event.preventDefault();
+          try {
+            // close() can re-enter this listener on some Linux window
+            // managers. Give the flush a short budget, then destroy the
+            // window so a failed save can never trap the app open.
+            await Promise.race([
+              chat.flushAll(),
+              new Promise<void>((resolve) =>
+                globalThis.setTimeout(resolve, 1_500),
+              ),
+            ]);
+          } finally {
+            try {
+              await window.destroy();
+            } catch {
+              await window.close();
+            }
+          }
+        });
+      })
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [chat.flushAll]);
 
   useEffect(() => {
     if (!toast) return;
