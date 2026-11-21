@@ -33,6 +33,7 @@
   "bundle": {
     "active": true,
     "targets": ["appimage"],
+    "licenseFile": "../LICENSE",
     "resources": [
       "binaries/janas-server",
       "binaries/gguf2jns",
@@ -50,7 +51,10 @@
     "longDescription": "Janas Studio runs the Janas C inference engine on your own machine. Chat with local .jns models with streaming responses, tune temperature and top-p, browse and download GGUF models from Hugging Face, and compile them into the Janas .jns format with a live build console.",
     "linux": {
       "appimage": {
-        "bundleMediaFramework": false
+        "bundleMediaFramework": false,
+        "files": {
+          "/usr/share/licenses/janas-studio/LICENSE": "../LICENSE"
+        }
       }
     }
   }

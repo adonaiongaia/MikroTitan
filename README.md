@@ -47,11 +47,11 @@ Screenshots use a demo workspace and a demo model.
 
 Janas Studio has no accounts, analytics, crash reporting or telemetry upload. Chat history, images, project bundles and memory facts are written to the local app data directory, and runtime settings to the platform config directory; small UI preferences such as the theme and agent defaults live in local storage. The engine runs locally and binds to loopback by default, and the webview's CSP only permits its own origin, Tauri IPC and the local dev server, so network calls happen in the Rust backend.
 
-Four features use the network, and only when used:
+**Engine setup runs automatically at startup**, whether or not you open Settings. On every launch the app detects the host and checks GitHub for the latest llama.cpp release, so one request reaches `api.github.com` even if you never download a model. It looks up Janas releases only when its managed Janas tools are missing or unusable, and it downloads a binary only when one needs installing or you press **Retry setup**. Apart from that startup check, the remaining network features are user-triggered:
 
 | Feature | What is sent | Destination |
 | --- | --- | --- |
-| Engine setup | A release-asset lookup for the detected OS/architecture, then binary downloads | `api.github.com` and GitHub release assets |
+| Engine setup | An automatic release lookup at every startup; binary downloads when an engine needs installing, or when you retry setup | `api.github.com` and GitHub release assets |
 | Model search and download | Search terms and the selected repository/file | `huggingface.co` |
 | Web search, with **Internet** on | The search query, then the result pages it reads | DuckDuckGo (Bing fallback) and those result sites |
 | Opening a citation | The URL you click | Your default browser |
@@ -421,8 +421,8 @@ New UI pieces: `chat/SessionsRail`, `chat/EnginePanel`, `chat/TelemetryPanel`,
 - `cargo test` — 143 tests pass, 0 failed; one network-dependent live-search smoke test is ignored by default.
 - `npm run appimage` — release build and AppImage bundling completed:
   - Artifact: `src-tauri/target/release/bundle/appimage/Janas Studio_0.1.1_amd64.AppImage`
-  - Size: 90,397,176 bytes (86.21 MiB)
-  - SHA-256: `59a7c0849577bc60277b8b548b581d4b127e3197375b1e7e4e35d2838f38d038`
+  - Size: 90,409,464 bytes (86.22 MiB)
+  - SHA-256: `7913aa913faebc8bb5d8167ceb0d49149006839f7c4a313aeeec6bcd7681edf9`
 - Runtime passes in an isolated profile exercised branching and version switching, per-chat drafts and MCP scope, backup restore and export/import, close-time saving, and model verify/delete. The delete confirmation now awaits the Tauri dialog, and window close flushes pending chat writes before destroying the window.
 - The Tools badge, All/None controls, zero-tools hint and scope reconciliation are covered by typecheck, unit tests and the production build; `docs/screenshots/mcp-scope.png` shows the badge, populated scope and All/None controls in the running app.
 - Engine-specific checks from earlier builds (llama.cpp Vulkan KV-cache guard, context retry, MCP schema budget, bundled binaries) remain covered by the Rust suite.
@@ -442,4 +442,4 @@ New UI pieces: `chat/SessionsRail`, `chat/EnginePanel`, `chat/TelemetryPanel`,
 
 ## License
 
-Janas Studio is released under the [GNU General Public License, version 3 only](LICENSE) (`GPL-3.0-only`).
+Janas Studio is released under the [GNU General Public License, version 3 only](LICENSE) (`GPL-3.0-only`). The AppImage bundle ships that text at `usr/share/licenses/janas-studio/LICENSE`, and the bundle metadata points at it through `bundle.licenseFile`.

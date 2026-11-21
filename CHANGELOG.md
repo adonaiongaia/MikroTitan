@@ -21,6 +21,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ### Changed
 
 - Manifest license metadata now reports `GPL-3.0-only`, matching the repository's GPL-3.0 `LICENSE`.
+- AppImage builds now bundle the full GPL-3.0 text at `usr/share/licenses/janas-studio/LICENSE`; `bundle.licenseFile` also points at the repository `LICENSE`.
 - Chat sessions moved from the old `localStorage` blob to the Rust-backed schema-v2 store.
 - Closing the window now flushes pending chat writes against a short deadline before destroying the window, so a debounced save cannot be stranded.
 - The Tools drawer's checkbox toggling now normalizes against the current server list, dropping stale IDs and preserving the all-selected state.
