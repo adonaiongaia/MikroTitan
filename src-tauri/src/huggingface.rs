@@ -19,7 +19,7 @@ use crate::{
     settings::AppSettings,
 };
 
-const USER_AGENT: &str = "Janas-Studio/0.1 (+https://github.com/prabanta-dev/janas)";
+const USER_AGENT: &str = "Studio-for-Janas/0.1 (+https://github.com/prabanta-dev/janas)";
 const HF_API: &str = "https://huggingface.co/api/models";
 const HF_RESOLVE: &str = "https://huggingface.co";
 

@@ -88,7 +88,7 @@ export function EngineLogsPanel({ engine }: { engine: EngineController }) {
         }
       : null;
     const text = [
-      "Janas Studio diagnostics",
+      "Studio for Janas diagnostics",
       `app_version: ${appVersion}`,
       `snapshot: ${JSON.stringify(engine.snapshot, null, 2)}`,
       `active_engine: ${JSON.stringify(engine.active, null, 2)}`,

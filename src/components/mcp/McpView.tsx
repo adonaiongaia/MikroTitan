@@ -278,8 +278,9 @@ export function McpView() {
                 Cancel
               </Button>
               <p className="text-[9px] text-slate-600">
-                Bundled janas-mcp needs a .jns model path in Arguments.
-                Environment values stay in local storage and are never logged.
+                The managed janas-mcp is installed by engine setup and needs a
+                .jns model path in Arguments. Environment values stay in local
+                storage and are never logged.
               </p>
             </div>
           </div>

@@ -12,7 +12,7 @@ export function Logo({ className = "h-9 w-9", withTile = true }: LogoProps) {
       viewBox="0 0 64 64"
       className={className}
       role="img"
-      aria-label="Janas Studio"
+      aria-label="Studio for Janas"
     >
       <defs>
         <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">

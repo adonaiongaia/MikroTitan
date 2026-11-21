@@ -1655,7 +1655,7 @@ pub async fn verify_local_model(
     let (ok, message) = match expected.as_deref() {
         Some(expected) if !expected.eq_ignore_ascii_case(&actual) => (
             false,
-            "Checksum mismatch. This file may be corrupt or was not downloaded by Janas Studio."
+            "Checksum mismatch. This file may be corrupt or was not downloaded by Studio for Janas."
                 .to_string(),
         ),
         Some(_) => (true, "Verified against the download checksum.".to_string()),

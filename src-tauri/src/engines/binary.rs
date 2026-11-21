@@ -441,7 +441,7 @@ pub(crate) async fn download_file(
         .connect_timeout(Duration::from_secs(20))
         .timeout(Duration::from_secs(30 * 60))
         .redirect(reqwest::redirect::Policy::limited(10))
-        .user_agent("Janas-Studio/0.1")
+        .user_agent("Studio-for-Janas/0.1")
         .build()
         .map_err(|err| AppError::message(format!("Could not build the HTTP client: {err}")))?;
 

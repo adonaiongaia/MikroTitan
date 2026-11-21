@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.1",
   "type": "module",
-  "description": "A local AI studio for the Janas inference engine",
+  "description": "An independent, unofficial desktop studio for the Janas inference engine",
   "license": "GPL-3.0-only",
   "scripts": {
     "dev": "vite --port 1420 --strictPort",

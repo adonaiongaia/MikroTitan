@@ -262,7 +262,7 @@ impl McpSession {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
                 "clientInfo": {
-                    "name": "Janas Studio",
+                    "name": "Studio for Janas",
                     "version": env!("CARGO_PKG_VERSION")
                 }
             }),

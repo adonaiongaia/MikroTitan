@@ -123,7 +123,7 @@ impl ChatStore {
         validate_id(&session.id)?;
         if session.schema_version > CURRENT_SCHEMA_VERSION {
             return Err(AppError::message(format!(
-                "That chat was written by a newer version of Janas Studio (schema {}).",
+                "That chat was written by a newer version of Studio for Janas (schema {}).",
                 session.schema_version
             )));
         }

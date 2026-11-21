@@ -2,8 +2,8 @@
 name = "janas-studio"
 version = "0.1.1"
 default-run = "janas-studio"
-description = "A local AI studio for the Janas inference engine"
-authors = ["Janas Studio"]
+description = "An independent, unofficial desktop studio for the Janas inference engine"
+authors = ["Studio for Janas contributors"]
 license = "GPL-3.0-only"
 edition = "2021"
 rust-version = "1.77.2"

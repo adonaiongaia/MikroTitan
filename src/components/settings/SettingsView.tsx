@@ -5,6 +5,7 @@ import {
   AlertTriangle,
   CheckCircle2,
   Download,
+  ExternalLink,
   FolderOpen,
   RefreshCw,
   RotateCcw,
@@ -973,11 +974,11 @@ export function SettingsView({ engine }: SettingsViewProps) {
 
         <section className="panel p-5">
           <h3 className="text-[12px] font-semibold text-white">
-            About this build
+            About Studio for Janas
           </h3>
           <div className="mt-3 space-y-2 text-[10.5px] leading-5 text-slate-500">
             <p>
-              Janas Studio is a local front end for{" "}
+              Studio for Janas is an independent, unofficial front end for{" "}
               <span className="text-slate-300">janas-server</span>, the
               OpenAI-compatible HTTP API of the Janas C inference engine. Chat
               requests stream from{" "}
@@ -988,6 +989,23 @@ export function SettingsView({ engine }: SettingsViewProps) {
               cross-origin access to the engine.
             </p>
             <p>
+              The engine is{" "}
+              <span className="text-slate-300">Janas-LLM</span> by{" "}
+              <span className="text-slate-300">Maurizio Cammalleri</span>,
+              licensed under GPL-3.0-or-later. This project is not affiliated
+              with, sponsored by or endorsed by the Janas project.
+            </p>
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() =>
+                void api.openExternal("https://github.com/prabanta-dev/janas")
+              }
+              icon={<ExternalLink className="h-3 w-3" />}
+            >
+              Janas-LLM on GitHub
+            </Button>
+            <p>
               GGUF models are downloaded from the Hugging Face Hub into your
               models folder, then rewritten into Janas's{" "}
               <span className="text-slate-300">.jns</span> format by the
@@ -995,7 +1013,8 @@ export function SettingsView({ engine }: SettingsViewProps) {
               converted file directly.
             </p>
             <p>
-              No model weights are bundled with the app. An AppImage build
+              No model weights or Janas binaries are bundled with the app; the
+              current Janas release is downloaded at startup. An AppImage build
               requires WebKitGTK 4.1 on the host, as is standard for Tauri on
               Linux.
             </p>

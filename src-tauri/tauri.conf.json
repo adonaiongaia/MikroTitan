@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Janas Studio",
+  "productName": "Studio for Janas",
   "version": "0.1.1",
   "identifier": "dev.janas.studio",
   "build": {
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Janas Studio",
+        "title": "Studio for Janas",
         "width": 1440,
         "height": 900,
         "minWidth": 1024,
@@ -34,11 +34,6 @@
     "active": true,
     "targets": ["appimage"],
     "licenseFile": "../LICENSE",
-    "resources": [
-      "binaries/janas-server",
-      "binaries/gguf2jns",
-      "binaries/janas-mcp"
-    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -47,13 +42,14 @@
       "icons/icon.ico"
     ],
     "category": "DeveloperTool",
-    "shortDescription": "A local AI studio for the Janas inference engine",
-    "longDescription": "Janas Studio runs the Janas C inference engine on your own machine. Chat with local .jns models with streaming responses, tune temperature and top-p, browse and download GGUF models from Hugging Face, and compile them into the Janas .jns format with a live build console.",
+    "shortDescription": "An independent, unofficial studio for the Janas inference engine",
+    "longDescription": "Studio for Janas is an independent, unofficial desktop studio for the Janas-LLM C inference engine by Maurizio Cammalleri. It downloads the current Janas release at startup, runs it on your own machine, streams chat from local .jns models, browses and downloads GGUF models from Hugging Face, and compiles them into the Janas .jns format with a live build console.",
     "linux": {
       "appimage": {
         "bundleMediaFramework": false,
         "files": {
-          "/usr/share/licenses/janas-studio/LICENSE": "../LICENSE"
+          "/usr/share/licenses/studio-for-janas/LICENSE": "../LICENSE",
+          "/usr/share/doc/studio-for-janas/THIRD_PARTY_NOTICES.md": "../THIRD_PARTY_NOTICES.md"
         }
       }
     }

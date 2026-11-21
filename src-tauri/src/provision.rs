@@ -1,9 +1,9 @@
 //! Automatic engine provisioning.
 //!
-//! The app ships no llama.cpp binary and its read-only AppImage mount can never
-//! be used for installs. This module runs once in the background at startup,
-//! detects the host, resolves the matching release assets, and places the
-//! engines in `app_local_data_dir()/bin`.
+//! The app ships no engine or converter binaries and its read-only AppImage
+//! mount can never be used for installs. This module runs once in the
+//! background at startup, detects the host, resolves the matching release
+//! assets, and places the tools in `app_local_data_dir()/bin`.
 //!
 //! The managed layout is deliberately the same as the one used by
 //! [`crate::engines::binary`]:
@@ -176,7 +176,7 @@ impl Provisioner {
 
     /// Detect the host and install whichever managed tools are missing. Network
     /// failures are represented in the report; they never prevent the app from
-    /// starting with its bundled Janas tools.
+    /// starting with the tools already installed in its managed bin folder.
     pub async fn run(
         &self,
         app: &AppHandle,
@@ -236,10 +236,10 @@ impl Provisioner {
         report.message = match report.status {
             SetupStatus::Ready => "Managed engines are ready.".into(),
             SetupStatus::Degraded => {
-                "One managed engine could not be provisioned; existing and bundled tools remain usable.".into()
+                "One managed engine could not be provisioned; tools already in the managed bin folder remain usable.".into()
             }
             SetupStatus::Failed => {
-                "Managed engine provisioning failed. Existing and bundled tools remain usable.".into()
+                "Managed engine provisioning failed. Tools already in the managed bin folder remain usable.".into()
             }
             SetupStatus::Idle | SetupStatus::Running => "Engine setup is still running.".into(),
         };
@@ -447,16 +447,15 @@ async fn provision_janas(
         Err(err) => {
             let message = err.to_string();
             return (
-                vec![
-                    failed_janas("janas-server", &message),
-                    failed_janas("janas-chat", &message),
-                ],
+                failed_janas_tools(&message),
                 None,
             );
         }
     };
     let server_path = bin.join("janas-server");
     let chat_path = bin.join("janas-chat");
+    let converter_path = bin.join("gguf2jns");
+    let mcp_path = bin.join("janas-mcp");
     let server_probe = if server_path.is_file() {
         run_cli_probe(&server_path, Some(&bin))
             .await
@@ -467,12 +466,16 @@ async fn provision_janas(
     };
     let needs_server = force || !server_path.is_file() || server_probe.is_none();
     let needs_chat = force || !chat_path.is_file();
+    let needs_converter = force || !converter_path.is_file();
+    let needs_mcp = force || !mcp_path.is_file();
 
-    if !needs_server && !needs_chat {
+    if !needs_server && !needs_chat && !needs_converter && !needs_mcp {
         return (
             vec![
                 present_janas("janas-server", &server_path, server_probe.and_then(|probe| probe.version_line)),
                 present_janas("janas-chat", &chat_path, None),
+                present_janas("gguf2jns", &converter_path, None),
+                present_janas("janas-mcp", &mcp_path, None),
             ],
             None,
         );
@@ -482,13 +485,15 @@ async fn provision_janas(
         Ok(Some(value)) => value,
         Ok(None) => {
             let message = format!(
-                "No pre-built Janas release archive exists for {} {}. The bundled tools remain available.",
+                "No pre-built Janas release archive exists for {} {}. Tools already in the managed bin folder remain available.",
                 profile.os, profile.arch
             );
             return (
                 vec![
                     skipped_janas("janas-server", &server_path, &message),
                     skipped_janas("janas-chat", &chat_path, &message),
+                    skipped_janas("gguf2jns", &converter_path, &message),
+                    skipped_janas("janas-mcp", &mcp_path, &message),
                 ],
                 None,
             );
@@ -497,10 +502,7 @@ async fn provision_janas(
             let message = format!("Could not resolve the latest Janas release: {err}");
             warnings.push(message.clone());
             return (
-                vec![
-                    failed_janas("janas-server", &message),
-                    failed_janas("janas-chat", &message),
-                ],
+                failed_janas_tools(&message),
                 None,
             );
         }
@@ -509,10 +511,7 @@ async fn provision_janas(
     if let Err(err) = supervisor.ensure_inactive(EngineKind::Janas).await {
         let message = err.to_string();
         return (
-            vec![
-                failed_janas("janas-server", &message),
-                failed_janas("janas-chat", &message),
-            ],
+            failed_janas_tools(&message),
             None,
         );
     }
@@ -523,10 +522,7 @@ async fn provision_janas(
             let message = format!("Invalid Janas download URL: {err}");
             warnings.push(message.clone());
             return (
-                vec![
-                    failed_janas("janas-server", &message),
-                    failed_janas("janas-chat", &message),
-                ],
+                failed_janas_tools(&message),
                 None,
             );
         }
@@ -536,10 +532,7 @@ async fn provision_janas(
         let message = format!("Could not create the Janas staging folder: {err}");
         warnings.push(message.clone());
         return (
-            vec![
-                failed_janas("janas-server", &message),
-                failed_janas("janas-chat", &message),
-            ],
+            failed_janas_tools(&message),
             None,
         );
     }
@@ -548,10 +541,7 @@ async fn provision_janas(
         let message = format!("Could not create the Janas download workspace: {err}");
         warnings.push(message.clone());
         return (
-            vec![
-                failed_janas("janas-server", &message),
-                failed_janas("janas-chat", &message),
-            ],
+            failed_janas_tools(&message),
             None,
         );
     }
@@ -561,10 +551,7 @@ async fn provision_janas(
         warnings.push(message.clone());
         let _ = tokio::fs::remove_dir_all(&work).await;
         return (
-            vec![
-                failed_janas("janas-server", &message),
-                failed_janas("janas-chat", &message),
-            ],
+            failed_janas_tools(&message),
             None,
         );
     }
@@ -575,15 +562,20 @@ async fn provision_janas(
         warnings.push(message.clone());
         let _ = tokio::fs::remove_dir_all(&work).await;
         return (
-            vec![
-                failed_janas("janas-server", &message),
-                failed_janas("janas-chat", &message),
-            ],
+            failed_janas_tools(&message),
             None,
         );
     }
 
-    let primary = if needs_server { "janas-server" } else { "janas-chat" };
+    let primary = if needs_server {
+        "janas-server"
+    } else if needs_chat {
+        "janas-chat"
+    } else if needs_converter {
+        "gguf2jns"
+    } else {
+        "janas-mcp"
+    };
     let archive_for_extract = archive.clone();
     let payload_for_extract = payload_dir.clone();
     let primary_owned = primary.to_string();
@@ -598,10 +590,7 @@ async fn provision_janas(
             warnings.push(message.clone());
             let _ = tokio::fs::remove_dir_all(&work).await;
             return (
-                vec![
-                    failed_janas("janas-server", &message),
-                    failed_janas("janas-chat", &message),
-                ],
+                failed_janas_tools(&message),
                 None,
             );
         }
@@ -610,10 +599,7 @@ async fn provision_janas(
             warnings.push(message.clone());
             let _ = tokio::fs::remove_dir_all(&work).await;
             return (
-                vec![
-                    failed_janas("janas-server", &message),
-                    failed_janas("janas-chat", &message),
-                ],
+                failed_janas_tools(&message),
                 None,
             );
         }
@@ -626,6 +612,16 @@ async fn provision_janas(
     };
     let chat_source = if needs_chat {
         binary::find_binary(&payload_dir, "janas-chat")
+    } else {
+        None
+    };
+    let converter_source = if needs_converter {
+        binary::find_binary(&payload_dir, "gguf2jns")
+    } else {
+        None
+    };
+    let mcp_source = if needs_mcp {
+        binary::find_binary(&payload_dir, "janas-mcp")
     } else {
         None
     };
@@ -700,6 +696,78 @@ async fn provision_janas(
         binaries.push(present_janas("janas-chat", &chat_path, None));
     }
 
+    if needs_converter {
+        match converter_source {
+            Some(source) => match install_janas_file(
+                app,
+                &bin,
+                "gguf2jns",
+                &source,
+                &companions,
+                false,
+            )
+            .await
+            {
+                Ok(_) => binaries.push(ProvisionedBinary {
+                    name: "gguf2jns".into(),
+                    status: ComponentStatus::Installed,
+                    path: Some(converter_path.to_string_lossy().to_string()),
+                    version: None,
+                    source: Some("github".into()),
+                    message: format!("Installed from {} ({}).", choice.tag, choice.asset),
+                }),
+                Err(err) => {
+                    let message = format!("Could not install gguf2jns: {err}");
+                    warnings.push(message.clone());
+                    binaries.push(failed_janas("gguf2jns", &message));
+                }
+            },
+            None => {
+                let message = "The Janas release archive did not contain gguf2jns.".to_string();
+                warnings.push(message.clone());
+                binaries.push(failed_janas("gguf2jns", &message));
+            }
+        }
+    } else {
+        binaries.push(present_janas("gguf2jns", &converter_path, None));
+    }
+
+    if needs_mcp {
+        match mcp_source {
+            Some(source) => match install_janas_file(
+                app,
+                &bin,
+                "janas-mcp",
+                &source,
+                &companions,
+                false,
+            )
+            .await
+            {
+                Ok(_) => binaries.push(ProvisionedBinary {
+                    name: "janas-mcp".into(),
+                    status: ComponentStatus::Installed,
+                    path: Some(mcp_path.to_string_lossy().to_string()),
+                    version: None,
+                    source: Some("github".into()),
+                    message: format!("Installed from {} ({}).", choice.tag, choice.asset),
+                }),
+                Err(err) => {
+                    let message = format!("Could not install janas-mcp: {err}");
+                    warnings.push(message.clone());
+                    binaries.push(failed_janas("janas-mcp", &message));
+                }
+            },
+            None => {
+                let message = "The Janas release archive did not contain janas-mcp.".to_string();
+                warnings.push(message.clone());
+                binaries.push(failed_janas("janas-mcp", &message));
+            }
+        }
+    } else {
+        binaries.push(present_janas("janas-mcp", &mcp_path, None));
+    }
+
     let _ = tokio::fs::remove_dir_all(&work).await;
     (binaries, Some(choice))
 }
@@ -735,6 +803,13 @@ fn failed_janas(name: &str, message: &str) -> ProvisionedBinary {
         source: None,
         message: message.into(),
     }
+}
+
+fn failed_janas_tools(message: &str) -> Vec<ProvisionedBinary> {
+    ["janas-server", "janas-chat", "gguf2jns", "janas-mcp"]
+        .iter()
+        .map(|name| failed_janas(name, message))
+        .collect()
 }
 
 async fn install_janas_file(
@@ -1277,7 +1352,7 @@ async fn github_json<T: DeserializeOwned>(path: &str) -> AppResult<T> {
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(20))
         .redirect(reqwest::redirect::Policy::limited(5))
-        .user_agent("Janas-Studio/0.1 (+https://github.com/prabanta-dev/janas)")
+        .user_agent("Studio-for-Janas/0.1 (+https://github.com/prabanta-dev/janas)")
         .build()
         .map_err(|err| AppError::message(format!("Could not build the GitHub client: {err}")))?;
     let response = client

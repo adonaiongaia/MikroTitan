@@ -397,19 +397,19 @@ pub fn expand_home(input: &str) -> PathBuf {
     PathBuf::from(trimmed)
 }
 
-/// The bundle's resource directory, set once at startup. Binaries shipped
-/// inside the AppImage are found here so the user never has to link them.
-static BUNDLED_DIR: OnceLock<PathBuf> = OnceLock::new();
+/// The app's managed `bin` directory, set once at startup. Tools downloaded
+/// from the current Janas release are found here, so bare names work without
+/// the user having to link them or add the folder to PATH.
+static MANAGED_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-pub fn set_bundled_dir(path: PathBuf) {
-    let _ = BUNDLED_DIR.set(path);
+pub fn set_managed_dir(path: PathBuf) {
+    let _ = MANAGED_DIR.set(path);
 }
 
-fn bundled_binary(name: &str) -> Option<PathBuf> {
-    let dir = BUNDLED_DIR.get()?;
-    [dir.join(name), dir.join("binaries").join(name)]
-        .into_iter()
-        .find(|candidate| candidate.is_file())
+fn managed_binary(name: &str) -> Option<PathBuf> {
+    let dir = MANAGED_DIR.get()?;
+    let candidate = dir.join(name);
+    candidate.is_file().then_some(candidate)
 }
 
 /// Resolve a binary specified either as a path or as a bare name on PATH.
@@ -437,7 +437,7 @@ pub fn resolve_binary(input: &str) -> Option<PathBuf> {
         }
     }
     for name in &names {
-        if let Some(full) = bundled_binary(name) {
+        if let Some(full) = managed_binary(name) {
             return Some(full);
         }
     }
