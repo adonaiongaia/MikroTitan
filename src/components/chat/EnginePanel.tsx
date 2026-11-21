@@ -87,6 +87,10 @@ interface EngineForm {
   janas_kv_cache: string;
   llama_gpu_layers: number;
   llama_ctx_size: number;
+  llama_mtp_mode: string;
+  llama_mtp_path: string;
+  llama_draft_path: string;
+  llama_drafts_on: string;
   llama_flash_attn: string;
   llama_kv_cache_k: string;
   llama_kv_cache_v: string;
@@ -113,6 +117,10 @@ function formFrom(settings: AppSettings | null): EngineForm {
     janas_kv_cache: settings?.janas_kv_cache ?? "auto",
     llama_gpu_layers: settings?.llama_gpu_layers ?? 0,
     llama_ctx_size: settings?.llama_ctx_size ?? 16384,
+    llama_mtp_mode: settings?.llama_mtp_mode ?? "auto",
+    llama_mtp_path: settings?.llama_mtp_path ?? "",
+    llama_draft_path: settings?.llama_draft_path ?? "",
+    llama_drafts_on: settings?.llama_drafts_on ?? "auto",
     llama_flash_attn: settings?.llama_flash_attn ?? "auto",
     llama_kv_cache_k: settings?.llama_kv_cache_k ?? "f16",
     llama_kv_cache_v: settings?.llama_kv_cache_v ?? "f16",
@@ -812,6 +820,49 @@ function LlamaRuntimeSection({
         KV quantization cuts cache memory, and some models only accept f16 for
         V.
       </p>
+      <div className="space-y-2.5 rounded-xl border border-white/5 bg-white/[0.02] p-2.5">
+        <SelectField
+          label="MTP / speculation"
+          value={form.llama_mtp_mode}
+          onChange={(value) => update("llama_mtp_mode", value)}
+          options={[
+            ["auto", "Auto · llama.cpp default"],
+            ["off", "Off · --spec-type none"],
+            ["mtp", "MTP · --spec-type draft-mtp"],
+          ]}
+        />
+        {form.llama_mtp_mode === "mtp" ? (
+          <TextField
+            label="MTP head file"
+            value={form.llama_mtp_path}
+            onChange={(value) => update("llama_mtp_path", value)}
+            placeholder="optional mtp-*.gguf"
+          />
+        ) : null}
+        <TextField
+          label="Draft model"
+          value={form.llama_draft_path}
+          onChange={(value) => update("llama_draft_path", value)}
+          placeholder="optional small same-family .gguf"
+        />
+        <SelectField
+          label="Drafts on"
+          value={form.llama_drafts_on}
+          onChange={(value) => update("llama_drafts_on", value)}
+          options={[
+            ["auto", "Auto · llama.cpp decides"],
+            ["cpu", "CPU · draft device none"],
+            ["gpu", "GPU · all draft layers"],
+          ]}
+        />
+        <p className="text-[10px] leading-4 text-slate-600">
+          Auto passes the draft model and lets llama.cpp detect the type. MTP
+          uses the heads inside the main model; the head file is only needed
+          when they ship in a separate GGUF, and placement only applies once a
+          draft model or head file is loaded. The two paths share one slot, so
+          set just one.
+        </p>
+      </div>
       <div className="space-y-2.5 rounded-xl border border-white/5 bg-white/[0.02] p-2.5">
         <Toggle
           checked={form.llama_direct_cpu_moe}

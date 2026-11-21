@@ -8,6 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- **Speculative decoding and MTP for llama.cpp.** The llama engine now mirrors the Janas speculation settings: an MTP/speculation mode (`--spec-type draft-mtp` or `none`), an optional MTP head GGUF, a draft model (`--spec-draft-model`), and draft placement (`--spec-draft-device none` or `--spec-draft-ngl all`). The adapter only emits the flags the probed build advertises and rejects a missing or non-GGUF draft file instead of launching without it.
 - **Branching chat history.** Editing a user turn or regenerating a reply now keeps the old continuation as an archived branch. Previous/next arrows switch sibling versions, and **Branch** creates a new chat from a selected message's prefix.
 - **Schema-v2 Rust chat store.** Each chat is stored as one JSON file under the app data directory. Saves are atomic, a previous version is kept per chat, images are extracted to `assets/<chat-id>/`, and orphaned images can be cleaned up.
 - **Chat history backups.** Settings → Chat history and backups shows store sizes, exports and imports the whole shelf, restores a chat's previous version, and exposes storage maintenance.

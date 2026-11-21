@@ -61,6 +61,19 @@ pub struct AppSettings {
     /// Optional `--mmproj` GGUF. llama.cpp needs this vision projector to
     /// accept image content parts in chat requests.
     pub llama_mmproj_path: String,
+    /// llama.cpp only: `--spec-type draft-mtp` uses the multi-token-prediction
+    /// heads that ship with the selected model. "auto" leaves the build's own
+    /// default (no speculation), "off" passes `--spec-type none`.
+    pub llama_mtp_mode: String,
+    /// llama.cpp only: MTP heads that live in a separate GGUF. It is handed to
+    /// llama.cpp as the speculative draft model alongside `draft-mtp`.
+    pub llama_mtp_path: String,
+    /// llama.cpp only: `--spec-draft-model`, a smaller same-family GGUF used
+    /// for speculative decoding.
+    pub llama_draft_path: String,
+    /// llama.cpp only: where the draft model runs. "auto", "cpu"
+    /// (`--spec-draft-device none`) or "gpu" (`--spec-draft-ngl all`).
+    pub llama_drafts_on: String,
     /// llama-server's loopback port. Kept separate from Janas's port so the
     /// two engines can be switched without editing the other configuration.
     pub llama_port: u16,
@@ -119,6 +132,10 @@ impl Default for AppSettings {
             janas_kv_cache: "auto".into(),
             llama_model_path: String::new(),
             llama_mmproj_path: String::new(),
+            llama_mtp_mode: "auto".into(),
+            llama_mtp_path: String::new(),
+            llama_draft_path: String::new(),
+            llama_drafts_on: "auto".into(),
             llama_port: 8081,
             llama_gpu_layers: 0,
             llama_ctx_size: 16_384,
@@ -170,6 +187,13 @@ impl AppSettings {
         self.llama_ctx_size = self.llama_ctx_size.clamp(512, 1_048_576);
         self.janas_attention = normalize_janas_attention(&self.janas_attention);
         self.janas_kv_cache = normalize_janas_kv_cache(&self.janas_kv_cache);
+        self.mtp_mode = normalize_janas_mtp_mode(&self.mtp_mode);
+        self.llama_mtp_mode = normalize_llama_mtp_mode(&self.llama_mtp_mode);
+        self.llama_drafts_on = normalize_draft_placement(&self.llama_drafts_on);
+        self.mtp_path = self.mtp_path.trim().to_string();
+        self.draft_path = self.draft_path.trim().to_string();
+        self.llama_mtp_path = self.llama_mtp_path.trim().to_string();
+        self.llama_draft_path = self.llama_draft_path.trim().to_string();
         self.llama_flash_attn = normalize_flash_attn(&self.llama_flash_attn);
         self.llama_kv_cache_k = normalize_kv_cache(&self.llama_kv_cache_k);
         self.llama_kv_cache_v = normalize_kv_cache(&self.llama_kv_cache_v);
@@ -204,6 +228,37 @@ pub fn normalize_flash_attn(value: &str) -> String {
     match value.trim().to_ascii_lowercase().as_str() {
         "on" => "on".into(),
         "off" => "off".into(),
+        _ => "auto".into(),
+    }
+}
+
+/// Janas keeps its own three-way `--mtp` switch: auto, `--no-mtp`, or an
+/// explicit MTP block file.
+pub fn normalize_janas_mtp_mode(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" | "no" => "off".into(),
+        "file" => "file".into(),
+        _ => "auto".into(),
+    }
+}
+
+/// llama.cpp enables MTP through `--spec-type draft-mtp`. A stored Janas-style
+/// "file" value still means "use MTP" here, because llama.cpp takes the MTP
+/// heads as its speculative draft model.
+pub fn normalize_llama_mtp_mode(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" | "no" => "off".into(),
+        "mtp" | "file" | "on" | "draft-mtp" => "mtp".into(),
+        _ => "auto".into(),
+    }
+}
+
+/// llama.cpp only moves a whole draft model, so its placement is a narrower
+/// choice than Janas's `--drafts-on` device list.
+pub fn normalize_draft_placement(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "cpu" => "cpu".into(),
+        "gpu" => "gpu".into(),
         _ => "auto".into(),
     }
 }

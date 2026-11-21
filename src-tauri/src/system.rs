@@ -1681,8 +1681,13 @@ pub fn delete_local_model(
 ) -> AppResult<u64> {
     let settings = store.get();
     let target = validate_model_file(&settings, &path)?;
-    let active = [settings.model_path.as_str(), settings.llama_model_path.as_str()]
-        .iter()
+    let active = [
+        settings.model_path.as_str(),
+        settings.llama_model_path.as_str(),
+        settings.llama_draft_path.as_str(),
+        settings.llama_mtp_path.as_str(),
+    ]
+    .iter()
         .filter(|value| !value.trim().is_empty())
         .filter_map(|value| expand_home(value).canonicalize().ok())
         .any(|active| active == target);

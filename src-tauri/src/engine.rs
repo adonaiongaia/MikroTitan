@@ -1997,6 +1997,45 @@ mod tests {
     }
 
     #[test]
+    fn janas_mtp_and_draft_settings_reach_the_command_line() {
+        let args_of = |settings: &AppSettings| -> String {
+            let mut command = Command::new("janas-server");
+            apply_engine_settings(&mut command, settings);
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().to_string())
+                .collect::<Vec<String>>()
+                .join(" ")
+        };
+
+        // Auto is the engine's own default: no speculation flags are added.
+        let mut settings = AppSettings::default();
+        let auto = args_of(&settings);
+        assert!(!auto.contains("--mtp"));
+        assert!(!auto.contains("--draft"));
+
+        // Off asks janas-server to disable MTP explicitly.
+        settings.mtp_mode = "off".into();
+        assert!(args_of(&settings).contains("--no-mtp"));
+
+        // A block file, a draft model and the draft device are all forwarded.
+        settings.mtp_mode = "file".into();
+        settings.mtp_path = "~/models/model-mtp.jns".into();
+        settings.draft_path = "~/models/draft.jns".into();
+        settings.drafts_on = "npu+gpu".into();
+        let args = args_of(&settings);
+        assert!(args.contains("--mtp"));
+        assert!(args.contains("model-mtp.jns"));
+        assert!(args.contains("--draft"));
+        assert!(args.contains("draft.jns"));
+        assert!(args.contains("--drafts-on npu+gpu"));
+
+        // llama.cpp's speculative flags are a separate engine surface.
+        assert!(!args.contains("--spec-type"));
+        assert!(!args.contains("--spec-draft-model"));
+    }
+
+    #[test]
     fn reads_context_limits_from_both_engine_error_shapes() {
         let llama = r#"{"error":{"code":400,"message":"request (74373 tokens) exceeds the available context size (16384 tokens)","type":"exceed_context_size_error","n_prompt_tokens":74373,"n_ctx":16384}}"#;
         assert_eq!(context_limit_from_error(llama), Some(16_384));

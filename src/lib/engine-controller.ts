@@ -50,6 +50,23 @@ export function llamaRuntimePreview(settings: AppSettings): string[] {
   if (settings.llama_mmproj_path.trim()) {
     args.push("--mmproj", settings.llama_mmproj_path.trim());
   }
+  if (settings.llama_mtp_mode === "mtp") {
+    args.push("--spec-type", "draft-mtp");
+  } else if (settings.llama_mtp_mode === "off") {
+    args.push("--spec-type", "none");
+  }
+  const draftModel =
+    settings.llama_mtp_mode === "mtp"
+      ? settings.llama_mtp_path.trim() || settings.llama_draft_path.trim()
+      : settings.llama_draft_path.trim() || settings.llama_mtp_path.trim();
+  if (draftModel) {
+    args.push("--spec-draft-model", draftModel);
+    if (settings.llama_drafts_on === "cpu") {
+      args.push("--spec-draft-device", "none");
+    } else if (settings.llama_drafts_on === "gpu") {
+      args.push("--spec-draft-ngl", "all");
+    }
+  }
   if (settings.llama_direct_cpu_moe) {
     args.push(
       "--cpu-moe",

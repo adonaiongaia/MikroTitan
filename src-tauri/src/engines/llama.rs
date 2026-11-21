@@ -55,6 +55,16 @@ pub struct LlamaLayout {
     /// This build advertises the PR #30966 MoE cache pipeline: host experts,
     /// a device-side cache, and CPU execution for the cache misses.
     pub moe_cache_cpu_share: bool,
+    /// This build advertises `--spec-type`, which is where `draft-mtp` and
+    /// `none` are selected. Older builds only take a draft model.
+    pub spec_type: bool,
+    /// The speculative draft-model flag this build uses, if it has one.
+    pub draft_model_flag: Option<&'static str>,
+    /// Where a draft model runs: `--spec-draft-device` or `--device-draft`.
+    pub draft_device_flag: Option<&'static str>,
+    /// How many draft layers live on the GPU: `--spec-draft-ngl` or an older
+    /// `--gpu-layers-draft` alias.
+    pub draft_ngl_flag: Option<&'static str>,
 }
 
 pub struct LlamaRunner;
@@ -464,6 +474,10 @@ fn layout_for(output: &ProbeOutput, settings: &AppSettings) -> (LlamaLayout, Vec
                 alias: false,
                 mmproj_flag,
                 moe_cache_cpu_share: false,
+                spec_type: false,
+                draft_model_flag: None,
+                draft_device_flag: None,
+                draft_ngl_flag: None,
             },
             warnings,
         );
@@ -535,6 +549,55 @@ fn layout_for(output: &ProbeOutput, settings: &AppSettings) -> (LlamaLayout, Vec
     let alias = advertises(help, "--alias");
     let moe_cache_cpu_share = advertises(help, "--moe-cache-mib")
         && advertises(help, "--moe-cache-cpu-share");
+    let spec_type = advertises(help, "--spec-type");
+    let draft_model_flag = if advertises(help, "--spec-draft-model") {
+        Some("--spec-draft-model")
+    } else if advertises(help, "--model-draft") {
+        Some("--model-draft")
+    } else if advertises(help, "-md") {
+        Some("-md")
+    } else {
+        None
+    };
+    let draft_device_flag = if advertises(help, "--spec-draft-device") {
+        Some("--spec-draft-device")
+    } else if advertises(help, "--device-draft") {
+        Some("--device-draft")
+    } else {
+        None
+    };
+    let draft_ngl_flag = if advertises(help, "--spec-draft-ngl") {
+        Some("--spec-draft-ngl")
+    } else if advertises(help, "--gpu-layers-draft") {
+        Some("--gpu-layers-draft")
+    } else if advertises(help, "--n-gpu-layers-draft") {
+        Some("--n-gpu-layers-draft")
+    } else {
+        None
+    };
+    if settings::normalize_llama_mtp_mode(&settings.llama_mtp_mode) == "mtp" && !spec_type {
+        warnings.push(
+            "This llama-server build does not advertise `--spec-type`, so MTP heads cannot be enabled. Update llama.cpp or use a plain draft model."
+                .into(),
+        );
+    }
+    let draft_configured = !settings.llama_mtp_path.trim().is_empty()
+        || !settings.llama_draft_path.trim().is_empty();
+    if draft_configured && draft_model_flag.is_none() {
+        warnings.push(
+            "This llama-server build does not advertise a speculative draft-model flag; the selected MTP head file or draft model will be ignored."
+                .into(),
+        );
+    }
+    if settings::normalize_draft_placement(&settings.llama_drafts_on) != "auto"
+        && draft_device_flag.is_none()
+        && draft_ngl_flag.is_none()
+    {
+        warnings.push(
+            "This llama-server build does not advertise draft placement flags; the draft placement setting will be ignored."
+                .into(),
+        );
+    }
 
     if !kv_cache
         && (settings::normalize_kv_cache(&settings.llama_kv_cache_k) != "f16"
@@ -591,6 +654,10 @@ fn layout_for(output: &ProbeOutput, settings: &AppSettings) -> (LlamaLayout, Vec
             alias,
             mmproj_flag,
             moe_cache_cpu_share,
+            spec_type,
+            draft_model_flag,
+            draft_device_flag,
+            draft_ngl_flag,
         },
         warnings,
     )
@@ -598,6 +665,28 @@ fn layout_for(output: &ProbeOutput, settings: &AppSettings) -> (LlamaLayout, Vec
 
 fn build_label(build: Option<u64>) -> String {
     build.map(|value| format!(" (b{value})")).unwrap_or_default()
+}
+
+/// Draft models and MTP heads are loaded as a second GGUF, so they get the
+/// same existence and extension checks as the main model.
+fn validate_spec_model(raw: &str, label: &str) -> AppResult<PathBuf> {
+    let path = settings::expand_home(raw);
+    if !path.is_file() {
+        return Err(AppError::message(format!(
+            "The llama.cpp {label} does not exist: {}. Choose it in Settings → llama.cpp.",
+            path.display()
+        )));
+    }
+    if !path
+        .extension()
+        .map(|extension| extension.eq_ignore_ascii_case("gguf"))
+        .unwrap_or(false)
+    {
+        return Err(AppError::message(format!(
+            "The llama.cpp {label} must be a .gguf file that matches the selected model."
+        )));
+    }
+    Ok(path)
 }
 
 fn build_args(
@@ -739,6 +828,100 @@ fn build_args(
         if cache_v != "f16" {
             args.push("--cache-type-v".into());
             args.push(cache_v);
+        }
+    }
+
+    // Speculative decoding. Janas exposes `--mtp` / `--no-mtp` plus `--draft`
+    // and `--drafts-on`; llama.cpp splits the same ideas across `--spec-type`,
+    // its single draft-model slot and the draft placement flags.
+    let mtp_path = settings.llama_mtp_path.trim();
+    let draft_path = settings.llama_draft_path.trim();
+    if !mtp_path.is_empty() && !draft_path.is_empty() {
+        return Err(AppError::message(
+            "Choose either an MTP head file or a draft model, not both: llama.cpp has one speculative draft slot.",
+        ));
+    }
+
+    let spec_mode = settings::normalize_llama_mtp_mode(&settings.llama_mtp_mode);
+    let mut draft_model: Option<PathBuf> = None;
+    let mut spec_kind: Option<&str> = None;
+    match spec_mode.as_str() {
+        "off" => {
+            if !mtp_path.is_empty() || !draft_path.is_empty() {
+                warnings.push(
+                    "MTP / speculation is Off, so the selected MTP head file or draft model is not used. Choose Auto or MTP to enable it."
+                        .into(),
+                );
+            }
+            spec_kind = Some("none");
+        }
+        "mtp" => {
+            let raw = if !mtp_path.is_empty() {
+                mtp_path
+            } else {
+                draft_path
+            };
+            if !raw.is_empty() {
+                draft_model = Some(validate_spec_model(raw, "MTP head file")?);
+            }
+            spec_kind = Some("draft-mtp");
+        }
+        _ => {
+            let raw = if !draft_path.is_empty() {
+                draft_path
+            } else {
+                mtp_path
+            };
+            if !raw.is_empty() {
+                draft_model = Some(validate_spec_model(raw, "speculative draft model")?);
+            }
+        }
+    }
+
+    if layout.spec_type {
+        if let Some(kind) = spec_kind {
+            if !extra_has("--spec-type") {
+                args.push("--spec-type".into());
+                args.push(kind.into());
+            }
+        }
+    }
+
+    let has_draft_model = draft_model.is_some();
+    if let Some(path) = draft_model {
+        if let Some(flag) = layout.draft_model_flag {
+            let overridden = extra_has("--spec-draft-model")
+                || extra_has("-md")
+                || extra_has("--model-draft");
+            if !overridden {
+                args.push(flag.into());
+                args.push(path.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    if has_draft_model {
+        match settings::normalize_draft_placement(&settings.llama_drafts_on).as_str() {
+            "cpu" => {
+                if let Some(flag) = layout.draft_device_flag {
+                    if !extra_has("--spec-draft-device") && !extra_has("--device-draft") {
+                        args.push(flag.into());
+                        args.push("none".into());
+                    }
+                }
+            }
+            "gpu" => {
+                if let Some(flag) = layout.draft_ngl_flag {
+                    if !extra_has("--spec-draft-ngl")
+                        && !extra_has("--gpu-layers-draft")
+                        && !extra_has("--n-gpu-layers-draft")
+                    {
+                        args.push(flag.into());
+                        args.push("all".into());
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1044,6 +1227,10 @@ mod tests {
             alias: true,
             mmproj_flag: Some("--mmproj"),
             moe_cache_cpu_share: false,
+            spec_type: false,
+            draft_model_flag: None,
+            draft_device_flag: None,
+            draft_ngl_flag: None,
         };
         let result = build_args(&settings, &layout);
         assert!(result.is_err());
@@ -1078,6 +1265,10 @@ mod tests {
             alias: true,
             mmproj_flag: Some("--mmproj"),
             moe_cache_cpu_share: false,
+            spec_type: false,
+            draft_model_flag: None,
+            draft_device_flag: None,
+            draft_ngl_flag: None,
         };
         let (args, warnings) = build_args(&settings, &layout).expect("args");
         let joined = args.join(" ");
@@ -1118,11 +1309,99 @@ mod tests {
             alias: true,
             mmproj_flag: Some("--mmproj"),
             moe_cache_cpu_share: false,
+            spec_type: false,
+            draft_model_flag: None,
+            draft_device_flag: None,
+            draft_ngl_flag: None,
         };
         let (args, warnings) = build_args(&settings, &layout).expect("args");
         let joined = args.join(" ");
         assert!(joined.contains(&format!("--mmproj {}", projector.to_string_lossy())));
         assert!(warnings.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn speculative_flags_follow_the_mtp_and_draft_settings() {
+        let dir = std::env::temp_dir().join(format!(
+            "janas-llama-spec-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create test directory");
+        let model = dir.join("model.gguf");
+        let draft = dir.join("draft.gguf");
+        std::fs::write(&model, b"GGUF-test").expect("write test model");
+        std::fs::write(&draft, b"GGUF-draft").expect("write test draft model");
+        let draft_text = draft.to_string_lossy().to_string();
+
+        let layout = LlamaLayout {
+            adapter: "test".into(),
+            model_flag: "--model",
+            ctx_flag: Some("--ctx-size"),
+            ngl_flag: Some("--n-gpu-layers"),
+            flash: FlashSyntax::Choice,
+            kv_cache: true,
+            metrics: true,
+            jinja: true,
+            top_k: true,
+            alias: true,
+            mmproj_flag: Some("--mmproj"),
+            moe_cache_cpu_share: false,
+            spec_type: true,
+            draft_model_flag: Some("--spec-draft-model"),
+            draft_device_flag: Some("--spec-draft-device"),
+            draft_ngl_flag: Some("--spec-draft-ngl"),
+        };
+
+        let mut settings = AppSettings::default();
+        settings.llama_model_path = model.to_string_lossy().to_string();
+        settings.llama_draft_path = draft_text.clone();
+        settings.llama_drafts_on = "cpu".into();
+
+        // Auto leaves the type to llama.cpp, which detects it from the model.
+        let (args, warnings) = build_args(&settings, &layout).expect("args");
+        let joined = args.join(" ");
+        assert!(!joined.contains("--spec-type"));
+        assert!(joined.contains(&format!("--spec-draft-model {draft_text}")));
+        assert!(joined.contains("--spec-draft-device none"));
+        assert!(warnings.is_empty());
+
+        // MTP keeps the heads inside the main model. Nothing is offloaded
+        // separately, so no draft-model or draft-placement flag is emitted.
+        settings.llama_mtp_mode = "mtp".into();
+        settings.llama_draft_path.clear();
+        settings.llama_drafts_on = "gpu".into();
+        let (args, _) = build_args(&settings, &layout).expect("args");
+        let joined = args.join(" ");
+        assert!(joined.contains("--spec-type draft-mtp"));
+        assert!(!joined.contains("--spec-draft-model"));
+        assert!(!joined.contains("--spec-draft-ngl"));
+
+        // A separate MTP head file takes the draft-model slot and can be placed.
+        settings.llama_mtp_path = draft_text.clone();
+        let (args, _) = build_args(&settings, &layout).expect("args");
+        let joined = args.join(" ");
+        assert!(joined.contains(&format!("--spec-draft-model {draft_text}")));
+        assert!(joined.contains("--spec-draft-ngl all"));
+
+        // Both slots at once is a configuration error, not a silent choice.
+        settings.llama_draft_path = draft_text.clone();
+        assert!(build_args(&settings, &layout).is_err());
+        settings.llama_draft_path.clear();
+
+        // Off disables speculation even when a file is still selected.
+        settings.llama_mtp_mode = "off".into();
+        let (args, warnings) = build_args(&settings, &layout).expect("args");
+        let joined = args.join(" ");
+        assert!(joined.contains("--spec-type none"));
+        assert!(!joined.contains("--spec-draft-model"));
+        assert!(warnings.iter().any(|warning| warning.contains("Off")));
+
+        // A missing draft file is reported instead of launching without it.
+        settings.llama_mtp_mode = "mtp".into();
+        settings.llama_mtp_path = dir.join("missing.gguf").to_string_lossy().to_string();
+        assert!(build_args(&settings, &layout).is_err());
+
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1150,6 +1429,10 @@ mod tests {
             alias: true,
             mmproj_flag: Some("--mmproj"),
             moe_cache_cpu_share: true,
+            spec_type: false,
+            draft_model_flag: None,
+            draft_device_flag: None,
+            draft_ngl_flag: None,
         };
         let (args, warnings) = build_args(&settings, &layout).expect("args");
         let joined = args.join(" ");
@@ -1187,6 +1470,10 @@ mod tests {
             alias: true,
             mmproj_flag: Some("--mmproj"),
             moe_cache_cpu_share: true,
+            spec_type: false,
+            draft_model_flag: None,
+            draft_device_flag: None,
+            draft_ngl_flag: None,
         };
         let (args, _) = build_args(&settings, &layout).expect("args");
         let count = |flag: &str| args.iter().filter(|argument| *argument == flag).count();
@@ -1224,6 +1511,10 @@ mod tests {
             alias: true,
             mmproj_flag: Some("--mmproj"),
             moe_cache_cpu_share: false,
+            spec_type: false,
+            draft_model_flag: None,
+            draft_device_flag: None,
+            draft_ngl_flag: None,
         };
         let (args, _) = build_args(&settings, &layout).expect("args");
         let joined = args.join(" ");

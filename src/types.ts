@@ -168,6 +168,14 @@ export interface AppSettings {
   janas_kv_cache: "auto" | "8" | "16" | string;
   llama_model_path: string;
   llama_mmproj_path: string;
+  /** llama.cpp: --spec-type draft-mtp / none, or auto to keep the build's default. */
+  llama_mtp_mode: "auto" | "off" | "mtp" | string;
+  /** llama.cpp: optional MTP head GGUF, used as the speculative draft model. */
+  llama_mtp_path: string;
+  /** llama.cpp: --spec-draft-model, a smaller same-family GGUF. */
+  llama_draft_path: string;
+  /** llama.cpp: where the draft runs: auto, cpu (--spec-draft-device none) or gpu. */
+  llama_drafts_on: "auto" | "cpu" | "gpu" | string;
   llama_port: number;
   llama_gpu_layers: number;
   llama_ctx_size: number;

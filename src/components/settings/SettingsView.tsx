@@ -161,7 +161,11 @@ export function SettingsView({ engine }: SettingsViewProps) {
   };
 
   const pickLlamaFile = async (
-    key: "llama_model_path" | "llama_mmproj_path",
+    key:
+      | "llama_model_path"
+      | "llama_mmproj_path"
+      | "llama_mtp_path"
+      | "llama_draft_path",
   ) => {
     try {
       const picked = await open({
@@ -489,6 +493,90 @@ export function SettingsView({ engine }: SettingsViewProps) {
               Leave empty for text-only models. Image input needs both this
               projector and a vision-capable GGUF model.
             </p>
+          </Row>
+
+          <Row
+            label="MTP / speculation"
+            hint="--spec-type: MTP uses the model's multi-token-prediction heads. Auto keeps llama.cpp's default; Off sends --spec-type none."
+          >
+            <select
+              value={form.llama_mtp_mode}
+              onChange={(event) =>
+                update("llama_mtp_mode", event.target.value)
+              }
+              className="field font-mono text-[11px]"
+            >
+              <option value="auto">auto</option>
+              <option value="off">off</option>
+              <option value="mtp">mtp</option>
+            </select>
+          </Row>
+
+          <Row
+            label="MTP head file"
+            hint="Optional --spec-draft-model with MTP. Only needed when the MTP heads ship as a separate .gguf instead of inside the main model."
+          >
+            <div className="flex gap-2">
+              <input
+                value={form.llama_mtp_path}
+                onChange={(event) =>
+                  update("llama_mtp_path", event.target.value)
+                }
+                placeholder="/models/mtp-model.gguf"
+                className="field flex-1 font-mono text-[11px]"
+                spellCheck={false}
+              />
+              <Button
+                size="icon"
+                variant="secondary"
+                className="h-10 w-10"
+                onClick={() => void pickLlamaFile("llama_mtp_path")}
+                aria-label="Browse for an MTP head GGUF"
+                icon={<FolderOpen className="h-4 w-4" />}
+              />
+            </div>
+          </Row>
+
+          <Row
+            label="Draft model"
+            hint="--spec-draft-model: a smaller same-family GGUF that drafts tokens for speculative decoding. It shares llama.cpp's single draft slot with the MTP head file, so set just one."
+          >
+            <div className="flex gap-2">
+              <input
+                value={form.llama_draft_path}
+                onChange={(event) =>
+                  update("llama_draft_path", event.target.value)
+                }
+                placeholder="/models/qwen3-0.6b-q4_k_m.gguf"
+                className="field flex-1 font-mono text-[11px]"
+                spellCheck={false}
+              />
+              <Button
+                size="icon"
+                variant="secondary"
+                className="h-10 w-10"
+                onClick={() => void pickLlamaFile("llama_draft_path")}
+                aria-label="Browse for a draft GGUF"
+                icon={<FolderOpen className="h-4 w-4" />}
+              />
+            </div>
+          </Row>
+
+          <Row
+            label="Draft placement"
+            hint="Auto lets llama.cpp decide; CPU sends --spec-draft-device none, GPU keeps all draft layers on the GPU with --spec-draft-ngl all."
+          >
+            <select
+              value={form.llama_drafts_on}
+              onChange={(event) =>
+                update("llama_drafts_on", event.target.value)
+              }
+              className="field font-mono text-[11px]"
+            >
+              <option value="auto">auto</option>
+              <option value="cpu">cpu</option>
+              <option value="gpu">gpu</option>
+            </select>
           </Row>
 
           <Row
