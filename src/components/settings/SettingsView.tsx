@@ -250,7 +250,7 @@ export function SettingsView({ engine }: SettingsViewProps) {
   const resetDefaults = async () => {
     if (!form) return;
     const confirmed = await ask(
-      "Reset all settings to their defaults?\n\nThis clears binary and model paths, the local API key, ports and runtime flags in the form. Your models folder is kept. Nothing is saved until you click Save changes.",
+      "Reset all settings to their defaults?\n\nThis clears binary and model paths, the local API key, the Hugging Face token, ports and runtime flags in the form. Your models folder is kept. Nothing is saved until you click Save changes.",
       { title: "Reset settings", kind: "warning" },
     );
     if (!confirmed) return;
@@ -878,6 +878,33 @@ export function SettingsView({ engine }: SettingsViewProps) {
                 onClick={() => void pickDirectory()}
                 aria-label="Browse for a models folder"
                 icon={<FolderOpen className="h-4 w-4" />}
+              />
+            </div>
+          </Row>
+
+          <Row
+            label="Hugging Face access token"
+            hint="Optional. Required for gated or private repositories. Stored locally and only sent to huggingface.co."
+          >
+            <div className="flex gap-2">
+              <input
+                type="password"
+                value={form.hf_token}
+                onChange={(event) => update("hf_token", event.target.value)}
+                className="field flex-1 font-mono text-[11px]"
+                placeholder="hf_… (leave empty for public models)"
+                autoComplete="off"
+                spellCheck={false}
+              />
+              <Button
+                size="icon"
+                variant="secondary"
+                className="h-10 w-10"
+                onClick={() =>
+                  void api.openExternal("https://huggingface.co/settings/tokens")
+                }
+                aria-label="Open Hugging Face token settings"
+                icon={<ExternalLink className="h-4 w-4" />}
               />
             </div>
           </Row>

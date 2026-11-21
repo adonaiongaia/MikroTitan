@@ -85,6 +85,7 @@ export function EngineLogsPanel({ engine }: { engine: EngineController }) {
       ? {
           ...settings,
           api_key: settings.api_key ? "[redacted]" : "",
+          hf_token: settings.hf_token ? "[redacted]" : "",
         }
       : null;
     const text = [

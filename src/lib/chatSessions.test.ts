@@ -96,6 +96,7 @@ describe("normalizeSession", () => {
       workspace_root: "/tmp/workspace",
       mcp_server_ids: ["mcp-1"],
       mcp_server_names: { "mcp-1": "Files" },
+      system_prompt: "You are a careful reviewer.",
     });
     expect(normalized?.archived_messages?.[0].content).toBe("old");
     expect(normalized?.draft?.text).toBe("half written");
@@ -104,6 +105,8 @@ describe("normalizeSession", () => {
     expect(normalized?.workspace_root).toBe("/tmp/workspace");
     expect(normalized?.mcp_server_ids).toEqual(["mcp-1"]);
     expect(normalized?.mcp_server_names).toEqual({ "mcp-1": "Files" });
+    expect(normalized?.system_prompt).toBe("You are a careful reviewer.");
+    expect(normalizeSession(session([]))?.system_prompt).toBeUndefined();
   });
 
   it("keeps an empty MCP scope distinct from all servers", () => {

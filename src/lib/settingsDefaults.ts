@@ -12,6 +12,7 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   model_path: "",
   extra_args: "",
   api_key: "",
+  hf_token: "",
   ctx_size: 16_384,
   cache_gib: 0,
   mtp_mode: "auto",

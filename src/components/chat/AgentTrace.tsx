@@ -30,7 +30,7 @@ export interface AgentActions {
   approve: (
     runId: string,
     stepId: string,
-    options?: { allowEdits?: boolean },
+    options?: { allowEdits?: boolean; alwaysAllow?: boolean },
   ) => void | Promise<void>;
   reject: (runId: string, stepId: string, feedback: string) => void | Promise<void>;
   abort: (runId: string) => void | Promise<void>;
@@ -338,6 +338,7 @@ function ApprovalCard({
 }) {
   const [feedback, setFeedback] = useState("");
   const [allowEdits, setAllowEdits] = useState(false);
+  const [alwaysAllow, setAlwaysAllow] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
 
   const run = async (label: string, action: () => void | Promise<void>) => {
@@ -426,13 +427,32 @@ function ApprovalCard({
           </label>
         ) : null}
 
+        {pending.can_always_allow ? (
+          <label className="mt-2 flex cursor-pointer items-center gap-1.5 text-[9.5px] text-slate-400">
+            <input
+              type="checkbox"
+              checked={alwaysAllow}
+              onChange={(event) => setAlwaysAllow(event.target.checked)}
+              className="h-3 w-3 accent-acid-400"
+            />
+            Always allow this command here
+            <span className="text-slate-600">
+              · also covers the same command with extra arguments; irreversible
+              and sensitive commands still ask
+            </span>
+          </label>
+        ) : null}
+
         <div className="mt-3 flex items-center gap-1.5">
           <button
             type="button"
             disabled={busy !== null}
             onClick={() =>
               void run("approve", () =>
-                actions.approve(runId, pending.step_id, { allowEdits }),
+                actions.approve(runId, pending.step_id, {
+                  allowEdits,
+                  alwaysAllow,
+                }),
               )
             }
             className="inline-flex h-7 flex-1 items-center justify-center gap-1.5 rounded-lg bg-acid-400 px-2 text-[10px] font-medium text-ink-950 transition hover:bg-acid-300 disabled:opacity-50"
@@ -721,6 +741,7 @@ export function AgentTraceView({ trace, streaming, actions }: AgentTraceProps) {
 
       {trace.pending ? (
         <ApprovalCard
+          key={trace.pending.step_id}
           runId={trace.run_id}
           pending={trace.pending}
           actions={actions}

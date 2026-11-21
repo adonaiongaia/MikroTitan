@@ -211,4 +211,10 @@ export const api = {
     invoke<string[]>("agent_undo_availability", { run_ids: runIds }),
   agentUndoState: (runId: string) =>
     invoke<AgentUndoResult>("agent_undo_state", { run_id: runId }),
+  agentApprovalRules: (workspace: string) =>
+    invoke<string[]>("agent_approval_rules", { workspace }),
+  forgetApprovalRule: (workspace: string, command: string) =>
+    invoke<string[]>("agent_forget_approval_rule", { workspace, command }),
+  clearApprovalRules: (workspace: string) =>
+    invoke<string[]>("agent_clear_approval_rules", { workspace }),
 };

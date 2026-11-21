@@ -30,6 +30,9 @@ pub struct AppSettings {
     pub extra_args: String,
     /// Optional `--api-key` for the local server. Never leaves this machine.
     pub api_key: String,
+    /// Optional Hugging Face access token for gated or private repositories.
+    /// It is only sent to huggingface.co, never logged, and stored locally.
+    pub hf_token: String,
     /// `--ctx`: context window in tokens.
     pub ctx_size: u32,
     /// `--cache`: GiB reserved for streamed experts. 0 means automatic.
@@ -117,6 +120,7 @@ impl Default for AppSettings {
             model_path: String::new(),
             extra_args: String::new(),
             api_key: String::new(),
+            hf_token: String::new(),
             ctx_size: 16_384,
             cache_gib: 0.0,
             mtp_mode: "auto".into(),
@@ -202,6 +206,11 @@ impl AppSettings {
         self.llama_mmproj_path = self.llama_mmproj_path.trim().to_string();
         self.llama_extra_args = self.llama_extra_args.trim().to_string();
         self.ssd_cache_dir = self.ssd_cache_dir.trim().to_string();
+        self.hf_token = self.hf_token.trim().to_string();
+        // Tokens never contain whitespace. Strip line breaks and spaces from a
+        // pasted value so the HTTP header builder cannot reject it.
+        self.hf_token
+            .retain(|character| !character.is_whitespace() && !character.is_control());
         self.top_k = self.top_k.clamp(1, 100);
     }
 
@@ -380,9 +389,32 @@ impl SettingsStore {
             return;
         };
         let tmp = self.path.with_extension("json.tmp");
-        if fs::write(&tmp, json).is_ok() {
-            let _ = fs::rename(&tmp, &self.path);
+        if fs::write(&tmp, &json).is_ok() {
+            // The local API key and Hugging Face token live here, so restrict
+            // the temporary file before it is renamed into place.
+            restrict_owner_only(&tmp);
+            if fs::rename(&tmp, &self.path).is_err() {
+                // Windows cannot rename over an existing file; write the
+                // existing path directly and clean up the temporary file.
+                let _ = fs::write(&self.path, &json);
+                let _ = fs::remove_file(&tmp);
+            }
         }
+        restrict_owner_only(&self.path);
+    }
+}
+
+/// Keep the settings file and its temporary copy readable only by the owner
+/// where POSIX modes are available.
+fn restrict_owner_only(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
     }
 }
 
@@ -595,5 +627,43 @@ pub fn scan_models(dir: &str, extra_file: Option<&str>, max_depth: usize) -> Vec
 
     found.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hugging_face_token_is_trimmed_and_single_line() {
+        let mut settings = AppSettings::default();
+        settings.hf_token = " hf_abc\n def\t ".into();
+        settings.normalize();
+        assert_eq!(settings.hf_token, "hf_abcdef");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settings_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "janas-settings-perms-{}-{}",
+            std::process::id(),
+            crate::util::now_ms()
+        ));
+        let config = root.join("config");
+        let store = SettingsStore::load(config.clone(), root.join("data"))
+            .expect("settings store should load");
+        store.save(store.get()).expect("settings should save");
+
+        let path = config.join("settings.json");
+        let mode = fs::metadata(&path)
+            .expect("settings file")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "settings may contain secrets");
+        let _ = fs::remove_dir_all(&root);
+    }
 }
 

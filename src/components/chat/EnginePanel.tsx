@@ -10,7 +10,9 @@ import {
   Loader2,
   MemoryStick,
   Play,
+  Plus,
   Save,
+  ShieldCheck,
   SlidersHorizontal,
   Sparkles,
   Trash2,
@@ -18,8 +20,9 @@ import {
   Zap,
 } from "lucide-react";
 
+import { api } from "../../lib/api";
 import { cn } from "../../lib/cn";
-import { basename, formatBytes } from "../../lib/format";
+import { basename, errorMessage, formatBytes } from "../../lib/format";
 import { useBackendCapabilities } from "../../hooks/useBackendCapabilities";
 import { SAMPLING_PARAMETERS } from "../../lib/backendCapabilities";
 import type {
@@ -30,6 +33,7 @@ import type {
   EnginePreferences,
   EngineStatus,
   EngineTelemetry,
+  Persona,
 } from "../../types";
 import { Slider } from "../ui/Slider";
 import { GpuOffloadControl } from "../ui/GpuOffloadControl";
@@ -63,6 +67,14 @@ interface EnginePanelProps {
   workspaceLocked: boolean;
   systemPrompt: string;
   onSystemPromptChange: (value: string) => void;
+  usingDefaultPrompt: boolean;
+  onUseDefaultPrompt: () => void;
+  onMakeDefaultPrompt: () => void;
+  personas: Persona[];
+  onAddPersona: (name: string, prompt: string) => Persona | null;
+  onDeletePersona: (id: string) => void;
+  workspaceRoot: string;
+  approvalRulesVersion: number;
   usage: ChatUsage | null;
   elapsedMs: number | null;
   firstTokenMs: number | null;
@@ -160,6 +172,14 @@ export function EnginePanel({
   workspaceLocked,
   systemPrompt,
   onSystemPromptChange,
+  usingDefaultPrompt,
+  onUseDefaultPrompt,
+  onMakeDefaultPrompt,
+  personas,
+  onAddPersona,
+  onDeletePersona,
+  workspaceRoot,
+  approvalRulesVersion,
   usage,
   elapsedMs,
   firstTokenMs,
@@ -171,6 +191,12 @@ export function EnginePanel({
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [resetting, setResetting] = useState(false);
+  const [personaId, setPersonaId] = useState("");
+  const [personaOpen, setPersonaOpen] = useState(false);
+  const [personaName, setPersonaName] = useState("");
+  const selectedPersona = personas.find(
+    (persona) => persona.id === personaId && persona.prompt === systemPrompt,
+  );
 
   useEffect(() => {
     setForm(formFrom(settings));
@@ -443,6 +469,8 @@ export function EnginePanel({
           onUpdate={onAgentUpdate}
           onPickWorkspace={onPickWorkspace}
           workspaceLocked={workspaceLocked}
+          workspaceRoot={workspaceRoot}
+          approvalRulesVersion={approvalRulesVersion}
         />
 
         <section className="space-y-3">
@@ -659,7 +687,24 @@ export function EnginePanel({
         )}
 
         <section className="space-y-2">
-          <SectionTitle>System prompt</SectionTitle>
+          <div className="flex items-center gap-2">
+            <SectionTitle>System prompt</SectionTitle>
+            <span
+              className={cn(
+                "ml-auto rounded-full border px-1.5 py-0.5 text-[8px] uppercase tracking-wider",
+                usingDefaultPrompt
+                  ? "border-white/10 bg-white/[0.03] text-slate-500"
+                  : "border-acid-400/25 bg-acid-400/10 text-acid-300/90",
+              )}
+              title={
+                usingDefaultPrompt
+                  ? "This chat follows the saved default prompt."
+                  : "This chat has its own system prompt."
+              }
+            >
+              {usingDefaultPrompt ? "default" : "this chat"}
+            </span>
+          </div>
           <textarea
             rows={4}
             value={systemPrompt}
@@ -667,6 +712,105 @@ export function EnginePanel({
             placeholder="Persistent instructions sent before every conversation…"
             className="field resize-none text-[11px] leading-5"
           />
+          <div className="flex items-center gap-1.5">
+            <select
+              value={selectedPersona?.id ?? ""}
+              onChange={(event) => {
+                const id = event.target.value;
+                setPersonaId(id);
+                const persona = personas.find((entry) => entry.id === id);
+                if (persona) onSystemPromptChange(persona.prompt);
+              }}
+              className="field min-w-0 flex-1 !px-2 !py-1.5 text-[10px]"
+            >
+              <option value="">Insert a persona…</option>
+              {personas.map((persona) => (
+                <option key={persona.id} value={persona.id}>
+                  {persona.name}
+                </option>
+              ))}
+            </select>
+            {selectedPersona ? (
+              <button
+                type="button"
+                onClick={() => {
+                  onDeletePersona(selectedPersona.id);
+                  setPersonaId("");
+                }}
+                className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-white/10 bg-white/5 text-slate-500 transition hover:text-rose-300"
+                aria-label="Delete the selected persona"
+                title="Delete this persona"
+              >
+                <Trash2 className="h-3 w-3" />
+              </button>
+            ) : null}
+            <button
+              type="button"
+              onClick={() => setPersonaOpen((value) => !value)}
+              disabled={!systemPrompt.trim()}
+              className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-white/10 bg-white/5 text-slate-400 transition hover:text-slate-200 disabled:opacity-40"
+              aria-label="Save the current prompt as a persona"
+              title="Save this prompt as a persona"
+            >
+              <Plus className="h-3 w-3" />
+            </button>
+          </div>
+          {personaOpen ? (
+            <div className="flex items-center gap-1.5">
+              <input
+                value={personaName}
+                onChange={(event) => setPersonaName(event.target.value)}
+                placeholder="Persona name"
+                className="field min-w-0 flex-1 !px-2 !py-1.5 text-[10px]"
+              />
+              <button
+                type="button"
+                onClick={() => {
+                  const persona = onAddPersona(personaName, systemPrompt);
+                  if (persona) setPersonaId(persona.id);
+                  setPersonaName("");
+                  setPersonaOpen(false);
+                }}
+                disabled={!systemPrompt.trim()}
+                className="inline-flex h-7 shrink-0 items-center rounded-lg bg-acid-400 px-2 text-[10px] font-medium text-ink-950 transition hover:bg-acid-300 disabled:opacity-40"
+              >
+                Save
+              </button>
+              <button
+                type="button"
+                onClick={() => setPersonaOpen(false)}
+                className="inline-flex h-7 shrink-0 items-center rounded-lg border border-white/10 bg-white/5 px-2 text-[10px] text-slate-400 transition hover:text-slate-200"
+              >
+                Cancel
+              </button>
+            </div>
+          ) : null}
+          <div className="flex items-center gap-2">
+            {!usingDefaultPrompt ? (
+              <>
+                <button
+                  type="button"
+                  onClick={onUseDefaultPrompt}
+                  className="text-[9.5px] text-slate-500 underline-offset-2 transition hover:text-slate-300 hover:underline"
+                >
+                  Use default
+                </button>
+                <button
+                  type="button"
+                  onClick={onMakeDefaultPrompt}
+                  disabled={!systemPrompt.trim()}
+                  className="text-[9.5px] text-slate-500 underline-offset-2 transition hover:text-slate-300 hover:underline disabled:opacity-40"
+                >
+                  Make default
+                </button>
+              </>
+            ) : null}
+          </div>
+          <p className="text-[10px] leading-4 text-slate-600">
+            {usingDefaultPrompt
+              ? "This chat follows the saved default. Editing here gives it its own prompt; new chats keep the default."
+              : "This chat has its own prompt. Other chats and new chats keep the saved default."}
+          </p>
         </section>
 
         <div className="space-y-2 rounded-xl border border-white/5 bg-white/[0.02] p-2.5">
@@ -921,6 +1065,8 @@ function AgentConfiguration({
   onUpdate,
   onPickWorkspace,
   workspaceLocked,
+  workspaceRoot,
+  approvalRulesVersion,
 }: {
   preferences: AgentPreferences;
   onUpdate: <K extends keyof AgentPreferences>(
@@ -929,8 +1075,56 @@ function AgentConfiguration({
   ) => void;
   onPickWorkspace: () => Promise<void>;
   workspaceLocked: boolean;
+  workspaceRoot: string;
+  approvalRulesVersion: number;
 }) {
   const [open, setOpen] = useState(true);
+  const [remembered, setRemembered] = useState<string[]>([]);
+  const [rulesError, setRulesError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!workspaceRoot.trim()) {
+      setRemembered([]);
+      setRulesError(null);
+      return;
+    }
+    void api
+      .agentApprovalRules(workspaceRoot)
+      .then((rules) => {
+        if (!cancelled) {
+          setRemembered(rules);
+          setRulesError(null);
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setRemembered([]);
+          setRulesError(errorMessage(err));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [workspaceRoot, approvalRulesVersion]);
+
+  const forgetRule = async (command: string) => {
+    try {
+      setRemembered(await api.forgetApprovalRule(workspaceRoot, command));
+      setRulesError(null);
+    } catch (err) {
+      setRulesError(errorMessage(err));
+    }
+  };
+
+  const clearRules = async () => {
+    try {
+      setRemembered(await api.clearApprovalRules(workspaceRoot));
+      setRulesError(null);
+    } catch (err) {
+      setRulesError(errorMessage(err));
+    }
+  };
 
   return (
     <section className="space-y-3">
@@ -985,8 +1179,8 @@ function AgentConfiguration({
               {preferences.approvalPolicy === "auto"
                 ? "Every normal tool runs without pausing. Irreversible commands and sensitive paths still ask. Use only in a workspace you trust."
                 : preferences.approvalPolicy === "all"
-                  ? "Writes, shell commands and MCP tools pause for approval. Read-only tools run automatically."
-                  : "Read-only tools run automatically. Writes, shell commands and MCP tools pause for approval."}
+                  ? "Writes, shell and MCP tools pause for approval, except shell commands you remembered for this workspace. Read-only tools run automatically."
+                  : "Read-only tools run automatically. Writes, shell and MCP tools pause unless the shell command is remembered for this workspace."}
             </span>
             {preferences.approvalPolicy !== "auto" ? (
               <span className="block text-[10px] leading-4 text-slate-600">
@@ -1003,6 +1197,76 @@ function AgentConfiguration({
               secrets before it reaches the trace or model.
             </span>
           </label>
+
+          <div className="space-y-1.5 rounded-lg border border-white/5 bg-white/[0.02] p-2">
+            <div className="flex items-center gap-1.5">
+              <ShieldCheck className="h-3 w-3 shrink-0 text-slate-600" />
+              <span className="text-[10px] text-slate-500">
+                Remembered commands
+              </span>
+              {remembered.length ? (
+                <button
+                  type="button"
+                  onClick={() => void clearRules()}
+                  className="ml-auto text-[9px] text-slate-500 transition hover:text-rose-300"
+                >
+                  Clear all
+                </button>
+              ) : null}
+            </div>
+            {workspaceRoot.trim() ? (
+              <>
+                <p
+                  className="truncate font-mono text-[8.5px] text-slate-600"
+                  title={workspaceRoot}
+                >
+                  {workspaceRoot}
+                </p>
+                {remembered.length ? (
+                  <div className="space-y-1">
+                    {remembered.map((command) => (
+                      <div
+                        key={command}
+                        className="flex items-center gap-1.5 rounded-md border border-white/5 bg-white/[0.02] px-2 py-1"
+                      >
+                        <code
+                          className="min-w-0 flex-1 truncate font-mono text-[9.5px] text-slate-300"
+                          title={command}
+                        >
+                          {command}
+                        </code>
+                        <button
+                          type="button"
+                          onClick={() => void forgetRule(command)}
+                          className="shrink-0 text-slate-600 transition hover:text-rose-300"
+                          aria-label={`Forget ${command}`}
+                          title="Forget this command"
+                        >
+                          <X className="h-3 w-3" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-[9px] leading-4 text-slate-600">
+                    Nothing remembered yet. Approving a shell command with
+                    “Always allow this command here” adds it to this workspace.
+                    Rules match the same command with extra arguments; compound
+                    commands and commands containing likely secrets never match.
+                  </p>
+                )}
+              </>
+            ) : (
+              <p className="text-[9px] leading-4 text-slate-600">
+                Choose a workspace folder to see the commands remembered there.
+              </p>
+            )}
+            {rulesError ? (
+              <p className="text-[9px] leading-4 text-rose-300/80">
+                {rulesError}
+              </p>
+            ) : null}
+          </div>
 
           <label className="block space-y-1">
             <span className="block text-[10px] text-slate-500">

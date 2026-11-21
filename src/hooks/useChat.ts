@@ -634,6 +634,7 @@ export function useChat() {
               risk: event.payload.risk,
               reason: event.payload.reason,
               file_edit: Boolean(event.payload.file_edit),
+              can_always_allow: Boolean(event.payload.can_always_allow),
               preview: event.payload.preview ?? null,
               workspace_root:
                 event.payload.workspace_root ?? trace.workspace_root,
@@ -1458,6 +1459,19 @@ export function useChat() {
     [updateActiveSession],
   );
 
+  /** `null` clears the override so the chat falls back to the default prompt. */
+  const setSessionSystemPrompt = useCallback(
+    (prompt: string | null) => {
+      updateActiveSession((session) => {
+        const next = { ...session };
+        if (prompt === null) delete next.system_prompt;
+        else next.system_prompt = prompt;
+        return next;
+      });
+    },
+    [updateActiveSession],
+  );
+
   const setSessionMcpServerIds = useCallback(
     (ids: string[] | undefined, servers: McpServerConfig[] = []) => {
       updateActiveSession((session) => ({
@@ -1684,6 +1698,7 @@ export function useChat() {
     clearDraft,
     setSessionProject,
     setSessionWorkspace,
+    setSessionSystemPrompt,
     setSessionMcpServerIds,
     reconcileMcpScopes,
     switchVersion,

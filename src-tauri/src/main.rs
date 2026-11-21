@@ -333,13 +333,19 @@ fn cancel_conversion(
 }
 
 #[tauri::command]
-async fn search_models(request: SearchRequest) -> AppResult<Vec<HfModel>> {
-    huggingface::search(request).await
+async fn search_models(
+    store: State<'_, Arc<SettingsStore>>,
+    request: SearchRequest,
+) -> AppResult<Vec<HfModel>> {
+    huggingface::search(request, &store.get().hf_token).await
 }
 
 #[tauri::command]
-async fn list_model_quants(repo: String) -> AppResult<Vec<HfQuant>> {
-    huggingface::list_quants(repo).await
+async fn list_model_quants(
+    store: State<'_, Arc<SettingsStore>>,
+    repo: String,
+) -> AppResult<Vec<HfQuant>> {
+    huggingface::list_quants(repo, &store.get().hf_token).await
 }
 
 #[tauri::command]
@@ -400,6 +406,9 @@ fn main() {
             app.manage(Arc::new(DownloadManager::new()));
             app.manage(Arc::new(agent::AgentManager::with_checkpoints(
                 data_dir.join("agent-checkpoints"),
+            )));
+            app.manage(Arc::new(agent::ApprovalRuleStore::load(
+                data_dir.join("agent-approvals.json"),
             )));
 
             // Provisioning is intentionally silent and off the UI thread. The
@@ -480,6 +489,9 @@ fn main() {
             provision::rerun_engine_setup,
             agent::agent_start,
             agent::agent_resolve_approval,
+            agent::agent_approval_rules,
+            agent::agent_forget_approval_rule,
+            agent::agent_clear_approval_rules,
             agent::agent_abort,
             agent::agent_undo,
             agent::agent_undo_file,

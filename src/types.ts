@@ -148,6 +148,8 @@ export interface AppSettings {
   model_path: string;
   extra_args: string;
   api_key: string;
+  /** Optional Hugging Face token for gated or private repositories. */
+  hf_token: string;
   /** --ctx: token window the server allocates. */
   ctx_size: number;
   /** --cache: GiB reserved for streamed experts; 0 is automatic. */
@@ -289,6 +291,8 @@ export interface ChatSession {
   mcp_server_ids?: string[];
   /** Server names captured with the scope, used to remap re-created servers. */
   mcp_server_names?: Record<string, string>;
+  /** Per-chat instructions; undefined falls back to the saved default. */
+  system_prompt?: string;
 }
 
 export interface ChatOutboundMessage {
@@ -698,6 +702,8 @@ export interface AgentPendingApproval {
   reason: string;
   /** write_file/edit_file, which can be allowed for the rest of the run. */
   file_edit?: boolean;
+  /** True when this shell command can be remembered for the workspace. */
+  can_always_allow?: boolean;
   preview?: AgentDiffPreview | null;
   /** Canonical root pinned for this run. */
   workspace_root?: string;
@@ -783,6 +789,8 @@ export interface AgentApprovalReply {
   feedback: string;
   /** Only meaningful with "approve"; never applies to shell or MCP tools. */
   allow_file_edits?: boolean;
+  /** Remember this shell command for the current workspace. */
+  always_allow?: boolean;
 }
 
 export interface AgentPlanEvent {
@@ -819,8 +827,16 @@ export interface AgentApprovalEvent {
   risk: AgentRisk;
   reason: string;
   file_edit: boolean;
+  can_always_allow?: boolean;
   preview?: AgentDiffPreview | null;
   workspace_root?: string | null;
+}
+
+/** A saved system prompt that can be applied to a chat. */
+export interface Persona {
+  id: string;
+  name: string;
+  prompt: string;
 }
 
 export type AgentUndoState =

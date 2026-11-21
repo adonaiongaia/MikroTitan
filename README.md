@@ -2,7 +2,7 @@
 
 **An independent, unofficial desktop studio for the [Janas-LLM](https://github.com/prabanta-dev/janas) C inference engine.**
 
-A local AI studio with **agent mode**, branching chat history, per-chat workspaces and MCP tool scopes, crash-safe session storage, and three themes.
+A local AI studio with **agent mode**, branching chat history, per-chat workspaces, system prompts and MCP tool scopes, crash-safe session storage, and three themes.
 
 Studio for Janas is built with **Tauri 2**, **Rust**, **React 18**, **TypeScript**, and **Tailwind CSS**. It manages the `janas-server` process, proxies its OpenAI-compatible SSE stream into the webview, browses GGUF repositories on Hugging Face, and drives `janas-convert` / upstream `gguf2jns` with a live console.
 
@@ -16,9 +16,11 @@ The engine is **Janas-LLM** by **Maurizio Cammalleri**, licensed under [GPL-3.0-
 
 ## Highlights
 
-- **Agent mode** — a bounded Think → Act → Observe loop with workspace tools, a live trace, risk-aware approvals, planning, auto-compaction, verification and per-file undo.
+- **Agent mode** — a bounded Think → Act → Observe loop with workspace tools, a live trace, risk-aware approvals (including per-workspace remembered commands), planning, auto-compaction, verification and per-file undo.
 - **Branching chats** — edit a prompt or regenerate a reply without losing the old path; switch versions with arrows or branch a new chat from any message.
-- **Per-chat context** — drafts, project bundles, workspace roots and MCP tool scopes follow the chat instead of the window.
+- **Per-chat context** — drafts, project bundles, workspace roots, system prompts and MCP tool scopes follow the chat instead of the window.
+- **Persona library** — save a prompt as a reusable persona; chats without their own prompt inherit a separate saved default.
+- **Gated models** — an optional Hugging Face access token unlocks gated and private repositories without affecting public downloads.
 - **Crash-safe history** — one JSON file per chat, schema v2, atomic writes, automatic previous-version backups, image assets on disk, and export/import/restore.
 - **MCP scope controls** — a Tools badge, All/None controls, per-chat server selection, and automatic reconciliation when servers are removed or re-created.
 - **Three themes** — Acid, Ember and Tide.
@@ -49,14 +51,14 @@ See [CHANGELOG.md](CHANGELOG.md) for the release history.
 
 ## Privacy and network access
 
-Studio for Janas has no accounts, analytics, crash reporting or telemetry upload. Chat history, images, project bundles and memory facts are written to the local app data directory, and runtime settings to the platform config directory; small UI preferences such as the theme and agent defaults live in local storage. The engine runs locally and binds to loopback by default, and the webview's CSP only permits its own origin, Tauri IPC and the local dev server, so network calls happen in the Rust backend.
+Studio for Janas has no accounts, analytics, crash reporting or telemetry upload. Chat history, images, project bundles and memory facts are written to the local app data directory, and runtime settings to the platform config directory; small UI preferences such as the theme, agent defaults, the saved default system prompt and personas live in local storage. The settings file (which may contain the local API key and Hugging Face token) and the agent approval-rule file are restricted to the owner on Unix. The engine runs locally and binds to loopback by default, and the webview's CSP only permits its own origin, Tauri IPC and the local dev server, so network calls happen in the Rust backend.
 
 **Engine setup runs automatically at startup**, whether or not you open Settings. On every launch the app detects the host and checks GitHub for the latest llama.cpp release, so one request reaches `api.github.com` even if you never download a model. It looks up Janas releases only when its managed Janas tools are missing or unusable, and it downloads a binary only when one needs installing or you press **Retry setup**. Apart from that startup check, the remaining network features are user-triggered:
 
 | Feature | What is sent | Destination |
 | --- | --- | --- |
 | Engine setup | An automatic release lookup at every startup; binary downloads when an engine needs installing, or when you retry setup | `api.github.com` and GitHub release assets |
-| Model search and download | Search terms and the selected repository/file | `huggingface.co` |
+| Model search and download | Search terms, the selected repository/file, and the optional Hugging Face token when one is configured | `huggingface.co` |
 | Web search, with **Internet** on | The search query, then the result pages it reads | DuckDuckGo (Bing fallback) and those result sites |
 | Opening a citation | The URL you click | Your default browser |
 
@@ -73,6 +75,7 @@ The composer's **Agent** toggle turns a chat into a bounded tool-running loop. I
 - Built-in workspace tools: `read_file`, `write_file`, `edit_file`, `list_directory`, `search_files` and `run_command`. `web_search` is exposed only when the Internet toggle is on; enabled MCP tools in the chat's scope join the same tool list.
 - **Workspace root:** file, search and shell tools stay disabled until a folder is chosen. A run pins that folder and cannot switch while it is active or has pending undo state. Each chat can override the global workspace, and `AGENTS.md` or `.janas/instructions.md` in the workspace is injected into the agent prompt.
 - **Approval policies:** *destructive* (read-only tools run automatically; writes, shell and MCP ask), *all* (everything except reads asks), or *full auto*. Irreversible commands (force-push, hard reset, recursive delete, publishing, `curl | sh`) and sensitive paths (`.env`, `.git`, SSH keys, cloud credentials) always ask, even under full auto. Tool output is scrubbed for likely secrets before it reaches the trace or model.
+- **Remembered commands:** an approval card can remember one plain shell command for the current workspace. The rule covers the same command with extra arguments, but never compound commands, commands the secret scrubber recognises, irreversible commands or sensitive paths. Rules are stored per canonical workspace in `agent-approvals.json` and can be revoked individually or cleared in Engine Settings → Agent configuration. MCP tools are not covered.
 - **File-edit shortcut:** approving a `write_file` or `edit_file` with “allow file edits for this run” skips later file-edit prompts for that run; shell and MCP calls remain gated.
 - **Diff previews:** file-edit approvals show a bounded diff with added and removed line counts before you approve or reject.
 - **Planning and limits:** an optional `<plan>` checklist before the first tool call, a 1–25 iteration cap, optional auto-compaction at a configurable share of the context window, and an optional verification command that runs after edits and before the agent may finish.
@@ -86,9 +89,10 @@ The composer's **Agent** toggle turns a chat into a bounded tool-running loop. I
 - **Chat sessions rail** (left, collapsible) with multiple chats, search, rename, pinning, per-chat deletion, per-chat import/export, and a **Memory** tab.
 - **Rust-backed chat store (schema v2):** each chat is one JSON file under the app data directory, with images extracted to `assets/<chat-id>/`. Saves are atomic and keep one previous version per chat. Settings → Chat history and backups exposes size stats, whole-shelf export/import, restore of the previous version, and orphaned-image cleanup.
 - **Branching and version history:** editing a user turn or regenerating a reply preserves the old suffix as an archived branch. Previous/next arrows switch sibling versions; **Branch** creates a new chat from the selected message's prefix. Branches inherit the source chat's project, workspace and MCP scope but not its draft.
-- **Per-chat drafts and context:** composer text and pending images are saved per chat and restored after restart. Attached projects, workspace roots and MCP server scopes are also per chat, while sampling settings remain global. A debounced save plus close-time flush keeps pending edits from being lost when the window closes.
+- **Per-chat drafts and context:** composer text and pending images are saved per chat and restored after restart. Attached projects, workspace roots, system prompts and MCP server scopes are also per chat, while sampling settings remain global. A debounced save plus close-time flush keeps pending edits from being lost when the window closes.
+- **Per-chat system prompt and personas:** the system prompt panel shows whether the chat is using the saved default or its own prompt. **Use default** clears the override, **Make default** copies the current prompt into the default for new and unmodified chats, and **Save as persona** stores a reusable prompt in a machine-local persona library. Personas can be applied to a chat or deleted; deleting one does not alter chats that already use its text. Branches inherit the source chat's prompt.
 - **Token-aware context budget**: every send reserves space for the reply, keeps the system prompt and current turn, trims attached project/web context first, then drops or truncates the oldest turns until the prompt fits the **context the running engine was actually launched with**, not an edited setting that has not been restarted. If the current message and system prompt alone cannot fit, the send is stopped before it is added to the transcript, and the input stays editable. The Rust proxy is also a safety net: if either server still returns HTTP 400 with its context size, the prompt is rebuilt around the current turn and retried once automatically. MCP tool definitions count as prompt input too; when an enabled server's schema cannot fit, the turn runs without those tools and the app explains why instead of sending an impossible request.
-- **Engine Settings** (right, collapsible): temperature, top-p, top-k, min-p, repeat penalty, max reply, thinking mode, structured JSON output, context-prefetch window, LRU/LFU eviction, and a system prompt — all applied per request. Sampling controls the active engine does not advertise are hidden at runtime. Server runtime flags are edited here too: `--ctx`, `--cache`, `--mtp` / `--no-mtp`, draft model, `--prompt-on` / `--reply-on` / `--drafts-on`, `--npu-int8`, `--mode`, plus Janas's `JANAS_ATTN` and `JANAS_KV` overrides, with an explicit restart action. When llama.cpp is active, the panel also has the llama-only Direct CPU MoE Compute toggle, `--cpu-moe` / `--moe-cache-mib` / `--moe-cache-cpu-share` launch pipeline, and `--threads` cap; those values never reach Janas. A trash button in the header restores the sampling, context and runtime defaults and clears the editable system prompt; Settings also has a Reset defaults action that loads the AppSettings defaults into the form for review before Save changes.
+- **Engine Settings** (right, collapsible): temperature, top-p, top-k, min-p, repeat penalty, max reply, thinking mode, structured JSON output, context-prefetch window, LRU/LFU eviction, and the active chat's system prompt — all applied per request. Sampling controls the active engine does not advertise are hidden at runtime. Server runtime flags are edited here too: `--ctx`, `--cache`, `--mtp` / `--no-mtp`, draft model, `--prompt-on` / `--reply-on` / `--drafts-on`, `--npu-int8`, `--mode`, plus Janas's `JANAS_ATTN` and `JANAS_KV` overrides, with an explicit restart action. When llama.cpp is active, the panel also has the llama-only Direct CPU MoE Compute toggle, `--cpu-moe` / `--moe-cache-mib` / `--moe-cache-cpu-share` launch pipeline, and `--threads` cap; those values never reach Janas. A trash button in the header restores the sampling, context and runtime defaults, clears the active chat's prompt and clears the saved default; Settings also has a Reset defaults action that loads the AppSettings defaults into the form for review before Save changes.
 - **System Telemetry** (bottom, collapsible): a separate **prompt-read** and **reply-write** token ticker, SSD read throughput and IOPS sampled from the engine's `/proc/<pid>/io`, RSS/CPU, GPU/NPU counters from sysfs when the driver exposes them, an estimated RAM-vs-disk layer split, an expert-routing heatmap, and a 64 MB storage benchmark that warns when a drive will bottleneck 48 GB or 70 B+ mixtures.
 - **Composer**: a context-window ring next to Send, image attachments with a patch-token estimate, drag-and-drop project ingestion, and an Internet toggle.
 - **Internet pipeline**: DuckDuckGo (with a Bing fallback) → top three pages fetched and converted to text → bundled with the prompt as numbered `[S1]` evidence. A live ticker reports each stage, and the reply carries clickable source badges that open in the system browser.
@@ -101,6 +105,7 @@ The composer's **Agent** toggle turns a chat into a bounded tool-running loop. I
 
 - **Download pause/resume** in the download dialog and the tray; pausing keeps the stream open and resume continues from the same byte.
 - **RAM/VRAM estimate** and destination preview for every quantization before download.
+- **Gated repositories:** Settings has an optional Hugging Face access token. When set, it is sent only to `huggingface.co` on search, tree/checksum and download requests, so gated or private GGUF repositories work. A 401/403 explains whether to accept the model's licence or add a token; public models keep working without one.
 - **Model Library** view: local `.jns`/`.gguf` files with architecture, parameter count, publisher, size and quantization, plus one-click activation. Thinking and Tools badges come from a GGUF chat template when present, otherwise from the model family/name; the badge tooltip says which source was used.
 - **Integrity checks and cleanup:** verify any local model against the SHA-256 recorded in the download manifest, with a clear result when no upstream checksum was recorded. Delete a model with an awaited confirmation; the action is blocked while that file is the active model.
 - **MCP Server Hub**: register stdio servers with arguments, per-server environment variables and an optional working directory. Probes allow 30 seconds for startup, capture stderr and report early exits. Enabled servers' tools are namespaced into the chat model's tool list, executed through the same stdio session during the turn, and shown in the activity drawer. Per-server auto-approve skips the approval card for normal chat tool calls.
@@ -110,7 +115,7 @@ The composer's **Agent** toggle turns a chat into a bounded tool-running loop. I
 ### Appearance, settings and history
 
 - **Themes:** Acid (lime/graphite), Ember (copper/soot) and Tide (cyan/deep water), selectable in Settings and persisted locally.
-- **Agent configuration:** max iterations, approval policy, workspace root, planning step, auto-compaction threshold and verification command live in the Engine Settings panel.
+- **Agent configuration:** max iterations, approval policy, workspace root, remembered commands, planning step, auto-compaction threshold and verification command live in the Engine Settings panel.
 - **Chat history and backups:** live size statistics, per-chat previous versions with restore, whole-shelf export/import, and orphaned-image cleanup.
 - **Reset defaults:** the Engine Settings trash action restores sampling, context and runtime defaults and clears the editable system prompt; Settings also previews AppSettings defaults before saving.
 
@@ -118,7 +123,7 @@ The composer's **Agent** toggle turns a chat into a bounded tool-running loop. I
 
 ### Chat runtime
 
-- Global system prompt, persisted locally.
+- Per-chat system prompt with a saved default, persisted locally; saved personas can be applied from the prompt panel.
 - Temperature (0.0–2.0) and Top-P (0.0–1.0) sliders included in every request payload.
 - Live status pill for all four engine states.
 - Streaming markdown chat with reasoning blocks, copy actions, stop generation, and token/timing stats.
@@ -127,6 +132,7 @@ The composer's **Agent** toggle turns a chat into a bounded tool-running loop. I
 ### Hugging Face explorer
 
 - Live search against `https://huggingface.co/api/models`, with a GGUF-only filter and download/likes metadata.
+- Optional access token for gated or private repositories, stored locally and only attached to `huggingface.co` requests.
 - Enriches results by reading each repository's tree API, showing real GGUF quantizations, file counts, and byte sizes.
 - Download dialog picks a quantization, shows destination paths, and streams to disk with aggregate progress.
 - Downloads run in Rust, are cancellable, and emit `download://progress`.
@@ -141,9 +147,9 @@ The composer's **Agent** toggle turns a chat into a bounded tool-running loop. I
 ### Settings
 
 - Engine and converter binary paths with a `--version` probe.
-- Active `.jns` model, models folder, server host/port, extra arguments, and local API key.
+- Active `.jns` model, models folder, server host/port, extra arguments, local API key, and the optional Hugging Face access token.
 - Scan for local `.jns` models and select one.
-- Theme picker (Acid, Ember, Tide), agent preferences, and reset-defaults actions.
+- Theme picker (Acid, Ember, Tide), agent preferences, remembered command rules, and reset-defaults actions.
 - Chat history statistics, whole-shelf backup/export/import, previous-version restore, and orphaned-image cleanup.
 
 ## Requirements
@@ -369,7 +375,7 @@ src/
 src-tauri/src/
   main.rs                  Tauri setup, state, command registration
   engine.rs                Janas lifecycle, SSE proxy and tool loop
-  agent.rs                 agent loop, workspace tools, approvals and safety
+  agent.rs                 agent loop, workspace tools, approvals, approval rules and safety
   agent/checkpoint.rs      per-run file pre-images and undo state
   engines/                 dual-engine supervisor, Janas/llama adapters, binary installer
   chat_store.rs            schema-v2 chat sessions, assets, backups, export/import
@@ -378,7 +384,7 @@ src-tauri/src/
   converter.rs             janas-convert job runner
   huggingface.rs           Hub search, quant discovery, downloads
   capabilities.rs          runtime sampling-capability probing
-  settings.rs              persisted config, binary resolution, probing
+  settings.rs              persisted config, Hugging Face token, binary resolution, probing
   memory.rs                persistent memory bank + save_to_memory_bank handler
   system.rs                telemetry, benchmark, ingest, web search, library, model verify/delete, MCP, source opener
   error.rs                 serializable command errors
@@ -409,6 +415,7 @@ New UI pieces: `chat/SessionsRail`, `chat/EnginePanel`, `chat/TelemetryPanel`,
 | `chat_export_session`, `chat_import_session`, `chat_branch_session`, `chat_export_all`, `chat_import_all`, `chat_backup_list`, `chat_restore_backup`, `chat_store_gc`, `chat_store_stats` | branching, backup, export/import and maintenance |
 | `verify_local_model`, `delete_local_model` | SHA-256 verification and model deletion |
 | `agent_start`, `agent_resolve_approval`, `agent_abort` | agent run, approval decisions and cancellation |
+| `agent_approval_rules`, `agent_forget_approval_rule`, `agent_clear_approval_rules` | list, revoke and clear remembered shell commands for a workspace |
 | `agent_undo`, `agent_undo_file`, `agent_keep_file`, `agent_undo_availability`, `agent_undo_state` | per-run and per-file agent undo |
 
 | Event | Payload |
@@ -428,13 +435,14 @@ New UI pieces: `chat/SessionsRail`, `chat/EnginePanel`, `chat/TelemetryPanel`,
 
 - `npm run check` — TypeScript typecheck passed.
 - `npm test` — 23 Vitest tests pass across chat-session normalization/branching and MCP scope/reconciliation, including empty-scope request building and persistence-boundary checks.
-- `cargo test` — 145 tests pass, 0 failed; one network-dependent live-search smoke test is ignored by default.
+- `cargo test` — 153 tests pass, 0 failed; one network-dependent live-search smoke test is ignored by default.
 - `npm run appimage` — release build and AppImage bundling completed:
   - Artifact: `src-tauri/target/release/bundle/appimage/Studio for Janas_0.1.1_amd64.AppImage`
-  - Size: 84,875,768 bytes (80.94 MiB)
-  - SHA-256: `8353ad748b2cefd8372a5333bebcd691874221f7b1fcf946efef495f33691417`
+  - Size: 84,883,960 bytes (80.94 MiB)
+  - SHA-256: `80fedf2d9f2eafd96888b3f8f3d282fa3a834acc6dbd04d3d253c519c5f623d2`
   - Contents: no Janas binaries are bundled; `usr/share/licenses/studio-for-janas/LICENSE` and `usr/share/doc/studio-for-janas/THIRD_PARTY_NOTICES.md` match the repository files byte-for-byte.
 - Runtime passes in an isolated profile exercised branching and version switching, per-chat drafts and MCP scope, backup restore and export/import, close-time saving, and model verify/delete. The delete confirmation now awaits the Tauri dialog, and window close flushes pending chat writes before destroying the window.
+- The approval-rule store, per-chat prompt normalization and Hugging Face token/error plumbing are covered by the Rust and Vitest suites; no live gated-repository download or Tauri UI pass was performed for this build.
 - The Tools badge, All/None controls, zero-tools hint and scope reconciliation are covered by typecheck, unit tests and the production build; `docs/screenshots/mcp-scope.png` shows the badge, populated scope and All/None controls in the running app.
 - Engine-specific checks from earlier builds (llama.cpp Vulkan KV-cache guard, context retry, MCP schema budget, managed Janas provisioning) remain covered by the Rust suite.
 
@@ -445,7 +453,9 @@ New UI pieces: `chat/SessionsRail`, `chat/EnginePanel`, `chat/TelemetryPanel`,
 - llama.cpp image input needs a vision-capable GGUF plus its matching `--mmproj` projector selected in Settings; otherwise the engine's error is shown verbatim.
 - Persistent memory is an in-app hashed TF-IDF vector store, not ChromaDB, so there is no Python sidecar. Facts live in `memory.json` under the app data directory and never leave the machine.
 - The app assumes a single local engine instance and a single active model.
-- Chat sessions and their images live under `chat-sessions/` in the app data directory, one JSON file per chat plus `assets/<chat-id>/`, with one previous version kept per chat. Engine/agent preferences, theme choice and other UI state live in `localStorage`; memory facts live in `memory.json`; server settings live in the platform config directory.
+- Chat sessions and their images live under `chat-sessions/` in the app data directory, one JSON file per chat plus `assets/<chat-id>/`, with one previous version kept per chat. Engine/agent preferences, theme choice, the saved default system prompt and the persona library live in `localStorage`; memory facts live in `memory.json`; server settings live in the platform config directory.
+- Remembered agent commands live in `agent-approvals.json` in the app data directory, one rule set per canonical workspace, and are restricted to the owner on Unix. They cover shell commands only; MCP tools remain governed by their per-server auto-approve setting. Rules for a workspace that no longer exists stay in the file; delete `agent-approvals.json` to remove them.
+- The Hugging Face token is optional and saved in `settings.json` alongside the local API key; both are sent to the webview on settings reads and restricted to the owner on Unix. The token is never written to download manifests, logs or chat history.
 - Per-chat MCP scopes store server IDs and names. On chat load, missing servers are pruned and servers re-created under the same name are remapped automatically.
 - Janas writes its own cache under `~/.cache/janas`. Converting large models can need roughly three times the model size in free disk space, as documented upstream.
 - Only GGUF quantizations supported by the installed converter will compile.

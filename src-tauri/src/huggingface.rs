@@ -116,7 +116,32 @@ fn metadata_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
-pub async fn search(request: SearchRequest) -> AppResult<Vec<HfModel>> {
+/// Add the optional access token. Callers in this module build only
+/// huggingface.co URLs; reqwest removes the header on cross-host redirects.
+fn authorized(builder: reqwest::RequestBuilder, token: &str) -> reqwest::RequestBuilder {
+    let token = token.trim();
+    if token.is_empty() {
+        builder
+    } else {
+        builder.bearer_auth(token)
+    }
+}
+
+fn access_error(status: reqwest::StatusCode) -> String {
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        format!(
+            "Hugging Face returned HTTP {status}. This repository is gated or private: accept its licence on huggingface.co, then add an access token in Settings."
+        )
+    } else if status == reqwest::StatusCode::NOT_FOUND {
+        format!(
+            "Hugging Face returned HTTP {status}. The repository or file may be missing, or private and in need of an access token in Settings."
+        )
+    } else {
+        format!("Hugging Face returned HTTP {status}.")
+    }
+}
+
+pub async fn search(request: SearchRequest, token: &str) -> AppResult<Vec<HfModel>> {
     let limit = request.limit.clamp(1, 40);
     let mut url = format!("{HF_API}?limit={limit}&sort=downloads&direction=-1&full=true");
     let query = request.query.trim();
@@ -129,17 +154,13 @@ pub async fn search(request: SearchRequest) -> AppResult<Vec<HfModel>> {
     }
 
     let client = metadata_client();
-    let response = client
-        .get(&url)
+    let response = authorized(client.get(&url), token)
         .send()
         .await
         .map_err(|err| AppError::message(format!("Hugging Face search failed: {err}")))?;
 
     if !response.status().is_success() {
-        return Err(AppError::message(format!(
-            "Hugging Face returned HTTP {} for this search.",
-            response.status()
-        )));
+        return Err(AppError::message(access_error(response.status())));
     }
 
     let models: Vec<ApiModel> = response
@@ -149,8 +170,11 @@ pub async fn search(request: SearchRequest) -> AppResult<Vec<HfModel>> {
 
     let mut enriched = futures_util::stream::iter(models.into_iter().map(|model| {
         let client = client.clone();
+        let token = token.to_string();
         async move {
-            let quants = fetch_quants(&client, &model.id).await.unwrap_or_default();
+            let quants = fetch_quants(&client, &model.id, &token)
+                .await
+                .unwrap_or_default();
             let author = model
                 .author
                 .clone()
@@ -184,10 +208,10 @@ pub async fn search(request: SearchRequest) -> AppResult<Vec<HfModel>> {
     Ok(enriched)
 }
 
-pub async fn list_quants(repo: String) -> AppResult<Vec<HfQuant>> {
+pub async fn list_quants(repo: String, token: &str) -> AppResult<Vec<HfQuant>> {
     validate_repo(&repo)?;
     let client = metadata_client();
-    fetch_quants(&client, &repo)
+    fetch_quants(&client, &repo, token)
         .await
         .map_err(|err| AppError::message(format!("Could not list this model's files: {err}")))
 }
@@ -195,26 +219,31 @@ pub async fn list_quants(repo: String) -> AppResult<Vec<HfQuant>> {
 async fn fetch_quants(
     client: &reqwest::Client,
     repo: &str,
-) -> Result<Vec<HfQuant>, reqwest::Error> {
+    token: &str,
+) -> Result<Vec<HfQuant>, String> {
     let url = format!("{HF_API}/{repo}/tree/main?recursive=true&expand=true");
-    let entries: Vec<TreeEntry> = client
-        .get(url)
+    let response = authorized(client.get(url), token)
         .timeout(Duration::from_secs(8))
         .send()
-        .await?
-        .error_for_status()?
+        .await
+        .map_err(|err| format!("Hugging Face request failed: {err}"))?;
+    if !response.status().is_success() {
+        return Err(access_error(response.status()));
+    }
+    let entries: Vec<TreeEntry> = response
         .json()
-        .await?;
+        .await
+        .map_err(|err| format!("Unexpected Hugging Face response: {err}"))?;
     Ok(build_quants(entries))
 }
 
 async fn fetch_checksums(
     client: &reqwest::Client,
     repo: &str,
+    token: &str,
 ) -> HashMap<String, String> {
     let url = format!("{HF_API}/{repo}/tree/main?recursive=true&expand=true");
-    let Ok(response) = client
-        .get(url)
+    let Ok(response) = authorized(client.get(url), token)
         .timeout(Duration::from_secs(8))
         .send()
         .await
@@ -406,6 +435,7 @@ impl DownloadManager {
         let repo = request.repo.clone();
         let files = request.files.clone();
         let destination = PathBuf::from(settings.models_dir.trim());
+        let token = settings.hf_token.trim().to_string();
         let task_id = id.clone();
         let app_handle = app.clone();
 
@@ -431,6 +461,7 @@ impl DownloadManager {
                 repo,
                 files,
                 destination,
+                token,
             )
             .await;
             manager.finish(&task_id);
@@ -491,6 +522,7 @@ async fn run_download(
     repo: String,
     files: Vec<DownloadFile>,
     models_dir: PathBuf,
+    token: String,
 ) {
     let files_total = files.len();
     let known_total: Option<u64> = if files.iter().all(|file| file.size > 0) {
@@ -525,7 +557,7 @@ async fn run_download(
         },
     );
 
-    let expected = fetch_checksums(&client, &repo).await;
+    let expected = fetch_checksums(&client, &repo, &token).await;
     let mut checksums: HashMap<String, String> = HashMap::new();
     let mut downloaded_total = 0u64;
 
@@ -580,7 +612,7 @@ async fn run_download(
                 .join("/")
         );
 
-        let response = match client.get(url).send().await {
+        let response = match authorized(client.get(url), &token).send().await {
             Ok(response) => response,
             Err(err) => {
                 emit_error(
@@ -601,7 +633,7 @@ async fn run_download(
                 &repo,
                 file,
                 files_total,
-                format!("Hugging Face returned HTTP {}.", response.status()),
+                access_error(response.status()),
             );
             return;
         }
@@ -1034,6 +1066,17 @@ mod tests {
         assert!(validate_repo("Qwen/Qwen3-4B-GGUF").is_ok());
         assert!(validate_repo("not-a-repo").is_err());
         assert!(validate_repo("../evil").is_err());
+    }
+
+    #[test]
+    fn gated_errors_name_the_token_setting() {
+        let message = access_error(reqwest::StatusCode::UNAUTHORIZED);
+        assert!(message.contains("401"), "{message}");
+        assert!(message.contains("gated or private"), "{message}");
+        assert!(message.contains("access token"), "{message}");
+        let missing = access_error(reqwest::StatusCode::NOT_FOUND);
+        assert!(missing.contains("404"));
+        assert!(missing.contains("access token"));
     }
 
     #[test]

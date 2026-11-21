@@ -393,6 +393,10 @@ export function normalizeSession(value: unknown): ChatSession | null {
       mcpServerIds?.length
         ? normalizeMcpServerNames(session.mcp_server_names)
         : undefined,
+    system_prompt:
+      typeof session.system_prompt === "string"
+        ? session.system_prompt
+        : undefined,
   };
 }
 

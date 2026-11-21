@@ -18,6 +18,7 @@ import {
   useEnginePreferences,
 } from "../../hooks/useEnginePreferences";
 import { usePersistentState } from "../../hooks/usePersistentState";
+import { usePersonas } from "../../hooks/usePersonas";
 import { useSettings } from "../../hooks/useSettings";
 import { useTelemetry } from "../../hooks/useTelemetry";
 import { api } from "../../lib/api";
@@ -78,10 +79,21 @@ export function ChatView({ engine, chat }: ChatViewProps) {
   const memory = useMemory();
   const telemetry = useTelemetry(engine.snapshot.pid, true);
 
-  const [systemPrompt, setSystemPrompt] = usePersistentState(
+  const [defaultSystemPrompt, setDefaultSystemPrompt] = usePersistentState(
     "janas.systemPrompt",
     "",
   );
+  const personas = usePersonas();
+  // A chat owns its instructions when it has an explicit value; otherwise it
+  // follows the saved default, which is what new chats start from too.
+  const chatSystemPrompt = chat.activeSession?.system_prompt;
+  const systemPrompt = chatSystemPrompt ?? defaultSystemPrompt;
+  const usingDefaultPrompt = chatSystemPrompt === undefined;
+  const setSystemPrompt = useCallback(
+    (value: string) => chat.setSessionSystemPrompt(value),
+    [chat.setSessionSystemPrompt],
+  );
+  const [approvalRulesVersion, setApprovalRulesVersion] = useState(0);
   const [mcpServers] = usePersistentState<McpServerConfig[]>(
     "janas.mcpServers.v1",
     [],
@@ -314,7 +326,11 @@ export function ChatView({ engine, chat }: ChatViewProps) {
             decision: "approve",
             feedback: "",
             allow_file_edits: options?.allowEdits ?? false,
+            always_allow: options?.alwaysAllow ?? false,
           });
+          if (options?.alwaysAllow) {
+            setApprovalRulesVersion((value) => value + 1);
+          }
         } catch (err) {
           chat.setError(errorMessage(err));
         }
@@ -423,12 +439,19 @@ export function ChatView({ engine, chat }: ChatViewProps) {
           ...DEFAULT_ENGINE_PREFERENCES,
           internet: previous.internet,
         }));
-        setSystemPrompt("");
+        chat.setSessionSystemPrompt(null);
+        setDefaultSystemPrompt("");
       } catch (err) {
         chat.setError(errorMessage(err));
       }
     },
-    [chat, save, setPreferences, setSystemPrompt, settings],
+    [
+      chat,
+      save,
+      setDefaultSystemPrompt,
+      setPreferences,
+      settings,
+    ],
   );
 
   const switchEngine = useCallback(
@@ -940,6 +963,14 @@ export function ChatView({ engine, chat }: ChatViewProps) {
         workspaceLocked={workspaceLocked}
         systemPrompt={systemPrompt}
         onSystemPromptChange={setSystemPrompt}
+        usingDefaultPrompt={usingDefaultPrompt}
+        onUseDefaultPrompt={() => chat.setSessionSystemPrompt(null)}
+        onMakeDefaultPrompt={() => setDefaultSystemPrompt(systemPrompt)}
+        personas={personas.personas}
+        onAddPersona={personas.add}
+        onDeletePersona={personas.remove}
+        workspaceRoot={workspaceRoot}
+        approvalRulesVersion={approvalRulesVersion}
         usage={chat.usage}
         elapsedMs={chat.elapsedMs}
         firstTokenMs={chat.firstTokenMs}

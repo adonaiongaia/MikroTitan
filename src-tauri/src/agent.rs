@@ -191,6 +191,255 @@ pub struct ApprovalReply {
     /// same run without another prompt. Shell and MCP tools stay gated.
     #[serde(default)]
     pub allow_file_edits: bool,
+    /// Remember this exact shell command for the current workspace. Only the
+    /// approval path that carries a safe, single command can grant it.
+    #[serde(default)]
+    pub always_allow: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredCommandRule {
+    workspace: String,
+    command: String,
+    #[serde(default)]
+    created_at: u64,
+}
+
+/// Commands the user explicitly approved with "always allow", grouped by the
+/// canonical workspace they ran in. The file is plain JSON in the app data
+/// directory so a rule can always be inspected or removed by hand.
+pub struct ApprovalRuleStore {
+    path: PathBuf,
+    rules: Mutex<Vec<StoredCommandRule>>,
+}
+
+impl ApprovalRuleStore {
+    pub fn load(path: PathBuf) -> Self {
+        let rules = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Vec<StoredCommandRule>>(&text).ok())
+            .unwrap_or_default();
+        restrict_file(&path);
+        Self {
+            path,
+            rules: Mutex::new(rules),
+        }
+    }
+
+    fn commands_for(&self, workspace: &str) -> Vec<String> {
+        let Some(key) = workspace_key(workspace) else {
+            return Vec::new();
+        };
+        self.rules
+            .lock()
+            .map(|rules| {
+                rules
+                    .iter()
+                    .filter(|rule| rule.workspace == key)
+                    .map(|rule| rule.command.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn add(&self, workspace: &str, command: &str) -> AppResult<()> {
+        let key = workspace_key(workspace)
+            .ok_or_else(|| AppError::message("That workspace no longer exists."))?;
+        // Check the raw text first: normalising whitespace would hide a
+        // newline that the shell treats as a command separator.
+        if !command_is_rememberable(command) {
+            return Err(AppError::message(
+                "Only a single, plain shell command can be remembered.",
+            ));
+        }
+        let command = normalize_shell_command(command);
+        let mut rules = self
+            .rules
+            .lock()
+            .map_err(|_| AppError::message("The approval rule store is locked."))?;
+        let mut next = rules.clone();
+        if !next
+            .iter()
+            .any(|rule| rule.workspace == key && rule.command == command)
+        {
+            next.push(StoredCommandRule {
+                workspace: key,
+                command,
+                created_at: crate::util::now_ms(),
+            });
+        }
+        // Persist while holding the lock so two approvals in different
+        // workspaces cannot write an older snapshot over a newer one. Swap the
+        // in-memory list only after the file write succeeds, so a failed save
+        // does not leave a rule that vanishes on restart.
+        self.persist(&next)?;
+        *rules = next;
+        Ok(())
+    }
+
+    fn forget(&self, workspace: &str, command: &str) -> AppResult<()> {
+        let Some(key) = workspace_key(workspace) else {
+            return Ok(());
+        };
+        let command = normalize_shell_command(command);
+        let mut rules = self
+            .rules
+            .lock()
+            .map_err(|_| AppError::message("The approval rule store is locked."))?;
+        let mut next = rules.clone();
+        next.retain(|rule| !(rule.workspace == key && rule.command == command));
+        self.persist(&next)?;
+        *rules = next;
+        Ok(())
+    }
+
+    fn clear(&self, workspace: &str) -> AppResult<()> {
+        let Some(key) = workspace_key(workspace) else {
+            return Ok(());
+        };
+        let mut rules = self
+            .rules
+            .lock()
+            .map_err(|_| AppError::message("The approval rule store is locked."))?;
+        let mut next = rules.clone();
+        next.retain(|rule| rule.workspace != key);
+        self.persist(&next)?;
+        *rules = next;
+        Ok(())
+    }
+
+    fn persist(&self, rules: &[StoredCommandRule]) -> AppResult<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| {
+                AppError::message(format!("Could not create the approval rule folder: {err}"))
+            })?;
+        }
+        let body = serde_json::to_vec_pretty(rules)
+            .map_err(|err| AppError::message(format!("Could not encode approval rules: {err}")))?;
+        let temporary = self.path.with_extension("json.tmp");
+        std::fs::write(&temporary, &body).map_err(|err| {
+            AppError::message(format!("Could not write the approval rule file: {err}"))
+        })?;
+        // Restrict the temporary file too: it briefly contains the same rules.
+        restrict_file(&temporary);
+        if std::fs::rename(&temporary, &self.path).is_err() {
+            // Windows cannot rename over an existing file.
+            std::fs::write(&self.path, &body).map_err(|err| {
+                AppError::message(format!("Could not replace the approval rule file: {err}"))
+            })?;
+            let _ = std::fs::remove_file(&temporary);
+        }
+        restrict_file(&self.path);
+        Ok(())
+    }
+}
+
+/// Rules can contain command lines with project paths, so keep the file
+/// readable only by the owner when the platform supports POSIX modes.
+fn restrict_file(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
+fn workspace_key(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let expanded = crate::settings::expand_home(raw);
+    std::fs::canonicalize(&expanded)
+        .ok()
+        .map(|path| path.to_string_lossy().to_string())
+}
+
+fn normalize_shell_command(command: &str) -> String {
+    // Only trim the ends. Interior whitespace is significant inside quoted
+    // arguments, so collapsing it could turn an approved command into a
+    // different one.
+    command.trim().to_string()
+}
+
+/// A command is rememberable only when it is one plain invocation. Shell
+/// control characters, substitutions and redirections disable both storing a
+/// rule and matching one, so a remembered `npm test` can never cover
+/// `npm test && rm -rf /`.
+fn command_is_rememberable(command: &str) -> bool {
+    !command.trim().is_empty()
+        && !command.chars().any(|character| {
+            matches!(
+                character,
+                ';' | '|' | '&' | '>' | '<' | '`' | '$' | '\n' | '\r' | '(' | ')'
+            )
+        })
+        // Never store a command the secret scrubber recognises. A remembered
+        // rule is plain text on disk, so a bearer token or API key in the
+        // arguments must stay out of it.
+        && redact_secrets(command) == command
+}
+
+fn command_matches_rule(command: &str, rule: &str) -> bool {
+    if !command_is_rememberable(command) || !command_is_rememberable(rule) {
+        return false;
+    }
+    let rule = normalize_shell_command(rule);
+    if rule.is_empty() {
+        return false;
+    }
+    let command = normalize_shell_command(command);
+    command == rule
+        || (command.starts_with(&rule)
+            && command[rule.len()..]
+                .chars()
+                .next()
+                .is_some_and(char::is_whitespace))
+}
+
+/// The exact command this approval could remember, when it is safe to do so.
+fn rememberable_command(
+    tool: &str,
+    arguments: &Value,
+    workspace: Option<&Path>,
+) -> Option<String> {
+    if tool != "run_command" || workspace.is_none() {
+        return None;
+    }
+    let raw = arguments.get("command")?.as_str()?;
+    if !command_is_rememberable(raw) {
+        return None;
+    }
+    let command = normalize_shell_command(raw);
+    // Irreversible commands and sensitive paths always ask, so remembering
+    // them would create a rule that can never fire.
+    if irreversible_command_reason(tool, arguments).is_some()
+        || sensitive_access_reason(tool, arguments, workspace).is_some()
+    {
+        return None;
+    }
+    Some(command)
+}
+
+#[derive(Debug, Clone)]
+struct PendingApproval {
+    /// Set only when the approval card can offer "always allow".
+    command: Option<String>,
+    workspace: Option<String>,
+}
+
+impl PendingApproval {
+    #[cfg(test)]
+    fn none() -> Self {
+        Self {
+            command: None,
+            workspace: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -264,6 +513,8 @@ pub struct AgentApprovalEvent {
     /// True for write_file/edit_file, which the UI may allow for the rest of
     /// the run. Shell and MCP approvals never get that shortcut.
     pub file_edit: bool,
+    /// True when this shell command can be remembered for the workspace.
+    pub can_always_allow: bool,
     pub preview: Option<AgentDiffPreview>,
     /// Canonical workspace root pinned when the run started. The UI uses this
     /// to show the exact folder the approval applies to.
@@ -407,6 +658,12 @@ struct RunControl {
     /// this run and only to the built-in file-editing tools.
     file_edits_allowed: AtomicBool,
     approvals: Mutex<HashMap<String, tokio::sync::oneshot::Sender<Resolution>>>,
+    /// Pending approvals carry what the resolve command needs to persist a
+    /// remembered command without trusting a second IPC payload.
+    pending: Mutex<HashMap<String, PendingApproval>>,
+    /// Rules seeded from the store at run start, plus any granted during this
+    /// run. Keeping them here makes the next tool call in the same run prompt-free.
+    command_rules: Mutex<Vec<String>>,
     pids: Mutex<HashSet<i32>>,
 }
 
@@ -421,6 +678,34 @@ impl RunControl {
 
     fn file_edits_allowed(&self) -> bool {
         self.file_edits_allowed.load(Ordering::SeqCst)
+    }
+
+    fn seed_command_rules(&self, rules: Vec<String>) {
+        if let Ok(mut guard) = self.command_rules.lock() {
+            *guard = rules;
+        }
+    }
+
+    fn command_rules(&self) -> Vec<String> {
+        self.command_rules
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    fn allow_command(&self, command: &str) {
+        if let Ok(mut guard) = self.command_rules.lock() {
+            if !guard.iter().any(|rule| rule == command) {
+                guard.push(command.to_string());
+            }
+        }
+    }
+
+    fn pending_approval(&self, step_id: &str) -> Option<PendingApproval> {
+        self.pending
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(step_id).cloned())
     }
 
     fn cancel(&self) {
@@ -440,13 +725,20 @@ impl RunControl {
         }
     }
 
-    fn request_approval(&self, step_id: &str) -> AppResult<tokio::sync::oneshot::Receiver<Resolution>> {
+    fn request_approval(
+        &self,
+        step_id: &str,
+        pending: PendingApproval,
+    ) -> AppResult<tokio::sync::oneshot::Receiver<Resolution>> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let mut guard = self
             .approvals
             .lock()
             .map_err(|_| AppError::message("The agent approval gate is locked."))?;
         guard.insert(step_id.to_string(), sender);
+        if let Ok(mut pending_guard) = self.pending.lock() {
+            pending_guard.insert(step_id.to_string(), pending);
+        }
         Ok(receiver)
     }
 
@@ -456,6 +748,9 @@ impl RunControl {
             .lock()
             .ok()
             .and_then(|mut guard| guard.remove(step_id));
+        if let Ok(mut guard) = self.pending.lock() {
+            guard.remove(step_id);
+        }
         match sender {
             Some(sender) => sender.send(resolution).is_ok(),
             None => false,
@@ -953,10 +1248,12 @@ pub async fn agent_start(
     manager: State<'_, Arc<AgentManager>>,
     supervisor: State<'_, Arc<crate::engines::EngineSupervisor>>,
     store: State<'_, Arc<SettingsStore>>,
+    approvals: State<'_, Arc<ApprovalRuleStore>>,
     request: AgentRequest,
 ) -> AppResult<()> {
     let manager = manager.inner().clone();
     let supervisor = supervisor.inner().clone();
+    let approvals = approvals.inner().clone();
     let settings = store.get();
 
     if request.run_id.trim().is_empty() {
@@ -1002,6 +1299,11 @@ pub async fn agent_start(
     };
 
     let (control, journal) = manager.begin(&request.run_id, workspace.as_deref())?;
+    if let Some(workspace) = workspace.as_deref() {
+        control.seed_command_rules(
+            approvals.commands_for(&workspace.to_string_lossy()),
+        );
+    }
     let mut checkpoint_setup = CheckpointSetup {
         workspace: workspace.clone(),
         ..CheckpointSetup::default()
@@ -1051,22 +1353,79 @@ pub async fn agent_start(
 #[tauri::command(rename_all = "snake_case")]
 pub fn agent_resolve_approval(
     manager: State<'_, Arc<AgentManager>>,
+    approvals: State<'_, Arc<ApprovalRuleStore>>,
     reply: ApprovalReply,
 ) -> AppResult<()> {
     let control = manager
         .control(&reply.run_id)
         .ok_or_else(|| AppError::message("That agent run is no longer active."))?;
+    let approved = matches!(reply.decision, ApprovalChoice::Approve);
+    // Read the pending command before resolution clears the gate. The rule is
+    // built from what the agent actually asked to run, not from UI input.
+    let pending = control.pending_approval(&reply.step_id);
     let resolution = match reply.decision {
         ApprovalChoice::Approve => Resolution::Approved,
         ApprovalChoice::Reject => Resolution::Rejected(reply.feedback.trim().to_string()),
         ApprovalChoice::Abort => Resolution::Aborted,
     };
+    // Add the run-local allowance before waking the agent, otherwise it can
+    // reach the next identical command while the gate is already open but the
+    // rule is not, and prompt again. Persist only after the step resolves.
+    if approved && reply.always_allow {
+        if let Some(PendingApproval {
+            command: Some(command),
+            ..
+        }) = &pending
+        {
+            control.allow_command(command);
+        }
+    }
     if !resolve_approval(&control, &reply.step_id, resolution, reply.allow_file_edits) {
         return Err(AppError::message(
             "That approval step already finished. The agent may have moved on.",
         ));
     }
+    if approved && reply.always_allow {
+        if let Some(PendingApproval {
+            command: Some(command),
+            workspace: Some(workspace),
+        }) = pending
+        {
+            if let Err(error) = approvals.add(&workspace, &command) {
+                return Err(AppError::message(format!(
+                    "Approved, but the command could not be remembered: {error}"
+                )));
+            }
+        }
+    }
     Ok(())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn agent_approval_rules(
+    approvals: State<'_, Arc<ApprovalRuleStore>>,
+    workspace: String,
+) -> Vec<String> {
+    approvals.commands_for(&workspace)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn agent_forget_approval_rule(
+    approvals: State<'_, Arc<ApprovalRuleStore>>,
+    workspace: String,
+    command: String,
+) -> AppResult<Vec<String>> {
+    approvals.forget(&workspace, &command)?;
+    Ok(approvals.commands_for(&workspace))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn agent_clear_approval_rules(
+    approvals: State<'_, Arc<ApprovalRuleStore>>,
+    workspace: String,
+) -> AppResult<Vec<String>> {
+    approvals.clear(&workspace)?;
+    Ok(Vec::new())
 }
 
 /// Apply a single-use approval. The run-wide file-edit allowance is granted
@@ -1344,6 +1703,7 @@ impl RunContext<'_> {
         arguments: &str,
         risk: Risk,
         reason: &str,
+        can_always_allow: bool,
         preview: Option<&AgentDiffPreview>,
         workspace: Option<&Path>,
     ) {
@@ -1358,6 +1718,7 @@ impl RunContext<'_> {
                 risk,
                 reason: reason.to_string(),
                 file_edit: is_file_edit_tool(tool),
+                can_always_allow,
                 preview: preview.cloned(),
                 workspace_root: workspace.map(|path| path.to_string_lossy().to_string()),
             },
@@ -1915,6 +2276,7 @@ async fn execute(context: &RunContext<'_>) -> Result<AgentFinish, AgentFailure> 
                 is_mcp,
                 request.approval_policy,
                 context.control.file_edits_allowed(),
+                &context.control.command_rules(),
                 &arguments_value,
                 workspace.as_deref(),
             );
@@ -1933,8 +2295,17 @@ async fn execute(context: &RunContext<'_>) -> Result<AgentFinish, AgentFailure> 
                 let preview =
                     file_change_preview(workspace.as_deref(), &tool_name, &arguments_value).await;
                 // Register the gate before announcing it: the UI can approve
-                // the instant the card renders.
-                let receiver = match context.control.request_approval(&step_id) {
+                // the instant the card renders. The remembered command lives
+                // on the gate so a forged second IPC payload cannot widen it.
+                let receiver = match context.control.request_approval(
+                    &step_id,
+                    PendingApproval {
+                        command: decision.rememberable.clone(),
+                        workspace: workspace
+                            .as_deref()
+                            .map(|path| path.to_string_lossy().to_string()),
+                    },
+                ) {
                     Ok(receiver) => receiver,
                     Err(error) => return Err(AgentFailure::Fatal(error.to_string())),
                 };
@@ -1944,6 +2315,7 @@ async fn execute(context: &RunContext<'_>) -> Result<AgentFinish, AgentFailure> 
                     &arguments_display,
                     decision.risk,
                     &decision.reason,
+                    decision.rememberable.is_some(),
                     preview.as_ref(),
                     workspace.as_deref(),
                 );
@@ -2724,6 +3096,8 @@ struct ApprovalDecision {
     requires_approval: bool,
     risk: Risk,
     reason: String,
+    /// The exact shell command "always allow" would store, when offered.
+    rememberable: Option<String>,
 }
 
 fn approval_decision(
@@ -2732,6 +3106,7 @@ fn approval_decision(
     is_mcp: bool,
     policy: ApprovalPolicy,
     file_edits_allowed: bool,
+    allowed_commands: &[String],
     arguments: &Value,
     workspace: Option<&Path>,
 ) -> ApprovalDecision {
@@ -2740,6 +3115,7 @@ fn approval_decision(
             requires_approval: true,
             risk: Risk::Irreversible,
             reason: format!("Always confirm: {reason}. Stop here and verify the target before approving."),
+            rememberable: None,
         };
     }
     let sensitive = sensitive_access_reason(tool, arguments, workspace).or_else(|| {
@@ -2756,13 +3132,23 @@ fn approval_decision(
             requires_approval: true,
             risk: Risk::Destructive,
             reason: format!("Sensitive path guard: {reason}. Confirm before the agent accesses it; output will be redacted."),
+            rememberable: None,
         };
     }
+    let rememberable = rememberable_command(tool, arguments, workspace);
+    let remembered = rememberable.as_deref().is_some_and(|command| {
+        allowed_commands
+            .iter()
+            .any(|rule| command_matches_rule(command, rule))
+    });
     let requires_approval = if policy == ApprovalPolicy::Auto {
         false
     } else if is_mcp {
         true
-    } else if risk == Risk::ReadOnly || (file_edits_allowed && is_file_edit_tool(tool)) {
+    } else if remembered
+        || risk == Risk::ReadOnly
+        || (file_edits_allowed && is_file_edit_tool(tool))
+    {
         false
     } else {
         risk.requires_approval(policy)
@@ -2771,6 +3157,7 @@ fn approval_decision(
         requires_approval,
         risk,
         reason: risk.reason().to_string(),
+        rememberable,
     }
 }
 
@@ -5045,6 +5432,7 @@ mod tests {
             is_mcp,
             policy,
             file_edits_allowed,
+            &[],
             &Value::Null,
             None,
         )
@@ -5163,6 +5551,7 @@ mod tests {
                 false,
                 ApprovalPolicy::Auto,
                 true,
+                &[],
                 &json!({ "command": command }),
                 None,
             );
@@ -5175,6 +5564,7 @@ mod tests {
             false,
             ApprovalPolicy::Auto,
             false,
+            &[],
             &json!({ "command": "git push origin main" }),
             None,
         );
@@ -5186,6 +5576,7 @@ mod tests {
                 false,
                 ApprovalPolicy::Auto,
                 false,
+                &[],
                 &json!({ "command": command }),
                 None,
             );
@@ -5213,6 +5604,7 @@ mod tests {
                 false,
                 ApprovalPolicy::Auto,
                 true,
+                &[],
                 &json!({ "path": path }),
                 None,
             );
@@ -5224,6 +5616,7 @@ mod tests {
             false,
             ApprovalPolicy::Auto,
             false,
+            &[],
             &json!({ "path": ".env.example" }),
             None,
         );
@@ -5234,10 +5627,121 @@ mod tests {
             false,
             ApprovalPolicy::Auto,
             false,
+            &[],
             &json!({ "command": "cat .env" }),
             None,
         );
         assert!(shell.requires_approval);
+    }
+
+    fn approval_with_rules(command: &str, rules: &[&str]) -> bool {
+        let rules: Vec<String> = rules.iter().map(|rule| rule.to_string()).collect();
+        approval_decision(
+            Risk::Destructive,
+            "run_command",
+            false,
+            ApprovalPolicy::Destructive,
+            false,
+            &rules,
+            &json!({ "command": command }),
+            Some(Path::new(".")),
+        )
+        .requires_approval
+    }
+
+    #[test]
+    fn remembered_commands_skip_approval_but_never_for_compounds() {
+        assert!(!approval_with_rules(
+            "npm test -- --runInBand",
+            &["npm test"]
+        ));
+        assert!(approval_with_rules("npm run build", &["npm test"]));
+        assert!(approval_with_rules("npm testing", &["npm test"]));
+        assert!(approval_with_rules(
+            "npm test && rm -rf src",
+            &["npm test"]
+        ));
+        assert!(approval_with_rules("npm test | sh", &["npm test"]));
+        assert!(approval_with_rules("npm test\nrm -rf src", &["npm test"]));
+        assert!(approval_with_rules("npm test\r\nrm -rf src", &["npm test"]));
+    }
+
+    #[test]
+    fn irreversible_and_sensitive_commands_ignore_rules() {
+        assert!(approval_with_rules(
+            "git push --force origin main",
+            &["git push --force origin main"]
+        ));
+        assert!(approval_with_rules("cat .env", &["cat .env"]));
+    }
+
+    #[test]
+    fn remembered_commands_keep_quoted_whitespace_significant() {
+        assert!(!approval_with_rules(
+            "cat \"my  file\"",
+            &["cat \"my  file\""]
+        ));
+        assert!(approval_with_rules(
+            "cat \"my file\"",
+            &["cat \"my  file\""]
+        ));
+        assert!(!command_is_rememberable("   "));
+    }
+
+    #[test]
+    fn commands_with_likely_secrets_cannot_be_remembered() {
+        for command in [
+            "curl -H 'Authorization: Bearer abc123' https://example.com",
+            "API_KEY=sk-live-abcdef npm run deploy",
+            "psql postgres://user:hunter2@db.example/app",
+        ] {
+            assert!(
+                approval_with_rules(command, &[command]),
+                "{command} must keep asking"
+            );
+        }
+    }
+
+    #[test]
+    fn approval_rule_store_round_trips_and_forgets() {
+        let workspace = temp_workspace("rules");
+        let path = workspace.join("rules.json");
+        let store = ApprovalRuleStore::load(path.clone());
+        store
+            .add(&workspace.to_string_lossy(), "npm test")
+            .expect("add rule");
+        assert_eq!(
+            store.commands_for(&workspace.to_string_lossy()),
+            vec!["npm test".to_string()]
+        );
+        assert!(store
+            .add(
+                &workspace.to_string_lossy(),
+                "curl -H 'Authorization: Bearer abc123' https://example.com"
+            )
+            .is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path)
+                .expect("rule file")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "rules must stay owner-only");
+        }
+        let reloaded = ApprovalRuleStore::load(path);
+        assert_eq!(
+            reloaded.commands_for(&workspace.to_string_lossy()),
+            vec!["npm test".to_string()]
+        );
+        reloaded
+            .forget(&workspace.to_string_lossy(), "npm test")
+            .expect("forget rule");
+        assert!(reloaded
+            .commands_for(&workspace.to_string_lossy())
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 
     #[test]
@@ -5630,7 +6134,9 @@ mod tests {
     #[test]
     fn abort_resolves_pending_approvals() {
         let control = RunControl::default();
-        let mut receiver = control.request_approval("step-1").expect("gate");
+        let mut receiver = control
+            .request_approval("step-1", PendingApproval::none())
+            .expect("gate");
         control.cancel();
         match receiver.try_recv() {
             Ok(Resolution::Aborted) => {}
@@ -5641,7 +6147,9 @@ mod tests {
     #[test]
     fn action_resolution_is_single_use() {
         let control = RunControl::default();
-        let _receiver = control.request_approval("step-2").expect("gate");
+        let _receiver = control
+            .request_approval("step-2", PendingApproval::none())
+            .expect("gate");
         assert!(control.resolve("step-2", Resolution::Approved));
         assert!(!control.resolve("step-2", Resolution::Approved));
     }
@@ -5658,7 +6166,9 @@ mod tests {
         ));
         assert!(!control.file_edits_allowed());
 
-        let _receiver = control.request_approval("step-3").expect("gate");
+        let _receiver = control
+            .request_approval("step-3", PendingApproval::none())
+            .expect("gate");
         assert!(resolve_approval(
             &control,
             "step-3",
@@ -5967,6 +6477,7 @@ mod tests {
             false,
             ApprovalPolicy::Auto,
             false,
+            &[],
             &json!({ "path": "notes.txt" }),
             Some(&root),
         );
@@ -5982,6 +6493,7 @@ mod tests {
             false,
             ApprovalPolicy::Auto,
             false,
+            &[],
             &json!({ "command": "pwd", "cwd": "alias" }),
             Some(&root),
         );
