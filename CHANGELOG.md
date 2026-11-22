@@ -10,7 +10,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - **Remembered agent commands.** An approval card can allow one plain shell command for the current workspace. Rules persist in `agent-approvals.json` per canonical workspace, cover the same command with extra arguments, and can be listed, revoked individually or cleared in Engine Settings. Compound commands, likely secrets, irreversible commands and sensitive paths never match.
 - **Per-chat system prompts and personas.** Each chat can keep its own system prompt, fall back to a saved default, or promote its prompt with **Make default**. A machine-local persona library saves, applies and deletes reusable prompts; branches inherit the source chat's prompt.
-- **Hugging Face token support.** Settings accepts an optional access token for gated or private repositories. It is applied only to `huggingface.co` search, tree/checksum and download requests, and 401/403 responses now explain the licence/token step.
+- **Hugging Face token support.** Settings accepts an optional access token for gated or private repositories. It is applied only to `huggingface.co` search, tree/checksum and download requests. A 401 now points to an invalid or expired token, while a 403 points to the repository licence or the token's access.
 - **Speculative decoding and MTP for llama.cpp.** The llama engine now mirrors the Janas speculation settings: an MTP/speculation mode (`--spec-type draft-mtp` or `none`), an optional MTP head GGUF, a draft model (`--spec-draft-model`), and draft placement (`--spec-draft-device none` or `--spec-draft-ngl all`). The adapter only emits the flags the probed build advertises and rejects a missing or non-GGUF draft file instead of launching without it.
 - **Branching chat history.** Editing a user turn or regenerating a reply now keeps the old continuation as an archived branch. Previous/next arrows switch sibling versions, and **Branch** creates a new chat from a selected message's prefix.
 - **Schema-v2 Rust chat store.** Each chat is stored as one JSON file under the app data directory. Saves are atomic, a previous version is kept per chat, images are extracted to `assets/<chat-id>/`, and orphaned images can be cleaned up.
@@ -26,7 +26,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - **The editable system prompt is now per chat.** A saved default seeds new chats and chats without an override; editing the prompt in Engine Settings no longer silently changes every conversation. Reset clears the active chat's prompt and the saved default.
 - **Agent approval copy names remembered commands.** The policy descriptions now state that a remembered shell command can skip its prompt, and the approval checkbox explains the extra-argument match.
-- **Settings and approval-rule files are owner-only on Unix, including their temporary copies.** `settings.json` (local API key and Hugging Face token) and `agent-approvals.json` are written with mode `0600`; the `.json.tmp` file is restricted before it replaces the old file, and a failed rename falls back to a direct owner-only write.
+- **Settings and approval-rule files are owner-only on Unix, including their temporary copies.** `settings.json` (local API key and Hugging Face token) and `agent-approvals.json` are written with mode `0600`; the `.json.tmp` file is created with that mode from the outset, and a failed rename falls back to a direct write followed by the owner-only restriction.
 - Renamed the app to **Studio for Janas** and added an explicit independent, unofficial disclaimer in the README and the About panel. The engine attribution now reads **Janas-LLM by Maurizio Cammalleri** with a link to the upstream project.
 - Removed the pinned Janas binaries from the repository and the AppImage. Startup setup now downloads `janas-server`, `janas-chat`, `gguf2jns` and `janas-mcp` from the current `prabanta-dev/janas` release, and bare tool names such as `gguf2jns` and `janas-mcp` resolve from the managed `bin` folder.
 - Manifest license metadata now reports `GPL-3.0-only`, matching the repository's GPL-3.0 `LICENSE`.
@@ -38,7 +38,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ### Fixed
 
 - Copied diagnostics now redact both stored credentials: the local API key and the Hugging Face token are replaced with `[redacted]`.
-- Settings and approval-rule temp files are now owner-only before the atomic rename, so a brief write of a secret or rule file cannot be read by other local users.
+- Settings and approval-rule temp files are now created with owner-only permissions rather than tightened after the write, so they are never briefly readable by other local users. A stale temp path, including a symlink, is replaced rather than followed, and a partially written temp file is removed.
+- Settings saves now report write and rename failures instead of silently reporting success, and the previous in-memory settings remain active when persistence fails.
+- Hugging Face checksum-metadata failures now stop a download instead of silently skipping SHA-256 verification, and 401/403 errors distinguish an invalid token from a licence or scope denial.
 - Approval cards now reset their checkboxes and feedback for each step, so “allow file edits” or “always allow” cannot carry over to a later command.
 - Remembered-command writes are serialized with the rule file, so two approvals in different workspaces cannot overwrite each other.
 - Commands the secret scrubber recognises are never stored as remembered rules, and rule matching rejects newline-separated or other compound commands.

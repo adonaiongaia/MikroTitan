@@ -128,10 +128,10 @@ fn authorized(builder: reqwest::RequestBuilder, token: &str) -> reqwest::Request
 }
 
 fn access_error(status: reqwest::StatusCode) -> String {
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        format!(
-            "Hugging Face returned HTTP {status}. This repository is gated or private: accept its licence on huggingface.co, then add an access token in Settings."
-        )
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        "Hugging Face rejected the access token (HTTP 401). The token may be missing, invalid or expired; update it in Settings, then retry.".into()
+    } else if status == reqwest::StatusCode::FORBIDDEN {
+        "Hugging Face denied access (HTTP 403). This repository may be gated or private: accept its licence on huggingface.co, then add or update the access token in Settings and retry.".into()
     } else if status == reqwest::StatusCode::NOT_FOUND {
         format!(
             "Hugging Face returned HTTP {status}. The repository or file may be missing, or private and in need of an access token in Settings."
@@ -221,7 +221,27 @@ async fn fetch_quants(
     repo: &str,
     token: &str,
 ) -> Result<Vec<HfQuant>, String> {
-    let url = format!("{HF_API}/{repo}/tree/main?recursive=true&expand=true");
+    fetch_quants_from(client, HF_API, repo, token).await
+}
+
+async fn fetch_quants_from(
+    client: &reqwest::Client,
+    api_base: &str,
+    repo: &str,
+    token: &str,
+) -> Result<Vec<HfQuant>, String> {
+    Ok(build_quants(
+        fetch_tree_from(client, api_base, repo, token).await?,
+    ))
+}
+
+async fn fetch_tree_from(
+    client: &reqwest::Client,
+    api_base: &str,
+    repo: &str,
+    token: &str,
+) -> Result<Vec<TreeEntry>, String> {
+    let url = format!("{api_base}/{repo}/tree/main?recursive=true&expand=true");
     let response = authorized(client.get(url), token)
         .timeout(Duration::from_secs(8))
         .send()
@@ -230,33 +250,31 @@ async fn fetch_quants(
     if !response.status().is_success() {
         return Err(access_error(response.status()));
     }
-    let entries: Vec<TreeEntry> = response
+    response
         .json()
         .await
-        .map_err(|err| format!("Unexpected Hugging Face response: {err}"))?;
-    Ok(build_quants(entries))
+        .map_err(|err| format!("Unexpected Hugging Face response: {err}"))
 }
 
 async fn fetch_checksums(
     client: &reqwest::Client,
     repo: &str,
     token: &str,
-) -> HashMap<String, String> {
-    let url = format!("{HF_API}/{repo}/tree/main?recursive=true&expand=true");
-    let Ok(response) = authorized(client.get(url), token)
-        .timeout(Duration::from_secs(8))
-        .send()
-        .await
-    else {
-        return HashMap::new();
-    };
-    let Ok(entries) = response.json::<Vec<TreeEntry>>().await else {
-        return HashMap::new();
-    };
-    entries
+) -> Result<HashMap<String, String>, String> {
+    fetch_checksums_from(client, HF_API, repo, token).await
+}
+
+async fn fetch_checksums_from(
+    client: &reqwest::Client,
+    api_base: &str,
+    repo: &str,
+    token: &str,
+) -> Result<HashMap<String, String>, String> {
+    Ok(fetch_tree_from(client, api_base, repo, token)
+        .await?
         .into_iter()
         .filter_map(|entry| entry.lfs.and_then(|lfs| lfs.oid).map(|oid| (entry.path, oid)))
-        .collect()
+        .collect())
 }
 
 fn build_quants(entries: Vec<TreeEntry>) -> Vec<HfQuant> {
@@ -557,7 +575,18 @@ async fn run_download(
         },
     );
 
-    let expected = fetch_checksums(&client, &repo, &token).await;
+    let expected = match fetch_checksums(&client, &repo, &token).await {
+        Ok(expected) => expected,
+        Err(message) => {
+            // Do not download a file we cannot verify. A missing checksum
+            // response is especially dangerous on a gated repository, where
+            // it often means the token or licence is no longer valid.
+            if let Some(file) = files.first() {
+                emit_error(&app, &id, &repo, file, files_total, message);
+            }
+            return;
+        }
+    };
     let mut checksums: HashMap<String, String> = HashMap::new();
     let mut downloaded_total = 0u64;
 
@@ -1012,6 +1041,11 @@ fn safe_relative(path: &str) -> AppResult<PathBuf> {
 mod tests {
     use super::*;
     use crate::util::now_ms;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        time::{Duration, Instant},
+    };
 
     fn entry(path: &str, size: u64) -> TreeEntry {
         TreeEntry {
@@ -1069,14 +1103,177 @@ mod tests {
     }
 
     #[test]
-    fn gated_errors_name_the_token_setting() {
-        let message = access_error(reqwest::StatusCode::UNAUTHORIZED);
-        assert!(message.contains("401"), "{message}");
-        assert!(message.contains("gated or private"), "{message}");
-        assert!(message.contains("access token"), "{message}");
+    fn access_errors_separate_authentication_from_permission() {
+        let unauthorized = access_error(reqwest::StatusCode::UNAUTHORIZED);
+        assert!(unauthorized.contains("401"), "{unauthorized}");
+        assert!(unauthorized.contains("rejected the access token"), "{unauthorized}");
+        assert!(unauthorized.contains("invalid or expired"), "{unauthorized}");
+        assert!(!unauthorized.contains("accept its licence"), "{unauthorized}");
+
+        let forbidden = access_error(reqwest::StatusCode::FORBIDDEN);
+        assert!(forbidden.contains("403"), "{forbidden}");
+        assert!(forbidden.contains("gated or private"), "{forbidden}");
+        assert!(forbidden.contains("accept its licence"), "{forbidden}");
+        assert!(forbidden.contains("access token"), "{forbidden}");
+
         let missing = access_error(reqwest::StatusCode::NOT_FOUND);
         assert!(missing.contains("404"));
         assert!(missing.contains("access token"));
+    }
+
+    fn mock_tree_server(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking mock server");
+        let address = listener.local_addr().expect("mock address");
+        let handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(pair) => break pair,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "mock server accept timed out");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(err) => panic!("mock server accept failed: {err}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("mock read timeout");
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).expect("mock request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("mock response");
+            String::from_utf8_lossy(&request).into_owned()
+        });
+        (format!("http://{address}/api/models"), handle)
+    }
+
+    #[tokio::test]
+    async fn mock_gated_tree_sends_token_and_names_the_fix() {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("mock client");
+        for (status, code, expected) in [
+            ("401 Unauthorized", "401", "rejected the access token"),
+            ("403 Forbidden", "403", "accept its licence"),
+        ] {
+            let (base, server) = mock_tree_server(status, "{}");
+            let error = fetch_quants_from(&client, &base, "org/private", "hf_mock_token")
+                .await
+                .expect_err("gated tree must fail");
+            let request = server.join().expect("mock server result");
+            let lower = request.to_ascii_lowercase();
+            assert!(
+                request.starts_with(
+                    "GET /api/models/org/private/tree/main?recursive=true&expand=true HTTP/1.1"
+                ),
+                "unexpected request target: {request}"
+            );
+            assert!(
+                lower.contains("authorization: bearer hf_mock_token"),
+                "token was not sent: {request}"
+            );
+            assert!(error.contains(code), "{error}");
+            assert!(error.contains(expected), "{error}");
+            assert!(!error.contains("hf_mock_token"), "token leaked: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_gated_tree_without_token_stays_unauthenticated() {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("mock client");
+        let (base, server) = mock_tree_server("401 Unauthorized", "{}");
+        let error = fetch_quants_from(&client, &base, "org/private", "")
+            .await
+            .expect_err("gated tree must fail");
+        let request = server.join().expect("mock server result").to_ascii_lowercase();
+        assert!(!request.contains("authorization:"), "{request}");
+        assert!(error.contains("401"), "{error}");
+        assert!(error.contains("rejected the access token"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn mock_public_tree_omits_blank_token() {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("mock client");
+        let (base, server) = mock_tree_server("200 OK", "[]");
+        let quants = fetch_quants_from(&client, &base, "org/public", "   ")
+            .await
+            .expect("public tree");
+        assert!(quants.is_empty());
+        let request = server.join().expect("mock server result");
+        assert!(
+            request.starts_with("GET /api/models/org/public/tree/main?recursive=true&expand=true HTTP/1.1"),
+            "{request}"
+        );
+        assert!(
+            !request.to_ascii_lowercase().contains("authorization:"),
+            "{request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_checksum_lookup_rejects_auth_errors() {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("mock client");
+        let (base, server) = mock_tree_server("403 Forbidden", "{}");
+        let error = fetch_checksums_from(&client, &base, "org/private", "hf_mock_token")
+            .await
+            .expect_err("checksum lookup must fail");
+        let request = server.join().expect("mock server result");
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer hf_mock_token"),
+            "token was not sent: {request}"
+        );
+        assert!(error.contains("403"), "{error}");
+        assert!(error.contains("gated or private"), "{error}");
+        assert!(!error.contains("hf_mock_token"), "token leaked: {error}");
+    }
+
+    #[tokio::test]
+    async fn mock_checksum_lookup_returns_lfs_oids() {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("mock client");
+        let body = r#"[{"path":"model.gguf","lfs":{"size":3,"oid":"abc123"}}]"#;
+        let (base, server) = mock_tree_server("200 OK", body);
+        let checksums = fetch_checksums_from(&client, &base, "org/public", "")
+            .await
+            .expect("checksum lookup");
+        assert_eq!(checksums.get("model.gguf"), Some(&"abc123".to_string()));
+        let request = server.join().expect("mock server result").to_ascii_lowercase();
+        assert!(!request.contains("authorization:"), "{request}");
     }
 
     #[test]

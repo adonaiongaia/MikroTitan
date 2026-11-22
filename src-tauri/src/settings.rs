@@ -346,7 +346,8 @@ impl SettingsStore {
             path,
             settings: RwLock::new(settings),
         };
-        store.persist();
+        let initial = store.get();
+        let _ = store.persist(&initial);
         Ok(store)
     }
 
@@ -377,30 +378,32 @@ impl SettingsStore {
                 .settings
                 .write()
                 .map_err(|_| AppError::message("Settings are locked by another operation."))?;
+            self.persist(&clean)?;
             *guard = clean.clone();
         }
-        self.persist();
         Ok(clean)
     }
 
-    fn persist(&self) {
-        let current = self.get();
-        let Ok(json) = serde_json::to_string_pretty(&current) else {
-            return;
-        };
+    fn persist(&self, settings: &AppSettings) -> AppResult<()> {
+        let json = serde_json::to_string_pretty(settings)
+            .map_err(|err| AppError::message(format!("Could not encode settings: {err}")))?;
         let tmp = self.path.with_extension("json.tmp");
-        if fs::write(&tmp, &json).is_ok() {
-            // The local API key and Hugging Face token live here, so restrict
-            // the temporary file before it is renamed into place.
-            restrict_owner_only(&tmp);
-            if fs::rename(&tmp, &self.path).is_err() {
-                // Windows cannot rename over an existing file; write the
-                // existing path directly and clean up the temporary file.
-                let _ = fs::write(&self.path, &json);
-                let _ = fs::remove_file(&tmp);
-            }
+        // The local API key and Hugging Face token live here, so the temporary
+        // file is created owner-only before it is renamed into place.
+        crate::util::write_private_temp(&tmp, json.as_bytes()).map_err(|err| {
+            AppError::message(format!("Could not write the settings file: {err}"))
+        })?;
+        if fs::rename(&tmp, &self.path).is_err() {
+            // Windows cannot rename over an existing file; write the existing
+            // path directly and clean up the temporary file.
+            let result = fs::write(&self.path, &json);
+            let _ = fs::remove_file(&tmp);
+            result.map_err(|err| {
+                AppError::message(format!("Could not replace the settings file: {err}"))
+            })?;
         }
         restrict_owner_only(&self.path);
+        Ok(())
     }
 }
 
@@ -663,6 +666,33 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600, "settings may contain secrets");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_save_keeps_the_previous_settings() {
+        let root = std::env::temp_dir().join(format!(
+            "janas-settings-failure-{}-{}",
+            std::process::id(),
+            crate::util::now_ms()
+        ));
+        fs::create_dir_all(&root).expect("create settings test root");
+        let settings_path = root.join("settings.json");
+        fs::create_dir(&settings_path).expect("make settings path a directory");
+        let store = SettingsStore {
+            path: settings_path,
+            settings: RwLock::new(AppSettings::default()),
+        };
+        let next = AppSettings {
+            models_dir: root.join("models").to_string_lossy().to_string(),
+            ..AppSettings::default()
+        };
+
+        assert!(store.save(next).is_err(), "a failed write must be reported");
+        assert!(
+            store.get().models_dir.is_empty(),
+            "in-memory settings must not change when persistence fails"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }

@@ -317,11 +317,9 @@ impl ApprovalRuleStore {
         let body = serde_json::to_vec_pretty(rules)
             .map_err(|err| AppError::message(format!("Could not encode approval rules: {err}")))?;
         let temporary = self.path.with_extension("json.tmp");
-        std::fs::write(&temporary, &body).map_err(|err| {
+        crate::util::write_private_temp(&temporary, &body).map_err(|err| {
             AppError::message(format!("Could not write the approval rule file: {err}"))
         })?;
-        // Restrict the temporary file too: it briefly contains the same rules.
-        restrict_file(&temporary);
         if std::fs::rename(&temporary, &self.path).is_err() {
             // Windows cannot rename over an existing file.
             std::fs::write(&self.path, &body).map_err(|err| {

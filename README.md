@@ -105,7 +105,7 @@ The composer's **Agent** toggle turns a chat into a bounded tool-running loop. I
 
 - **Download pause/resume** in the download dialog and the tray; pausing keeps the stream open and resume continues from the same byte.
 - **RAM/VRAM estimate** and destination preview for every quantization before download.
-- **Gated repositories:** Settings has an optional Hugging Face access token. When set, it is sent only to `huggingface.co` on search, tree/checksum and download requests, so gated or private GGUF repositories work. A 401/403 explains whether to accept the model's licence or add a token; public models keep working without one.
+- **Gated repositories:** Settings has an optional Hugging Face access token. When set, it is sent only to `huggingface.co` on search, tree/checksum and download requests, so gated or private GGUF repositories work. A 401 points to an invalid or expired token; a 403 points to the model licence or the token's access. Public models keep working without one.
 - **Model Library** view: local `.jns`/`.gguf` files with architecture, parameter count, publisher, size and quantization, plus one-click activation. Thinking and Tools badges come from a GGUF chat template when present, otherwise from the model family/name; the badge tooltip says which source was used.
 - **Integrity checks and cleanup:** verify any local model against the SHA-256 recorded in the download manifest, with a clear result when no upstream checksum was recorded. Delete a model with an awaited confirmation; the action is blocked while that file is the active model.
 - **MCP Server Hub**: register stdio servers with arguments, per-server environment variables and an optional working directory. Probes allow 30 seconds for startup, capture stderr and report early exits. Enabled servers' tools are namespaced into the chat model's tool list, executed through the same stdio session during the turn, and shown in the activity drawer. Per-server auto-approve skips the approval card for normal chat tool calls.
@@ -435,14 +435,14 @@ New UI pieces: `chat/SessionsRail`, `chat/EnginePanel`, `chat/TelemetryPanel`,
 
 - `npm run check` — TypeScript typecheck passed.
 - `npm test` — 23 Vitest tests pass across chat-session normalization/branching and MCP scope/reconciliation, including empty-scope request building and persistence-boundary checks.
-- `cargo test` — 153 tests pass, 0 failed; one network-dependent live-search smoke test is ignored by default.
+- `cargo test` — 161 tests pass, 0 failed; one network-dependent live-search smoke test is ignored by default.
 - `npm run appimage` — release build and AppImage bundling completed:
   - Artifact: `src-tauri/target/release/bundle/appimage/Studio for Janas_0.1.1_amd64.AppImage`
-  - Size: 84,883,960 bytes (80.94 MiB)
-  - SHA-256: `80fedf2d9f2eafd96888b3f8f3d282fa3a834acc6dbd04d3d253c519c5f623d2`
+  - Size: 84,883,960 bytes (80.95 MiB)
+  - SHA-256: `9d46a63bf685a578e85af870489d975a659a4600812ce8acc91cd7a4665c974b`
   - Contents: no Janas binaries are bundled; `usr/share/licenses/studio-for-janas/LICENSE` and `usr/share/doc/studio-for-janas/THIRD_PARTY_NOTICES.md` match the repository files byte-for-byte.
 - Runtime passes in an isolated profile exercised branching and version switching, per-chat drafts and MCP scope, backup restore and export/import, close-time saving, and model verify/delete. The delete confirmation now awaits the Tauri dialog, and window close flushes pending chat writes before destroying the window.
-- The approval-rule store, per-chat prompt normalization and Hugging Face token/error plumbing are covered by the Rust and Vitest suites; no live gated-repository download or Tauri UI pass was performed for this build.
+- The approval-rule store, per-chat prompt normalization and Hugging Face token/error plumbing are covered by the Rust and Vitest suites. Local mock-server tests assert that the bearer token is sent only on authenticated tree/checksum requests, blank tokens add no header, request targets are exact, 401 and 403 return different fixes, checksum auth failures are surfaced, and error strings do not contain the token. No live gated-repository download or Tauri UI pass was performed for this build.
 - The Tools badge, All/None controls, zero-tools hint and scope reconciliation are covered by typecheck, unit tests and the production build; `docs/screenshots/mcp-scope.png` shows the badge, populated scope and All/None controls in the running app.
 - Engine-specific checks from earlier builds (llama.cpp Vulkan KV-cache guard, context retry, MCP schema budget, managed Janas provisioning) remain covered by the Rust suite.
 
