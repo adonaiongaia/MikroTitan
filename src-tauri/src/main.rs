@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod agent;
+mod artifact_frame;
 mod chat_store;
 mod companions;
 mod converter;
@@ -12,6 +13,7 @@ mod dual_engine_harness;
 mod error;
 mod gguf;
 mod huggingface;
+mod logging;
 mod mcp;
 mod memory;
 mod provision;
@@ -368,6 +370,20 @@ fn chat_asset_data_url(store: State<'_, Arc<ChatStore>>, asset: String) -> AppRe
     store.asset_data_url(&asset)
 }
 
+#[tauri::command(rename_all = "snake_case")]
+fn artifact_save_file(path: String, contents: String, base64: bool) -> AppResult<String> {
+    system::save_artifact_file(&path, &contents, base64)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn artifact_register_frame(
+    frames: State<'_, artifact_frame::ArtifactFrames>,
+    html: String,
+    allow_network: bool,
+) -> AppResult<String> {
+    frames.register(html, allow_network)
+}
+
 #[tauri::command]
 fn chat_export_session(
     store: State<'_, Arc<ChatStore>>,
@@ -493,8 +509,24 @@ fn resume_download(manager: State<'_, Arc<DownloadManager>>, id: String) -> bool
 }
 
 fn main() {
+    if let Err(error) = logging::init() {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        // A dedicated scheme is the only way to run generated inline scripts
+        // under a strict app CSP: srcdoc inherits `script-src 'self'`.
+        .register_uri_scheme_protocol(artifact_frame::SCHEME, |ctx, request| {
+            use tauri::Manager;
+            match ctx
+                .app_handle()
+                .try_state::<artifact_frame::ArtifactFrames>()
+            {
+                Some(frames) => artifact_frame::respond(frames.inner(), request),
+                None => artifact_frame::unavailable(),
+            }
+        })
         .setup(|app| {
             let config_dir = app.path().app_config_dir()?;
             let data_dir = app.path().app_data_dir()?;
@@ -503,6 +535,7 @@ fn main() {
             }
 
             let store = Arc::new(SettingsStore::load(config_dir, data_dir.clone())?);
+            app.manage(artifact_frame::ArtifactFrames::default());
             let port = store.get().port;
             let memory = MemoryStore::load(data_dir.join("memory.json"));
             let chat_store = ChatStore::load(data_dir.join("chat-sessions"));
@@ -577,6 +610,8 @@ fn main() {
             chat_session_delete,
             chat_asset_data_url,
             chat_export_session,
+            artifact_save_file,
+            artifact_register_frame,
             chat_import_session,
             chat_branch_session,
             chat_export_all,

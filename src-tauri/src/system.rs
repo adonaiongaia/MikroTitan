@@ -24,6 +24,65 @@ use crate::{
 };
 
 // ---------------------------------------------------------------------------
+// Artifact export
+// ---------------------------------------------------------------------------
+/// Persist an exported artifact after the native save dialog (or a chat
+/// workspace write) has chosen the path. `base64` is used only for PNG data,
+/// and a `data:image/...;base64,` prefix is accepted for convenience.
+pub fn save_artifact_file(path: &str, contents: &str, base64: bool) -> AppResult<String> {
+    const MAX_BYTES: usize = 32 * 1024 * 1024;
+    // The webview can only send text or a base64 data URL. Reject an
+    // over-large payload before base64 decoding allocates another copy.
+    const MAX_INPUT_BYTES: usize = MAX_BYTES * 2;
+
+    let target = path.trim();
+    if target.is_empty() {
+        return Err(AppError::message("Choose a file path before saving."));
+    }
+    if target.contains('\0') {
+        return Err(AppError::message("That file path is not valid."));
+    }
+    if contents.len() > MAX_INPUT_BYTES {
+        return Err(AppError::message(format!(
+            "This artifact is larger than the {} MiB save limit.",
+            MAX_BYTES / (1024 * 1024)
+        )));
+    }
+
+    let bytes = if base64 {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let payload = contents
+            .split_once(',')
+            .filter(|(head, _)| head.starts_with("data:") && head.ends_with(";base64"))
+            .map(|(_, body)| body)
+            .unwrap_or(contents);
+        STANDARD.decode(payload.trim()).map_err(|error| {
+            AppError::message(format!("The image data could not be decoded: {error}"))
+        })?
+    } else {
+        contents.as_bytes().to_vec()
+    };
+    if bytes.len() > MAX_BYTES {
+        return Err(AppError::message(format!(
+            "This artifact is larger than the {} MiB save limit.",
+            MAX_BYTES / (1024 * 1024)
+        )));
+    }
+
+    let destination = PathBuf::from(target);
+    if destination.is_dir() {
+        return Err(AppError::message("That path is a directory, not a file."));
+    }
+    if let Some(parent) = destination.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    fs::write(&destination, bytes)?;
+    Ok(destination.display().to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Telemetry
 // ---------------------------------------------------------------------------
 

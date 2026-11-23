@@ -32,3 +32,17 @@ export function buildWebContext(
     .join("\n\n");
   return `Retrieved web pages for the query "${query}". These pages were fetched from the internet for this turn. Use them as evidence and cite them as [S1], [S2], and so on.\n\n${pages}`;
 }
+
+/**
+ * Optional instruction for models that should mark complete documents for the
+ * live artifact pane. It is appended to the system message only when the user
+ * turns the explicit-tag setting on; automatic fenced-block detection works
+ * either way.
+ */
+export const ARTIFACT_TAGS_INSTRUCTION = `Live artifacts:
+- When a complete, self-contained document is the deliverable, wrap it in one <artifact> tag instead of a fenced code block:
+  <artifact id="short-stable-id" type="html" title="Short title">…</artifact>
+- Supported types: html, svg, mermaid, markdown, json, csv. Put the document body directly inside the tag; a fenced body with the same language is also accepted. Do not use any other type.
+- Use the same id when revising the same artifact in a later turn so the app can show the new version and its diff. Use a new id for a separate artifact, and keep the title short.
+- Only tag substantial, standalone content meant to be previewed. Keep short snippets, commands, diffs and illustrative examples in normal fenced code blocks. Do not repeat a tagged document outside the tag, and do not wrap the <artifact> tag itself in a code fence.
+- Never put secrets, credentials or private file contents in an artifact.`;

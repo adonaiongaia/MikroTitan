@@ -68,6 +68,8 @@ interface EnginePanelProps {
   workspaceLocked: boolean;
   systemPrompt: string;
   onSystemPromptChange: (value: string) => void;
+  explicitArtifactTags: boolean;
+  onExplicitArtifactTagsChange: (value: boolean) => void;
   usingDefaultPrompt: boolean;
   onUseDefaultPrompt: () => void;
   onMakeDefaultPrompt: () => void;
@@ -180,6 +182,8 @@ export function EnginePanel({
   workspaceLocked,
   systemPrompt,
   onSystemPromptChange,
+  explicitArtifactTags,
+  onExplicitArtifactTagsChange,
   usingDefaultPrompt,
   onUseDefaultPrompt,
   onMakeDefaultPrompt,
@@ -820,6 +824,14 @@ export function EnginePanel({
               ? "This chat follows the saved default. Editing here gives it its own prompt; new chats keep the default."
               : "This chat has its own prompt. Other chats and new chats keep the saved default."}
           </p>
+          <div className="rounded-lg border border-white/5 bg-white/[0.02] p-2.5">
+            <Toggle
+              checked={explicitArtifactTags}
+              onChange={onExplicitArtifactTagsChange}
+              label="Explicit artifact tags"
+              description="Append an instruction asking the model to wrap complete HTML, SVG, Mermaid, Markdown, JSON and CSV documents in <artifact> tags. It does not edit your prompt; fenced blocks still preview automatically."
+            />
+          </div>
         </section>
 
         <div className="space-y-2 rounded-xl border border-white/5 bg-white/[0.02] p-2.5">

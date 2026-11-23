@@ -5,6 +5,7 @@ import {
   Cpu,
   FolderOpen,
   Loader2,
+  PanelRight,
   Play,
   Terminal,
   Trash2,
@@ -22,6 +23,11 @@ import { usePersonas } from "../../hooks/usePersonas";
 import { useSettings } from "../../hooks/useSettings";
 import { useTelemetry } from "../../hooks/useTelemetry";
 import { api } from "../../lib/api";
+import {
+  artifactGroupFor,
+  collectChatArtifacts,
+  type Artifact,
+} from "../../lib/artifacts";
 import { cn } from "../../lib/cn";
 import { errorMessage, basename } from "../../lib/format";
 import {
@@ -30,7 +36,11 @@ import {
   reconcileCollectionScope,
 } from "../../lib/rag";
 import { recallFacts, useMemory } from "../../lib/memory";
-import { buildWebContext, CORE_SYSTEM_PROMPT } from "../../lib/prompts";
+import {
+  ARTIFACT_TAGS_INSTRUCTION,
+  buildWebContext,
+  CORE_SYSTEM_PROMPT,
+} from "../../lib/prompts";
 import { siblingsFor } from "../../lib/chatSessions";
 import { mcpServerInputs, mcpServersInScope } from "../../lib/mcpScope";
 import type {
@@ -45,6 +55,7 @@ import type {
   RagChunk,
   StorageBenchmark,
 } from "../../types";
+import { ArtifactPane } from "../artifacts/ArtifactPane";
 import { knowledgeApi } from "../knowledge/api";
 import { DocsDrawer } from "../knowledge/DocsDrawer";
 import { RagSourceDrawer } from "../knowledge/RagSourceDrawer";
@@ -95,6 +106,10 @@ export function ChatView({ engine, chat, onOpenKnowledge }: ChatViewProps) {
   const [defaultSystemPrompt, setDefaultSystemPrompt] = usePersistentState(
     "janas.systemPrompt",
     "",
+  );
+  const [explicitArtifactTags, setExplicitArtifactTags] = usePersistentState(
+    "janas.artifacts.explicitTags.v1",
+    false,
   );
   const personas = usePersonas();
   // A chat owns its instructions when it has an explicit value; otherwise it
@@ -169,6 +184,67 @@ export function ChatView({ engine, chat, onOpenKnowledge }: ChatViewProps) {
     "janas.ui.telemetryCollapsed",
     false,
   );
+  const [artifactPaneOpen, setArtifactPaneOpen] = usePersistentState(
+    "janas.ui.artifactPaneOpen",
+    false,
+  );
+  // The selected artifact follows the chat, not the window. Switching chats
+  // restores that chat's canvas; switching siblings for a persisted root that
+  // is not on the new branch falls back to the newest artifact in the branch.
+  const [artifactSelection, setArtifactSelection] = usePersistentState<
+    Record<string, { rootId: string; versionId: string | null }>
+  >("janas.artifacts.active.v2", {});
+
+  const artifactIndex = useMemo(
+    () =>
+      collectChatArtifacts(chat.messages, {
+        streamingMessageId: chat.streaming
+          ? (chat.messages[chat.messages.length - 1]?.id ?? null)
+          : null,
+      }),
+    [chat.messages, chat.streaming],
+  );
+  const activeArtifactSelection = chat.activeId
+    ? artifactSelection[chat.activeId]
+    : undefined;
+  const selectedArtifactRootId = useMemo(() => {
+    if (
+      activeArtifactSelection &&
+      artifactGroupFor(artifactIndex, activeArtifactSelection.rootId)
+    ) {
+      return activeArtifactSelection.rootId;
+    }
+    return artifactIndex.latest?.rootId ?? null;
+  }, [activeArtifactSelection, artifactIndex]);
+  // The exact revision the user opened. A sibling branch may not contain it, so
+  // the pane falls back to that group's latest version there.
+  const selectedArtifactVersionId =
+    activeArtifactSelection &&
+    activeArtifactSelection.rootId === selectedArtifactRootId
+      ? activeArtifactSelection.versionId
+      : null;
+
+  const openArtifact = useCallback(
+    (artifact: Artifact) => {
+      if (chat.activeId) {
+        setArtifactSelection((previous) => ({
+          ...previous,
+          [chat.activeId]: {
+            rootId: artifact.rootId,
+            versionId: artifact.id,
+          },
+        }));
+      }
+      setArtifactPaneOpen(true);
+    },
+    [chat.activeId, setArtifactPaneOpen, setArtifactSelection],
+  );
+
+  // The artifact pane takes the space the engine panel was using, so the
+  // transcript and composer keep a usable width instead of being squeezed.
+  useEffect(() => {
+    if (artifactPaneOpen) setEngineCollapsed(true);
+  }, [artifactPaneOpen, setEngineCollapsed]);
 
   const project = chat.project;
   const [projectBusy, setProjectBusy] = useState(false);
@@ -642,7 +718,12 @@ export function ChatView({ engine, chat, onOpenKnowledge }: ChatViewProps) {
             .map((fact) => `- ${fact.text}`)
             .join("\n")}`
         : "";
-      const combinedSystemPrompt = [CORE_SYSTEM_PROMPT, systemPrompt, memoryBlock]
+      const combinedSystemPrompt = [
+        CORE_SYSTEM_PROMPT,
+        systemPrompt,
+        explicitArtifactTags ? ARTIFACT_TAGS_INSTRUCTION : "",
+        memoryBlock,
+      ]
         .filter(Boolean)
         .join("\n\n");
       const mcpInputs = mcpServerInputs(mcpServers, chat.mcpServerIds);
@@ -668,6 +749,7 @@ export function ChatView({ engine, chat, onOpenKnowledge }: ChatViewProps) {
     [
       chat.mcpServerIds,
       contextMax,
+      explicitArtifactTags,
       mcpServers,
       memory.facts,
       preferences,
@@ -808,6 +890,7 @@ export function ChatView({ engine, chat, onOpenKnowledge }: ChatViewProps) {
     Math.ceil(
       (messageChars +
         systemPrompt.length +
+        (explicitArtifactTags ? ARTIFACT_TAGS_INSTRUCTION.length : 0) +
         input.length +
         (project?.bundle.length ?? 0)) /
         4,
@@ -892,6 +975,20 @@ export function ChatView({ engine, chat, onOpenKnowledge }: ChatViewProps) {
             ) : null}
           </div>
           <div className="flex shrink-0 items-center gap-1.5">
+            {artifactIndex.groups.length ? (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => setArtifactPaneOpen((value) => !value)}
+                icon={<PanelRight className="h-3.5 w-3.5" />}
+                title="Toggle the live artifact workspace pane"
+              >
+                Artifacts
+                <span className="ml-0.5 rounded border border-acid-400/25 bg-acid-400/10 px-1 py-px text-[8px] font-semibold text-acid-200/90">
+                  {artifactIndex.groups.length}
+                </span>
+              </Button>
+            ) : null}
             <Button
               size="sm"
               variant="ghost"
@@ -1032,6 +1129,9 @@ export function ChatView({ engine, chat, onOpenKnowledge }: ChatViewProps) {
                       }
                       agentActions={agentActions}
                       onOpenRagSource={setSourceChunk}
+                      artifacts={artifactIndex.byMessage[message.id]}
+                      onOpenArtifact={openArtifact}
+                      activeArtifactRootId={selectedArtifactRootId}
                     />
                     </MessageBoundary>
                   );
@@ -1121,6 +1221,24 @@ export function ChatView({ engine, chat, onOpenKnowledge }: ChatViewProps) {
         />
       </section>
 
+      <ArtifactPane
+        open={artifactPaneOpen}
+        index={artifactIndex}
+        selectedRootId={selectedArtifactRootId}
+        selectedVersionId={selectedArtifactVersionId}
+        onSelectArtifact={(rootId, versionId) => {
+          if (!chat.activeId) return;
+          setArtifactSelection((previous) => ({
+            ...previous,
+            [chat.activeId]: { rootId, versionId },
+          }));
+        }}
+        onOpen={() => setArtifactPaneOpen(true)}
+        onClose={() => setArtifactPaneOpen(false)}
+        workspaceRoot={workspaceRoot}
+        onError={chat.setError}
+      />
+
       <EnginePanel
         collapsed={engineCollapsed}
         onToggle={() => setEngineCollapsed((value) => !value)}
@@ -1143,6 +1261,8 @@ export function ChatView({ engine, chat, onOpenKnowledge }: ChatViewProps) {
         workspaceLocked={workspaceLocked}
         systemPrompt={systemPrompt}
         onSystemPromptChange={setSystemPrompt}
+        explicitArtifactTags={explicitArtifactTags}
+        onExplicitArtifactTagsChange={setExplicitArtifactTags}
         usingDefaultPrompt={usingDefaultPrompt}
         onUseDefaultPrompt={() => chat.setSessionSystemPrompt(null)}
         onMakeDefaultPrompt={() => setDefaultSystemPrompt(systemPrompt)}

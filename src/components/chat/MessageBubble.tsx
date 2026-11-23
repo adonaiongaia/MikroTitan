@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import {
   Check,
   ChevronLeft,
@@ -17,6 +17,10 @@ import remarkGfm from "remark-gfm";
 import { api } from "../../lib/api";
 import { errorMessage } from "../../lib/format";
 import {
+  splitArtifactSegments,
+  type Artifact,
+} from "../../lib/artifacts";
+import {
   formatRagScore,
   linkifyDocCitations,
   ragChunkForCitation,
@@ -24,6 +28,7 @@ import {
   sortByCitation,
 } from "../../lib/rag";
 import type { ChatMessage, Citation, RagChunk } from "../../types";
+import { ArtifactCard } from "../artifacts/ArtifactCard";
 import { Logo } from "../Logo";
 import { AgentTraceView, type AgentActions } from "./AgentTrace";
 import { ChatImage } from "./ChatImage";
@@ -43,6 +48,10 @@ interface MessageBubbleProps {
   agentActions?: AgentActions;
   /** Opens the snippet drawer behind a [D#] pill. */
   onOpenRagSource?: (chunk: RagChunk) => void;
+  /** Renderable blocks detected in this reply; replaced with inline cards. */
+  artifacts?: Artifact[];
+  onOpenArtifact?: (artifact: Artifact) => void;
+  activeArtifactRootId?: string | null;
 }
 
 function safeCitations(citations: Citation[] | undefined): Citation[] {
@@ -86,6 +95,9 @@ export function MessageBubble({
   editable,
   agentActions,
   onOpenRagSource,
+  artifacts,
+  onOpenArtifact,
+  activeArtifactRootId,
 }: MessageBubbleProps) {
   const [copied, setCopied] = useState(false);
   const [linkError, setLinkError] = useState<string | null>(null);
@@ -99,8 +111,8 @@ export function MessageBubble({
   const ragSources = Array.isArray(message.rag_sources)
     ? sortByCitation(message.rag_sources)
     : [];
-  const renderedContent = linkifyDocCitations(content, ragSources);
   const trace = message.agentTrace ?? null;
+  const segments = splitArtifactSegments(content, artifacts ?? []);
   const empty = !content && !reasoning && !trace;
   const versions = versionIds?.length ? versionIds : [message.id];
   const activeVersion = Math.max(
@@ -138,6 +150,54 @@ export function MessageBubble({
       setLinkError(errorMessage(err));
     }
   };
+
+  const renderMarkdown = (markdown: string) => (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      // The default transform blanks non-http schemes, which would turn
+      // rag:// citation markers into plain text. The `a` renderer below
+      // decides what may actually be followed.
+      urlTransform={(url) => url}
+      components={{
+        // The webview cannot navigate away from the studio, and the system
+        // opener keeps http(s) links in the user's browser.
+        a: ({ href, children }) => {
+          // A [D#] marker is rewritten to rag:// before rendering. It opens
+          // the exact retrieved snippet instead of a URL.
+          const chunk = href?.startsWith("rag://")
+            ? ragChunkForCitation(ragSources, href.slice("rag://".length))
+            : null;
+          if (chunk) {
+            return (
+              <button
+                type="button"
+                onClick={() => onOpenRagSource?.(chunk)}
+                title={`${chunk.relative_path} · lines ${chunk.start_line}–${chunk.end_line} · ${formatRagScore(chunk.score)} relevance`}
+                className="mx-0.5 inline-flex items-center gap-0.5 rounded border border-acid-400/30 bg-acid-400/10 px-1 py-px align-baseline font-mono text-[9.5px] text-acid-200 transition hover:border-acid-400/60 hover:bg-acid-400/20"
+              >
+                [{children}]
+              </button>
+            );
+          }
+          return (
+            <a
+              href={isWebUrl(href) ? href : undefined}
+              onClick={(event) => {
+                if (!isWebUrl(href)) return;
+                event.preventDefault();
+                void openLink(href);
+              }}
+              rel="noreferrer noopener"
+            >
+              {children}
+            </a>
+          );
+        },
+      }}
+    >
+      {linkifyDocCitations(markdown, ragSources)}
+    </ReactMarkdown>
+  );
 
   const actions = (
     <div className="flex items-center gap-0.5 opacity-0 transition group-hover:opacity-100 focus-within:opacity-100">
@@ -326,51 +386,20 @@ export function MessageBubble({
           </div>
         ) : !content && trace ? null : (
           <div className="md">
-            <ReactMarkdown
-              remarkPlugins={[remarkGfm]}
-              // The default transform blanks non-http schemes, which would
-              // turn rag:// citation markers into plain text. The `a`
-              // renderer below decides what may actually be followed.
-              urlTransform={(url) => url}
-              components={{
-                // The webview cannot navigate away from the studio, and the
-                // system opener keeps http(s) links in the user's browser.
-                a: ({ href, children }) => {
-                  // A [D#] marker is rewritten to rag:// before rendering. It
-                  // opens the exact retrieved snippet instead of a URL.
-                  const chunk = href?.startsWith("rag://")
-                    ? ragChunkForCitation(ragSources, href.slice("rag://".length))
-                    : null;
-                  if (chunk) {
-                    return (
-                      <button
-                        type="button"
-                        onClick={() => onOpenRagSource?.(chunk)}
-                        title={`${chunk.relative_path} · lines ${chunk.start_line}–${chunk.end_line} · ${formatRagScore(chunk.score)} relevance`}
-                        className="mx-0.5 inline-flex items-center gap-0.5 rounded border border-acid-400/30 bg-acid-400/10 px-1 py-px align-baseline font-mono text-[9.5px] text-acid-200 transition hover:border-acid-400/60 hover:bg-acid-400/20"
-                      >
-                        [{children}]
-                      </button>
-                    );
-                  }
-                  return (
-                    <a
-                      href={isWebUrl(href) ? href : undefined}
-                      onClick={(event) => {
-                        if (!isWebUrl(href)) return;
-                        event.preventDefault();
-                        void openLink(href);
-                      }}
-                      rel="noreferrer noopener"
-                    >
-                      {children}
-                    </a>
-                  );
-                },
-              }}
-            >
-              {renderedContent}
-            </ReactMarkdown>
+            {segments.map((segment, index) =>
+              segment.kind === "artifact" ? (
+                <ArtifactCard
+                  key={`artifact-${segment.artifact.id}`}
+                  artifact={segment.artifact}
+                  active={segment.artifact.rootId === activeArtifactRootId}
+                  onOpen={onOpenArtifact}
+                />
+              ) : segment.content.trim() ? (
+                <Fragment key={`markdown-${index}`}>
+                  {renderMarkdown(segment.content)}
+                </Fragment>
+              ) : null,
+            )}
             {streaming ? (
               <span className="ml-0.5 inline-block h-4 w-1.5 translate-y-0.5 animate-pulse-soft rounded-sm bg-acid-400/80" />
             ) : null}
