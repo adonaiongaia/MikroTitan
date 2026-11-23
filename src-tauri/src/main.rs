@@ -2,6 +2,7 @@
 
 mod agent;
 mod chat_store;
+mod companions;
 mod converter;
 mod capabilities;
 mod engine;
@@ -349,6 +350,14 @@ async fn list_model_quants(
 }
 
 #[tauri::command]
+async fn inspect_repo_bundles(
+    store: State<'_, Arc<SettingsStore>>,
+    repo: String,
+) -> AppResult<huggingface::HfRepoBundles> {
+    huggingface::inspect_repo_bundles(repo, &store.get().hf_token).await
+}
+
+#[tauri::command]
 fn start_download(
     app: AppHandle,
     manager: State<'_, Arc<DownloadManager>>,
@@ -467,6 +476,7 @@ fn main() {
             cancel_conversion,
             search_models,
             list_model_quants,
+            inspect_repo_bundles,
             start_download,
             cancel_download,
             pause_download,
@@ -481,6 +491,14 @@ fn main() {
             system::library_disk,
             system::verify_local_model,
             system::delete_local_model,
+            companions::inspect_gguf_companion,
+            companions::inspect_model_companions,
+            companions::library_companions,
+            companions::validate_model_bundle,
+            companions::save_model_bundle,
+            companions::delete_model_bundle,
+            companions::apply_model_bundle,
+            companions::pair_model_companions,
             mcp::mcp_probe,
             engines::binary::download_and_extract_binary,
             engines::binary::rollback_binary,

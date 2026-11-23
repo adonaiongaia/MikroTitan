@@ -8,6 +8,7 @@ import { errorMessage } from "../../lib/format";
 import type {
   DownloadProgress,
   DownloadRequest,
+  HfMmprojFile,
   HfModel,
   HfQuant,
 } from "../../types";
@@ -84,14 +85,13 @@ export function ModelsView({
   );
 
   const downloadQuant = useCallback(
-    async (model: HfModel, quant: HfQuant) => {
-      return onStart({
-        repo: model.id,
-        files: quant.files.map((file) => ({
-          path: file.path,
-          size: file.size,
-        })),
-      });
+    async (model: HfModel, quant: HfQuant, mmproj?: HfMmprojFile) => {
+      const files = quant.files.map((file) => ({
+        path: file.path,
+        size: file.size,
+      }));
+      if (mmproj) files.push({ path: mmproj.path, size: mmproj.size });
+      return onStart({ repo: model.id, files });
     },
     [onStart],
   );
@@ -204,7 +204,7 @@ export function ModelsView({
           modelsDir={settings?.models_dir ?? "models"}
           downloads={downloads}
           onClose={() => setSelected(null)}
-          onDownload={(quant) => downloadQuant(selected, quant)}
+          onDownload={(quant, mmproj) => downloadQuant(selected, quant, mmproj)}
           onPause={(id) => void onPause(id)}
           onResume={(id) => void onResume(id)}
           onCancel={(id) => void onCancel(id)}

@@ -3,11 +3,15 @@ import {
   Boxes,
   Brain,
   Cpu,
+  Eye,
   HardDrive,
+  Link2,
   RefreshCw,
   Search,
   ShieldCheck,
+  Sparkles,
   Trash2,
+  TriangleAlert,
   Wrench,
   type LucideIcon,
 } from "lucide-react";
@@ -17,11 +21,14 @@ import { ask } from "@tauri-apps/plugin-dialog";
 import { cn } from "../../lib/cn";
 import { errorMessage, formatBytes, formatRelativeDate } from "../../lib/format";
 import type {
+  CompanionPairing,
+  LibraryCompanions,
   LibraryDisk,
   LibraryModel,
   ModelVerification,
 } from "../../types";
 import { Button } from "../ui/Button";
+import { CompanionDrawer } from "./CompanionDrawer";
 
 interface ModelLibraryViewProps {
   onUseModel: (path: string) => Promise<void>;
@@ -39,16 +46,23 @@ export function ModelLibraryView({ onUseModel }: ModelLibraryViewProps) {
     Record<string, ModelVerification>
   >({});
   const [deleting, setDeleting] = useState<string | null>(null);
+  const [companions, setCompanions] = useState<LibraryCompanions | null>(
+    null,
+  );
+  const [pairing, setPairing] = useState<CompanionPairing | null>(null);
+  const [quickPairing, setQuickPairing] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      const [nextModels, nextDisk] = await Promise.all([
+      const [nextModels, nextDisk, nextCompanions] = await Promise.all([
         api.libraryModels(),
         api.libraryDisk(),
+        api.libraryCompanions().catch(() => null),
       ]);
       setModels(nextModels);
       setDisk(nextDisk);
+      setCompanions(nextCompanions);
       setError(null);
     } catch (err) {
       setError(errorMessage(err));
@@ -100,6 +114,43 @@ export function ModelLibraryView({ onUseModel }: ModelLibraryViewProps) {
       setError(errorMessage(err));
     } finally {
       setDeleting(null);
+    }
+  };
+
+  const companionByPath = useMemo(() => {
+    const map = new Map<string, LibraryCompanions["models"][number]>();
+    for (const info of companions?.models ?? []) map.set(info.path, info);
+    return map;
+  }, [companions]);
+
+  const pairingByMain = useMemo(() => {
+    const map = new Map<string, CompanionPairing>();
+    for (const item of companions?.pairings ?? []) {
+      map.set(item.main.path, item);
+    }
+    return map;
+  }, [companions]);
+
+  const quickPair = async (item: CompanionPairing) => {
+    const candidate = item.vision.recommended;
+    if (!candidate) {
+      setPairing(item);
+      return;
+    }
+    setQuickPairing(item.main.path);
+    setError(null);
+    try {
+      await api.pairModelCompanions(
+        item.main.path,
+        candidate.path,
+        item.draft.bound_path ?? item.draft.recommended?.path ?? null,
+        8,
+      );
+      await onUseModel(item.main.path);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setQuickPairing(null);
     }
   };
 
@@ -181,7 +232,7 @@ export function ModelLibraryView({ onUseModel }: ModelLibraryViewProps) {
           </div>
         ) : filtered.length ? (
           <div className="overflow-hidden rounded-xl border border-white/5">
-            <div className="grid grid-cols-[minmax(200px,2fr)_100px_90px_120px_110px_110px_170px] gap-3 border-b border-white/5 bg-white/[0.02] px-4 py-2 text-[9px] uppercase tracking-wider text-slate-600">
+            <div className="grid grid-cols-[minmax(200px,2fr)_100px_90px_120px_110px_110px_210px] gap-3 border-b border-white/5 bg-white/[0.02] px-4 py-2 text-[9px] uppercase tracking-wider text-slate-600">
               <span>Model</span>
               <span>Architecture</span>
               <span>Params</span>
@@ -194,7 +245,7 @@ export function ModelLibraryView({ onUseModel }: ModelLibraryViewProps) {
               {filtered.map((model) => (
                 <div
                   key={model.path}
-                  className="group grid grid-cols-[minmax(200px,2fr)_100px_90px_120px_110px_110px_170px] items-center gap-3 px-4 py-3 transition hover:bg-white/[0.02]"
+                  className="group grid grid-cols-[minmax(200px,2fr)_100px_90px_120px_110px_110px_210px] items-center gap-3 px-4 py-3 transition hover:bg-white/[0.02]"
                 >
                   <div className="min-w-0">
                     <div className="flex items-center gap-2">
@@ -242,6 +293,20 @@ export function ModelLibraryView({ onUseModel }: ModelLibraryViewProps) {
                         ) : null}
                       </div>
                     ) : null}
+                    <CompanionRowBadges
+                      model={model}
+                      info={companionByPath.get(model.path) ?? null}
+                      pairing={pairingByMain.get(model.path) ?? null}
+                      busy={quickPairing === model.path}
+                      onQuickPair={() => {
+                        const item = pairingByMain.get(model.path);
+                        if (item) void quickPair(item);
+                      }}
+                      onOpenPairing={() => {
+                        const item = pairingByMain.get(model.path);
+                        if (item) setPairing(item);
+                      }}
+                    />
                     {model.duplicate ||
                     model.same_repo_count > 1 ||
                     verifications[model.path] ? (
@@ -321,6 +386,20 @@ export function ModelLibraryView({ onUseModel }: ModelLibraryViewProps) {
                       )}
                       Delete
                     </button>
+                    {pairingByMain.has(model.path) ? (
+                      <button
+                        type="button"
+                        title="Choose and test the projector and draft model for this bundle"
+                        onClick={() => {
+                          const item = pairingByMain.get(model.path);
+                          if (item) setPairing(item);
+                        }}
+                        className="inline-flex items-center gap-1 rounded-md border border-acid-400/20 bg-acid-400/5 px-1.5 py-0.5 text-[9px] text-acid-200 transition hover:bg-acid-400/10"
+                      >
+                        <Link2 className="h-2.5 w-2.5" />
+                        Pair
+                      </button>
+                    ) : null}
                     <button
                       type="button"
                       title={
@@ -364,6 +443,107 @@ export function ModelLibraryView({ onUseModel }: ModelLibraryViewProps) {
         <Cpu className="h-3 w-3" />
         Scanned from your models folder. No manifest is uploaded anywhere.
       </div>
+
+      {pairing ? (
+        <CompanionDrawer
+          pairing={pairing}
+          models={companions?.models ?? []}
+          onClose={() => setPairing(null)}
+          onUse={onUseModel}
+          onChanged={() => void refresh()}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+/** Vision and speculation state for one library row, driven by header facts. */
+function CompanionRowBadges({
+  model,
+  info,
+  pairing,
+  busy,
+  onQuickPair,
+  onOpenPairing,
+}: {
+  model: LibraryModel;
+  info: LibraryCompanions["models"][number] | null;
+  pairing: CompanionPairing | null;
+  busy: boolean;
+  onQuickPair: () => void;
+  onOpenPairing: () => void;
+}) {
+  if (!info) return null;
+
+  if (info.role === "mmproj") {
+    return (
+      <div className="mt-1 flex flex-wrap items-center gap-1">
+        <span className="inline-flex items-center gap-1 rounded border border-sky-400/20 bg-sky-400/5 px-1.5 py-0.5 text-[8px] text-sky-300">
+          <Eye className="h-2.5 w-2.5" /> Vision projector
+        </span>
+        <span className="rounded border border-white/10 bg-white/5 px-1 py-0.5 font-mono text-[8px] text-slate-500">
+          {info.vision_family ?? "family unknown"}
+        </span>
+      </div>
+    );
+  }
+
+  if (info.role === "draft_candidate") {
+    return (
+      <div className="mt-1 flex flex-wrap items-center gap-1">
+        <span className="inline-flex items-center gap-1 rounded border border-violet-400/20 bg-violet-400/5 px-1.5 py-0.5 text-[8px] text-violet-300">
+          <Sparkles className="h-2.5 w-2.5" /> Draft-sized
+        </span>
+        <span className="rounded border border-white/10 bg-white/5 px-1 py-0.5 font-mono text-[8px] text-slate-500">
+          {info.architecture ?? model.architecture} · {info.vocab_size ?? "?"} vocab
+        </span>
+      </div>
+    );
+  }
+
+  if (!pairing) return null;
+
+  const visionReady = Boolean(pairing.vision.bound_path);
+  const draftPaired = Boolean(pairing.draft.bound_path);
+
+  return (
+    <div className="mt-1 flex flex-wrap items-center gap-1">
+      {info.role === "vision_main" ? (
+        visionReady ? (
+          <span className="inline-flex items-center gap-1 rounded border border-emerald-400/25 bg-emerald-400/10 px-1.5 py-0.5 text-[8px] text-emerald-300">
+            <Eye className="h-2.5 w-2.5" /> Vision ready
+          </span>
+        ) : (
+          <button
+            type="button"
+            onClick={onQuickPair}
+            disabled={busy}
+            title={pairing.vision.message}
+            className="inline-flex items-center gap-1 rounded border border-amber-400/30 bg-amber-400/10 px-1.5 py-0.5 text-[8px] text-amber-200 transition hover:bg-amber-400/15 disabled:opacity-50"
+          >
+            {busy ? (
+              <RefreshCw className="h-2.5 w-2.5 animate-spin" />
+            ) : (
+              <TriangleAlert className="h-2.5 w-2.5" />
+            )}
+            Missing MMPROJ · Pair
+          </button>
+        )
+      ) : null}
+      {draftPaired ? (
+        <span className="inline-flex items-center gap-1 rounded border border-violet-400/25 bg-violet-400/10 px-1.5 py-0.5 text-[8px] text-violet-200">
+          <Sparkles className="h-2.5 w-2.5" /> Draft paired (+Speculative)
+        </span>
+      ) : pairing.draft.recommended ? (
+        <button
+          type="button"
+          onClick={onOpenPairing}
+          title={pairing.draft.message}
+          className="inline-flex items-center gap-1 rounded border border-white/10 bg-white/5 px-1.5 py-0.5 text-[8px] text-slate-400 transition hover:text-violet-200"
+        >
+          <Sparkles className="h-2.5 w-2.5" /> Draft available
+        </button>
+      ) : null}
     </div>
   );
 }

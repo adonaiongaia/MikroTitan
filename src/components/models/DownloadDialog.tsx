@@ -2,16 +2,24 @@ import { useEffect, useMemo, useState } from "react";
 import {
   AlertTriangle,
   Download,
+  Eye,
   FolderTree,
   Pause,
   Play,
+  Sparkles,
   X,
 } from "lucide-react";
 
 import { api } from "../../lib/api";
 import { cn } from "../../lib/cn";
 import { errorMessage, formatBytes } from "../../lib/format";
-import type { DownloadProgress, HfModel, HfQuant } from "../../types";
+import type {
+  DownloadProgress,
+  HfDraftHint,
+  HfMmprojFile,
+  HfModel,
+  HfQuant,
+} from "../../types";
 import { Button } from "../ui/Button";
 import { ProgressBar } from "../ui/ProgressBar";
 
@@ -20,7 +28,7 @@ interface DownloadDialogProps {
   modelsDir: string;
   downloads: Record<string, DownloadProgress>;
   onClose: () => void;
-  onDownload: (quant: HfQuant) => Promise<string>;
+  onDownload: (quant: HfQuant, mmproj?: HfMmprojFile) => Promise<string>;
   onPause: (id: string) => void;
   onResume: (id: string) => void;
   onCancel: (id: string) => void;
@@ -40,6 +48,10 @@ export function DownloadDialog({
   const [selected, setSelected] = useState<string>(
     model.quants[0]?.quant ?? "",
   );
+  const [projectors, setProjectors] = useState<HfMmprojFile[]>([]);
+  const [selectedMmproj, setSelectedMmproj] = useState<string | null>(null);
+  const [includeMmproj, setIncludeMmproj] = useState(false);
+  const [draftHint, setDraftHint] = useState<HfDraftHint | null>(null);
   const [loading, setLoading] = useState(model.quants.length === 0);
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -63,13 +75,19 @@ export function DownloadDialog({
     let cancelled = false;
     setLoading(true);
     api
-      .listModelQuants(model.id)
-      .then((fresh) => {
+      .inspectRepoBundles(model.id)
+      .then((bundles) => {
         if (cancelled) return;
-        setQuants(fresh);
-        if (!fresh.some((quant) => quant.quant === selected)) {
-          setSelected(fresh[0]?.quant ?? "");
+        setQuants(bundles.quants);
+        if (!bundles.quants.some((quant) => quant.quant === selected)) {
+          setSelected(bundles.quants[0]?.quant ?? "");
         }
+        setProjectors(bundles.available_mmproj);
+        setDraftHint(bundles.draft_hint);
+        const recommended =
+          bundles.recommended_mmproj ?? bundles.available_mmproj[0]?.path ?? null;
+        setSelectedMmproj(recommended);
+        setIncludeMmproj(Boolean(recommended));
       })
       .catch((err) => {
         if (!cancelled) setError(errorMessage(err));
@@ -96,6 +114,14 @@ export function DownloadDialog({
     () => quants.find((quant) => quant.quant === selected) ?? quants[0],
     [quants, selected],
   );
+  const mmproj = useMemo(
+    () => projectors.find((projector) => projector.path === selectedMmproj),
+    [projectors, selectedMmproj],
+  );
+  const chosenMmproj = includeMmproj ? mmproj : undefined;
+  const combinedBytes =
+    (active?.size_bytes ?? 0) + (chosenMmproj?.size ?? 0);
+
   const job = downloadId ? downloads[downloadId] : undefined;
   const running = job ? ["preparing", "downloading"].includes(job.status) : false;
   const paused = job?.status === "paused";
@@ -103,14 +129,14 @@ export function DownloadDialog({
 
   const destination = `${modelsDir.replace(/\/+$/, "")}/${model.id}`;
   const insufficient =
-    active != null && freeBytes != null && active.size_bytes > freeBytes;
+    active != null && freeBytes != null && combinedBytes > freeBytes;
 
   const start = async () => {
     if (!active) return;
     setStarting(true);
     setError(null);
     try {
-      const id = await onDownload(active);
+      const id = await onDownload(active, chosenMmproj);
       setDownloadId(id);
     } catch (err) {
       setError(errorMessage(err));
@@ -149,11 +175,11 @@ export function DownloadDialog({
           </button>
         </div>
 
-        <div className="space-y-4 px-5 py-4">
+        <div className="max-h-[70vh] space-y-4 overflow-y-auto px-5 py-4">
           {job ? (
             <div className="rounded-xl border border-white/10 bg-ink-950/60 p-3.5">
               <div className="flex items-center justify-between gap-2">
-                <p className="text-[11px] font-medium text-slate-200">
+                <p className="truncate text-[11px] font-medium text-slate-200">
                   {job.repo}
                 </p>
                 <span
@@ -186,7 +212,7 @@ export function DownloadDialog({
                   }
                   className="flex-1"
                 />
-                <span className="w-16 text-right font-mono text-[9px] text-slate-500">
+                <span className="w-20 text-right font-mono text-[9px] text-slate-500">
                   {formatBytes(job.downloaded)} / {formatBytes(job.total)}
                 </span>
               </div>
@@ -220,7 +246,8 @@ export function DownloadDialog({
                 ) : null}
                 {finished ? (
                   <p className="text-[10px] leading-4 text-emerald-300/80">
-                    Files are in your models folder. Compile them to .jns next.
+                    Main weights and any projector are in your models folder.
+                    Pair them in Library.
                   </p>
                 ) : null}
                 {job.status === "error" ? (
@@ -238,11 +265,11 @@ export function DownloadDialog({
                 <span className="label">Quantization</span>
                 {loading ? (
                   <span className="text-[10px] text-slate-500">
-                    refreshing file list…
+                    inspecting the repository tree…
                   </span>
                 ) : (
                   <span className="text-[10px] text-slate-500">
-                    {quants.length} available
+                    {quants.length} main build{quants.length === 1 ? "" : "s"}
                   </span>
                 )}
               </div>
@@ -254,7 +281,7 @@ export function DownloadDialog({
                 </div>
               ) : null}
 
-              <div className="max-h-52 space-y-1.5 overflow-y-auto pr-1">
+              <div className="max-h-48 space-y-1.5 overflow-y-auto pr-1">
                 {quants.length ? (
                   quants.map((quant) => (
                     <button
@@ -291,6 +318,74 @@ export function DownloadDialog({
                 )}
               </div>
 
+              <div className="space-y-2 rounded-xl border border-white/5 bg-white/[0.02] p-3">
+                <div className="flex items-start justify-between gap-3">
+                  <label
+                    className={cn(
+                      "flex min-w-0 items-start gap-2",
+                      !projectors.length && "opacity-50",
+                    )}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={includeMmproj && projectors.length > 0}
+                      disabled={!projectors.length}
+                      onChange={(event) => setIncludeMmproj(event.target.checked)}
+                      className="mt-0.5 h-3.5 w-3.5 accent-current text-acid-400"
+                    />
+                    <span className="min-w-0">
+                      <span className="flex items-center gap-1.5 text-[11px] font-medium text-slate-200">
+                        <Eye className="h-3 w-3 text-sky-300" />
+                        Include Vision Projector (mmproj)
+                      </span>
+                      <span className="mt-0.5 block text-[9.5px] leading-4 text-slate-500">
+                        {projectors.length
+                          ? `${projectors.length} projector${projectors.length === 1 ? "" : "s"} in this repo. f16 or bf16 keeps the vision tower at reference quality.`
+                          : "This repository has no mmproj file. Image input will stay unavailable for this model."}
+                      </span>
+                    </span>
+                  </label>
+                  {chosenMmproj ? (
+                    <span className="shrink-0 font-mono text-[10px] text-slate-400">
+                      +{formatBytes(chosenMmproj.size)}
+                    </span>
+                  ) : null}
+                </div>
+
+                {projectors.length ? (
+                  <select
+                    value={selectedMmproj ?? ""}
+                    onChange={(event) => setSelectedMmproj(event.target.value)}
+                    disabled={!includeMmproj}
+                    className="field !py-1.5 font-mono text-[10.5px] disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {projectors.map((projector) => (
+                      <option key={projector.path} value={projector.path}>
+                        {projector.path} · {projector.quant} ·{" "}
+                        {formatBytes(projector.size)}
+                        {projector.recommended ? " · recommended" : ""}
+                      </option>
+                    ))}
+                  </select>
+                ) : null}
+
+                {draftHint ? (
+                  <div className="flex items-start gap-2 rounded-lg border border-violet-400/15 bg-violet-400/5 px-2.5 py-2 text-[9.5px] leading-4 text-violet-200/80">
+                    <Sparkles className="mt-0.5 h-3 w-3 shrink-0" />
+                    <span>
+                      <span className="font-medium text-violet-200">
+                        {draftHint.size_label} draft hint:
+                      </span>{" "}
+                      {draftHint.reason} Download{" "}
+                      <span className="font-mono text-violet-200/90">
+                        {draftHint.repo_id}
+                      </span>{" "}
+                      separately and pair it in Library.
+                    </span>
+                  </div>
+                ) : null}
+              </div>
+
               {active ? (
                 <>
                   <div className="rounded-xl border border-white/5 bg-ink-950/50 px-3 py-2.5">
@@ -307,6 +402,14 @@ export function DownloadDialog({
                           </span>
                         </p>
                       ))}
+                      {chosenMmproj ? (
+                        <p className="truncate text-sky-300/60">
+                          {chosenMmproj.path}{" "}
+                          <span className="text-slate-700">
+                            ({formatBytes(chosenMmproj.size)})
+                          </span>
+                        </p>
+                      ) : null}
                     </div>
                   </div>
 
@@ -314,8 +417,8 @@ export function DownloadDialog({
                     <div className="flex items-start gap-2 rounded-xl border border-rose-400/20 bg-rose-500/5 px-3 py-2 text-[10px] leading-4 text-rose-300">
                       <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                       <span>
-                        This download needs {formatBytes(active.size_bytes)} but
-                        only {formatBytes(freeBytes ?? 0)} is free in the models
+                        This download needs {formatBytes(combinedBytes)} but only{" "}
+                        {formatBytes(freeBytes ?? 0)} is free in the models
                         folder. Free space before downloading.
                       </span>
                     </div>
@@ -326,25 +429,29 @@ export function DownloadDialog({
                   ) : null}
 
                   <div className="rounded-xl border border-white/5 bg-white/[0.02] px-3 py-2.5">
-                    <p className="label">Memory estimate</p>
+                    <div className="flex items-center justify-between">
+                      <p className="label">Memory estimate</p>
+                      <span className="font-mono text-[10px] text-slate-400">
+                        {formatBytes(combinedBytes)} on disk
+                      </span>
+                    </div>
                     <div className="mt-2 grid grid-cols-2 gap-2">
                       <MemoryStat
                         label="System RAM"
-                        value={formatBytes(
-                          active.size_bytes * 1.15 + 1.5 * 1024 ** 3,
-                        )}
+                        value={formatBytes(combinedBytes * 1.15 + 1.5 * 1024 ** 3)}
                         hint="working set at load"
                       />
                       <MemoryStat
                         label="VRAM"
-                        value={formatBytes(active.size_bytes * 1.05)}
+                        value={formatBytes(combinedBytes * 1.05)}
                         hint="if fully offloaded"
                       />
                     </div>
                     <p className="mt-1.5 text-[9px] leading-4 text-slate-600">
-                      Rough estimate: weights plus a 1.5 GiB margin for KV cache
-                      and runtime. A mixture of experts streams unused experts
-                      from disk, so resident RAM can be far lower.
+                      Rough estimate: weights{chosenMmproj ? ", projector" : ""}{" "}
+                      and a 1.5 GiB margin for the KV cache and runtime. A
+                      mixture-of-experts model streams unused experts from disk,
+                      so resident RAM can be far lower.
                     </p>
                   </div>
                 </>
@@ -373,7 +480,7 @@ export function DownloadDialog({
                 icon={<Download className="h-3.5 w-3.5" />}
               >
                 {active
-                  ? `Download ${formatBytes(active.size_bytes)}`
+                  ? `Download ${formatBytes(combinedBytes)}`
                   : "Download"}
               </Button>
             ) : null}

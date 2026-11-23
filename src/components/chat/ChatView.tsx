@@ -31,6 +31,7 @@ import { mcpServerInputs, mcpServersInScope } from "../../lib/mcpScope";
 import type {
   AppSettings,
   Citation,
+  CompanionPairing,
   EngineKind,
   LibraryModel,
   LocalModel,
@@ -142,6 +143,8 @@ export function ChatView({ engine, chat }: ChatViewProps) {
   const [llamaModels, setLlamaModels] = useState<LibraryModel[]>([]);
   const [switchingModel, setSwitchingModel] = useState(false);
   const [modelError, setModelError] = useState<string | null>(null);
+  const [visionGuard, setVisionGuard] = useState<CompanionPairing | null>(null);
+  const [visionBusy, setVisionBusy] = useState(false);
   const [sessionsCollapsed, setSessionsCollapsed] = usePersistentState(
     "janas.ui.sessionsCollapsed",
     false,
@@ -219,6 +222,34 @@ export function ChatView({ engine, chat }: ChatViewProps) {
   useEffect(() => {
     endRef.current?.scrollIntoView({ block: "end" });
   }, [chat.messages, chat.streaming]);
+
+  // Pre-flight image guardrail: a multimodal GGUF only accepts image content
+  // parts once llama.cpp has loaded its matching `--mmproj` projector. Inspect
+  // the active model as soon as an image is queued instead of letting the
+  // request fail on the server.
+  useEffect(() => {
+    if (!images.length || activeKind !== "llama" || !llamaModelPath) {
+      setVisionGuard(null);
+      return;
+    }
+    let cancelled = false;
+    api
+      .inspectModelCompanions(llamaModelPath)
+      .then((pairing) => {
+        if (cancelled) return;
+        setVisionGuard(
+          pairing.main.role === "vision_main" && !pairing.vision.bound_path
+            ? pairing
+            : null,
+        );
+      })
+      .catch(() => {
+        if (!cancelled) setVisionGuard(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [images.length, activeKind, llamaModelPath, settings?.llama_mmproj_path]);
 
   const chooseModel = useCallback(
     async (path: string) => {
@@ -430,6 +461,41 @@ export function ChatView({ engine, chat }: ChatViewProps) {
     }
   }, [chat, engine]);
 
+  const pairVisionProjector = useCallback(async () => {
+    const projector = visionGuard?.vision.recommended?.path;
+    if (!visionGuard || !projector) return;
+    setVisionBusy(true);
+    try {
+      const next = await api.pairModelCompanions(
+        visionGuard.main.path,
+        projector,
+        settings?.llama_draft_path.trim() || null,
+        settings?.llama_draft_max ?? 8,
+      );
+      await save(next);
+      setVisionGuard(null);
+      if (engine.snapshot.pid !== null) await engine.stop();
+      await engine.switchTo("llama");
+    } catch (err) {
+      chat.setError(errorMessage(err));
+    } finally {
+      setVisionBusy(false);
+    }
+  }, [chat, engine, save, settings, visionGuard]);
+
+  const downloadVisionProjector = useCallback(() => {
+    const repo = visionGuard?.repo;
+    if (!repo) {
+      chat.setError(
+        "No download source is recorded for this model. Download an mmproj for its family in Models, then pair it in Library.",
+      );
+      return;
+    }
+    void api
+      .openExternal(`https://huggingface.co/${repo}/tree/main`)
+      .catch((err) => chat.setError(errorMessage(err)));
+  }, [chat, visionGuard]);
+
   const resetEnginePanel = useCallback(
     async (runtime: Partial<AppSettings>) => {
       if (!settings) return;
@@ -527,6 +593,12 @@ export function ChatView({ engine, chat }: ChatViewProps) {
   const handleSend = useCallback(async () => {
     const text = input.trim();
     if (!text || chat.busy || !ready) return;
+    if (images.length && visionGuard) {
+      chat.setError(
+        "This vision model needs an mmproj projector before it can read images. Use the pairing banner under the composer, then send again.",
+      );
+      return;
+    }
 
     let citations: Citation[] | undefined;
     let extraContext = project?.bundle ?? "";
@@ -604,6 +676,7 @@ export function ChatView({ engine, chat }: ChatViewProps) {
     preferences.internet,
     project,
     ready,
+    visionGuard,
     workspaceRoot,
   ]);
 
@@ -925,6 +998,20 @@ export function ChatView({ engine, chat }: ChatViewProps) {
             chat.setError(null);
             setModelError(null);
           }}
+          visionWarning={
+            visionGuard
+              ? {
+                  modelName: visionGuard.main.file_name,
+                  family: visionGuard.main.vision_family,
+                  candidateName:
+                    visionGuard.vision.recommended?.file_name ?? null,
+                  canDownload: Boolean(visionGuard.repo),
+                  busy: visionBusy,
+                  onPair: () => void pairVisionProjector(),
+                  onDownload: () => downloadVisionProjector(),
+                }
+              : null
+          }
         />
 
         <TelemetryPanel

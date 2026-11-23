@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   ArrowUp,
   Bot,
+  Eye,
   FolderOpen,
   Globe,
   ImagePlus,
@@ -19,6 +20,18 @@ export interface ComposerImage {
   name: string;
   data_url: string;
   tokens: number;
+}
+
+/** The pre-flight warning shown when images are queued for a vision model
+ * whose `--mmproj` projector is not loaded. */
+export interface ComposerVisionWarning {
+  modelName: string;
+  family: string | null;
+  candidateName: string | null;
+  canDownload: boolean;
+  busy: boolean;
+  onPair: () => void;
+  onDownload: () => void;
 }
 
 interface ComposerProps {
@@ -46,6 +59,7 @@ interface ComposerProps {
   activity: string | null;
   error: string | null;
   onDismissError: () => void;
+  visionWarning?: ComposerVisionWarning | null;
 }
 
 function readImage(file: File): Promise<ComposerImage> {
@@ -92,6 +106,7 @@ export function Composer({
   activity,
   error,
   onDismissError,
+  visionWarning,
 }: ComposerProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -143,6 +158,55 @@ export function Composer({
             >
               <X className="h-3.5 w-3.5" />
             </button>
+          </div>
+        ) : null}
+
+        {visionWarning ? (
+          <div className="mb-2 rounded-xl border border-sky-400/25 bg-sky-400/[0.06] px-3.5 py-2.5">
+            <div className="flex items-start gap-2 text-[11px] leading-5 text-sky-100">
+              <Eye className="mt-0.5 h-3.5 w-3.5 shrink-0 text-sky-300" />
+              <div className="min-w-0 flex-1">
+                <p className="font-medium">
+                  {visionWarning.modelName} needs a vision projector
+                </p>
+                <p className="text-[10.5px] leading-4 text-sky-200/70">
+                  Images are queued, but llama.cpp will reject them until an
+                  mmproj is bound
+                  {visionWarning.family
+                    ? ` for ${visionWarning.family}`
+                    : ""}
+                  .
+                </p>
+              </div>
+            </div>
+            <div className="mt-2 flex flex-wrap items-center gap-2 pl-5">
+              {visionWarning.candidateName ? (
+                <Button
+                  size="sm"
+                  variant="primary"
+                  busy={visionWarning.busy}
+                  onClick={visionWarning.onPair}
+                  icon={<Eye className="h-3 w-3" />}
+                >
+                  Pair detected MMPROJ
+                </Button>
+              ) : null}
+              {visionWarning.canDownload ? (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={visionWarning.onDownload}
+                >
+                  Download MMPROJ
+                </Button>
+              ) : null}
+              {!visionWarning.candidateName && !visionWarning.canDownload ? (
+                <p className="text-[10px] text-amber-200/80">
+                  Download an mmproj for this family in Models, then pair it in
+                  Library.
+                </p>
+              ) : null}
+            </div>
           </div>
         ) : null}
 

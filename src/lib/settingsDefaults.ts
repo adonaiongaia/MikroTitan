@@ -31,6 +31,9 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   llama_mtp_mode: "auto",
   llama_mtp_path: "",
   llama_draft_path: "",
+  llama_draft_max: 8,
+  llama_draft_min: 0,
+  llama_draft_p_min: 0.75,
   llama_drafts_on: "auto",
   llama_port: 8081,
   llama_gpu_layers: 0,
@@ -44,4 +47,6 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   ssd_streaming: false,
   ssd_cache_dir: "",
   top_k: 40,
+  model_bundles: [],
+  active_bundle_id: "",
 };

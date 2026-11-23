@@ -102,6 +102,9 @@ interface EngineForm {
   llama_mtp_mode: string;
   llama_mtp_path: string;
   llama_draft_path: string;
+  llama_draft_max: number;
+  llama_draft_min: number;
+  llama_draft_p_min: number;
   llama_drafts_on: string;
   llama_flash_attn: string;
   llama_kv_cache_k: string;
@@ -132,6 +135,9 @@ function formFrom(settings: AppSettings | null): EngineForm {
     llama_mtp_mode: settings?.llama_mtp_mode ?? "auto",
     llama_mtp_path: settings?.llama_mtp_path ?? "",
     llama_draft_path: settings?.llama_draft_path ?? "",
+    llama_draft_max: settings?.llama_draft_max ?? 8,
+    llama_draft_min: settings?.llama_draft_min ?? 0,
+    llama_draft_p_min: settings?.llama_draft_p_min ?? 0.75,
     llama_drafts_on: settings?.llama_drafts_on ?? "auto",
     llama_flash_attn: settings?.llama_flash_attn ?? "auto",
     llama_kv_cache_k: settings?.llama_kv_cache_k ?? "f16",
@@ -989,6 +995,53 @@ function LlamaRuntimeSection({
           onChange={(value) => update("llama_draft_path", value)}
           placeholder="optional small same-family .gguf"
         />
+        <div className="grid grid-cols-3 gap-2">
+          <label className="space-y-1">
+            <span className="text-[10px] text-slate-500">Draft max</span>
+            <input
+              type="number"
+              min={1}
+              max={64}
+              step={1}
+              value={form.llama_draft_max}
+              onChange={(event) =>
+                update("llama_draft_max", Number(event.target.value) || 8)
+              }
+              className="field !py-1.5 font-mono text-[11px]"
+              title="--draft-max: tokens proposed per speculative step"
+            />
+          </label>
+          <label className="space-y-1">
+            <span className="text-[10px] text-slate-500">Draft min</span>
+            <input
+              type="number"
+              min={0}
+              max={64}
+              step={1}
+              value={form.llama_draft_min}
+              onChange={(event) =>
+                update("llama_draft_min", Number(event.target.value) || 0)
+              }
+              className="field !py-1.5 font-mono text-[11px]"
+              title="--draft-min: shortest accepted draft run (0 uses llama.cpp's default)"
+            />
+          </label>
+          <label className="space-y-1">
+            <span className="text-[10px] text-slate-500">Draft p-min</span>
+            <input
+              type="number"
+              min={0}
+              max={1}
+              step={0.05}
+              value={form.llama_draft_p_min}
+              onChange={(event) =>
+                update("llama_draft_p_min", Number(event.target.value) || 0)
+              }
+              className="field !py-1.5 font-mono text-[11px]"
+              title="--draft-p-min: minimum draft probability kept"
+            />
+          </label>
+        </div>
         <SelectField
           label="Drafts on"
           value={form.llama_drafts_on}

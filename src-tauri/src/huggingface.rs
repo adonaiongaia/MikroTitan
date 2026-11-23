@@ -37,6 +37,33 @@ pub struct HfQuant {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct HfMmprojFile {
+    pub path: String,
+    pub size: u64,
+    pub quant: String,
+    /// The projector the dialog selects by default (f16, then bf16, then q8_0).
+    pub recommended: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HfDraftHint {
+    pub repo_id: String,
+    pub size_label: String,
+    pub reason: String,
+}
+
+/// A repository split into the parts a smart bundle needs: main quantizations,
+/// vision projectors and an optional tiny sibling draft model.
+#[derive(Debug, Clone, Serialize)]
+pub struct HfRepoBundles {
+    pub repo: String,
+    pub quants: Vec<HfQuant>,
+    pub available_mmproj: Vec<HfMmprojFile>,
+    pub recommended_mmproj: Option<String>,
+    pub draft_hint: Option<HfDraftHint>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct HfModel {
     pub id: String,
     pub author: String,
@@ -89,7 +116,7 @@ struct SafetensorsInfo {
     total: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct TreeEntry {
     #[serde(rename = "type", default)]
     kind: Option<String>,
@@ -100,7 +127,7 @@ struct TreeEntry {
     lfs: Option<LfsInfo>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct LfsInfo {
     #[serde(default)]
     size: Option<u64>,
@@ -214,6 +241,168 @@ pub async fn list_quants(repo: String, token: &str) -> AppResult<Vec<HfQuant>> {
     fetch_quants(&client, &repo, token)
         .await
         .map_err(|err| AppError::message(format!("Could not list this model's files: {err}")))
+}
+
+pub async fn inspect_repo_bundles(repo: String, token: &str) -> AppResult<HfRepoBundles> {
+    validate_repo(&repo)?;
+    let client = metadata_client();
+    let entries = fetch_tree_from(&client, HF_API, &repo, token)
+        .await
+        .map_err(|err| AppError::message(format!("Could not inspect this repository: {err}")))?;
+    let quants = build_quants(entries.clone());
+    let mut available_mmproj = build_mmproj_files(&entries);
+    // One recommendation only: the first file after the preference sort.
+    let recommended_mmproj = available_mmproj
+        .first()
+        .map(|projector| projector.path.clone());
+    if let Some(first) = available_mmproj.first_mut() {
+        first.recommended = true;
+    }
+    let draft_hint = detect_draft_hint(&client, &repo, token).await;
+
+    Ok(HfRepoBundles {
+        repo,
+        quants,
+        available_mmproj,
+        recommended_mmproj,
+        draft_hint,
+    })
+}
+
+fn build_mmproj_files(entries: &[TreeEntry]) -> Vec<HfMmprojFile> {
+    let mut projectors: Vec<HfMmprojFile> = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .kind
+                .as_deref()
+                .map(|kind| kind == "file")
+                .unwrap_or(true)
+        })
+        .filter(|entry| {
+            let lower = entry.path.to_ascii_lowercase();
+            lower.ends_with(".gguf") && lower.contains("mmproj")
+        })
+        .map(|entry| {
+            let name = entry.path.rsplit('/').next().unwrap_or(&entry.path);
+            HfMmprojFile {
+                path: entry.path.clone(),
+                size: entry
+                    .lfs
+                    .as_ref()
+                    .and_then(|lfs| lfs.size)
+                    .or(entry.size)
+                    .unwrap_or(0),
+                quant: detect_quant(name).unwrap_or_else(|| "GGUF".into()),
+                recommended: false,
+            }
+        })
+        .collect();
+    projectors.sort_by(|a, b| {
+        projector_rank(&a.quant)
+            .cmp(&projector_rank(&b.quant))
+            .then(a.size.cmp(&b.size))
+            .then(a.path.to_lowercase().cmp(&b.path.to_lowercase()))
+    });
+    projectors
+}
+
+/// f16 is the reference projector format; bf16 is equivalent in quality on
+/// bf16-trained vision towers; q8_0 is a smaller, slightly lossy fallback.
+fn projector_rank(quant: &str) -> usize {
+    match quant.to_ascii_uppercase().as_str() {
+        "F16" => 0,
+        "BF16" => 1,
+        "Q8_0" => 2,
+        "F32" => 3,
+        _ => 9,
+    }
+}
+
+/// Look for a 0.5B / 1B / 1.5B sibling under the same publisher. This is a
+/// hint, not a pairing decision: nothing is downloaded or bound from it.
+async fn detect_draft_hint(
+    client: &reqwest::Client,
+    repo: &str,
+    token: &str,
+) -> Option<HfDraftHint> {
+    let (author, name) = repo.split_once('/')?;
+    let term = draft_search_term(name)?;
+    let url = format!(
+        "{HF_API}?author={}&search={}&limit=50&filter=gguf",
+        urlencoding::encode(author),
+        urlencoding::encode(&term)
+    );
+    let response = authorized(client.get(url), token)
+        .timeout(Duration::from_secs(8))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let models: Vec<ApiModel> = response.json().await.ok()?;
+    models
+        .iter()
+        .filter(|model| !model.id.eq_ignore_ascii_case(repo))
+        .find_map(|model| {
+            let size_label = tiny_draft_label(&model.id)?;
+            let reason = format!(
+                "{} also publishes a {size_label} model in this family; a same-tokenizer draft can speed up generation.",
+                author
+            );
+            Some(HfDraftHint {
+                repo_id: model.id.clone(),
+                size_label,
+                reason,
+            })
+        })
+}
+
+fn tiny_draft_label(model_id: &str) -> Option<String> {
+    // Keep the dot inside `0.5b`; splitting on it would break the size token.
+    for segment in model_id.to_ascii_lowercase().split(['-', '_', '/']) {
+        if matches!(segment, "0.5b" | "1b" | "1.5b") {
+            return Some(segment.to_uppercase());
+        }
+    }
+    None
+}
+
+fn draft_search_term(name: &str) -> Option<String> {
+    let trimmed = name.trim_end_matches("-GGUF").trim_end_matches("-gguf");
+    let mut kept: Vec<String> = Vec::new();
+    for segment in trimmed.split('-') {
+        let lower = segment.to_ascii_lowercase();
+        if lower.is_empty() {
+            continue;
+        }
+        if matches!(
+            lower.as_str(),
+            "gguf" | "instruct" | "it" | "chat" | "base" | "text" | "hf"
+        ) {
+            continue;
+        }
+        let starts_with_digit = lower
+            .chars()
+            .next()
+            .map(|character| character.is_ascii_digit())
+            .unwrap_or(false);
+        let parameter_size = starts_with_digit
+            && (lower.ends_with('b')
+                || lower
+                    .chars()
+                    .all(|character| character.is_ascii_digit() || character == '.'));
+        if parameter_size {
+            continue;
+        }
+        kept.push(segment.to_string());
+    }
+    if kept.is_empty() {
+        None
+    } else {
+        Some(kept.join("-"))
+    }
 }
 
 async fn fetch_quants(
@@ -1083,6 +1272,61 @@ mod tests {
         assert_eq!(quants[0].files.len(), 2);
         assert_eq!(quants[0].size_bytes, 200);
         assert_eq!(quants[1].quant, "Q8_0");
+    }
+
+    #[test]
+    fn splits_mmproj_from_main_quants_and_prefers_f16() {
+        let entries = vec![
+            entry("Qwen2.5-VL-7B-Q4_K_M.gguf", 100),
+            entry("Qwen2.5-VL-7B-Q8_0.gguf", 400),
+            entry("mmproj-model-q8_0.gguf", 20),
+            entry("mmproj-model-f16.gguf", 50),
+            entry("mmproj-model-bf16.gguf", 45),
+        ];
+        let mains = build_quants(entries.clone());
+        assert!(
+            mains
+                .iter()
+                .all(|quant| quant.files.iter().all(|file| !file.path.contains("mmproj"))),
+            "projectors must stay out of the main quantization list"
+        );
+
+        let projectors = build_mmproj_files(&entries);
+        assert_eq!(projectors.len(), 3);
+        assert_eq!(projectors[0].quant, "F16");
+        assert_eq!(projectors[1].quant, "BF16");
+        assert_eq!(projectors[2].quant, "Q8_0");
+    }
+
+    #[test]
+    fn draft_search_term_drops_parameter_and_format_suffixes() {
+        assert_eq!(
+            draft_search_term("Qwen2.5-7B-Instruct-GGUF").as_deref(),
+            Some("Qwen2.5")
+        );
+        assert_eq!(
+            draft_search_term("gemma-3-4b-it-GGUF").as_deref(),
+            Some("gemma")
+        );
+        assert_eq!(
+            draft_search_term("Llama-3.2-3B-Instruct-GGUF").as_deref(),
+            Some("Llama")
+        );
+    }
+
+    #[test]
+    fn tiny_draft_labels_only_match_whole_size_tokens() {
+        assert_eq!(
+            tiny_draft_label("Qwen/Qwen2.5-0.5B-Instruct-GGUF").as_deref(),
+            Some("0.5B")
+        );
+        assert_eq!(
+            tiny_draft_label("org/model-1.5b-it").as_deref(),
+            Some("1.5B")
+        );
+        assert_eq!(tiny_draft_label("org/model-1B-it").as_deref(), Some("1B"));
+        assert_eq!(tiny_draft_label("org/model-7B-it"), None);
+        assert_eq!(tiny_draft_label("org/model-21B-it"), None);
     }
 
     #[test]

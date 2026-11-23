@@ -1681,19 +1681,47 @@ pub fn delete_local_model(
 ) -> AppResult<u64> {
     let settings = store.get();
     let target = validate_model_file(&settings, &path)?;
-    let active = [
+    let active_paths = [
         settings.model_path.as_str(),
         settings.llama_model_path.as_str(),
         settings.llama_draft_path.as_str(),
         settings.llama_mtp_path.as_str(),
-    ]
-    .iter()
+        settings.llama_mmproj_path.as_str(),
+        settings.draft_path.as_str(),
+    ];
+    let active_main = |main: &str| {
+        !main.trim().is_empty()
+            && expand_home(main).canonicalize().ok().as_deref() == Some(target.as_path())
+    };
+    let active = active_paths
+        .iter()
         .filter(|value| !value.trim().is_empty())
         .filter_map(|value| expand_home(value).canonicalize().ok())
         .any(|active| active == target);
     if active {
         return Err(AppError::message(
             "That model is active. Select another model before deleting it.",
+        ));
+    }
+
+    // A model can also be bound as a companion by the active bundle while the
+    // bundle's main model is the one running. Deleting it would break the next
+    // launch, so refuse until the user explicitly unpairs it.
+    let bound_to_active_bundle = settings.model_bundles.iter().any(|bundle| {
+        let bundle_is_active = active_main(&bundle.main_model_path)
+            || (!settings.active_bundle_id.is_empty()
+                && bundle.id == settings.active_bundle_id
+                && active_main(&settings.llama_model_path));
+        bundle_is_active
+            && [bundle.mmproj_path.as_str(), bundle.draft_model_path.as_str()]
+                .iter()
+                .filter(|value| !value.trim().is_empty())
+                .filter_map(|value| expand_home(value).canonicalize().ok())
+                .any(|bound| bound == target)
+    });
+    if bound_to_active_bundle {
+        return Err(AppError::message(
+            "That file is bound to the active model bundle. Unpair the projector or draft model in the Library before deleting it.",
         ));
     }
     let bytes = fs::metadata(&target)?.len();

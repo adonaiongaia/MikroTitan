@@ -65,6 +65,12 @@ pub struct LlamaLayout {
     /// How many draft layers live on the GPU: `--spec-draft-ngl` or an older
     /// `--gpu-layers-draft` alias.
     pub draft_ngl_flag: Option<&'static str>,
+    /// `--draft-max`: how many tokens the draft model proposes per step.
+    pub draft_max_flag: Option<&'static str>,
+    /// `--draft-min`: the shortest accepted draft run.
+    pub draft_min_flag: Option<&'static str>,
+    /// `--draft-p-min`: the minimum draft probability llama.cpp keeps.
+    pub draft_p_min_flag: Option<&'static str>,
 }
 
 pub struct LlamaRunner;
@@ -478,6 +484,9 @@ fn layout_for(output: &ProbeOutput, settings: &AppSettings) -> (LlamaLayout, Vec
                 draft_model_flag: None,
                 draft_device_flag: None,
                 draft_ngl_flag: None,
+                draft_max_flag: None,
+                draft_min_flag: None,
+                draft_p_min_flag: None,
             },
             warnings,
         );
@@ -599,6 +608,18 @@ fn layout_for(output: &ProbeOutput, settings: &AppSettings) -> (LlamaLayout, Vec
         );
     }
 
+    // Only emit draft tuning flags the probed build advertises. `--draft-max`
+    // shipped alongside speculative decoding; older builds stop at the model.
+    let draft_max_flag = advertises(help, "--draft-max").then_some("--draft-max");
+    let draft_min_flag = advertises(help, "--draft-min").then_some("--draft-min");
+    let draft_p_min_flag = advertises(help, "--draft-p-min").then_some("--draft-p-min");
+    if draft_configured && draft_max_flag.is_none() {
+        warnings.push(
+            "This llama-server build does not advertise `--draft-max`, `--draft-min` or `--draft-p-min`; speculative draft length settings will be ignored."
+                .into(),
+        );
+    }
+
     if !kv_cache
         && (settings::normalize_kv_cache(&settings.llama_kv_cache_k) != "f16"
             || settings::normalize_kv_cache(&settings.llama_kv_cache_v) != "f16")
@@ -658,6 +679,9 @@ fn layout_for(output: &ProbeOutput, settings: &AppSettings) -> (LlamaLayout, Vec
             draft_model_flag,
             draft_device_flag,
             draft_ngl_flag,
+            draft_max_flag,
+            draft_min_flag,
+            draft_p_min_flag,
         },
         warnings,
     )
@@ -735,6 +759,14 @@ fn build_args(
             return Err(AppError::message(
                 "The llama.cpp vision projector must be a .gguf file. Choose the mmproj file that matches the selected vision model.",
             ));
+        }
+        if let Some(problem) = crate::companions::vision_pair_problem(
+            &model.to_string_lossy(),
+            &path.to_string_lossy(),
+        ) {
+            return Err(AppError::message(format!(
+                "The llama.cpp vision projector cannot be loaded with this model: {problem}. Pair a matching mmproj in Library, or clear the projector path."
+            )));
         }
         Some(path)
     };
@@ -873,7 +905,16 @@ fn build_args(
                 mtp_path
             };
             if !raw.is_empty() {
-                draft_model = Some(validate_spec_model(raw, "speculative draft model")?);
+                let path = validate_spec_model(raw, "speculative draft model")?;
+                if let Some(problem) = crate::companions::draft_pair_problem(
+                    &model.to_string_lossy(),
+                    &path.to_string_lossy(),
+                ) {
+                    return Err(AppError::message(format!(
+                        "The speculative draft model cannot be loaded with this main model: {problem}. Pick a draft with the same architecture and vocabulary size in Library."
+                    )));
+                }
+                draft_model = Some(path);
             }
         }
     }
@@ -901,6 +942,30 @@ fn build_args(
     }
 
     if has_draft_model {
+        if let Some(flag) = layout.draft_max_flag {
+            if !extra_has("--draft-max") {
+                args.push(flag.into());
+                args.push(settings.llama_draft_max.clamp(1, 64).to_string());
+            }
+        }
+        if let Some(flag) = layout.draft_min_flag {
+            if !extra_has("--draft-min") && settings.llama_draft_min > 0 {
+                args.push(flag.into());
+                args.push(
+                    settings
+                        .llama_draft_min
+                        .min(settings.llama_draft_max)
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(flag) = layout.draft_p_min_flag {
+            let p_min = settings.llama_draft_p_min.clamp(0.0, 1.0);
+            if !extra_has("--draft-p-min") && p_min > 0.0 && p_min < 1.0 {
+                args.push(flag.into());
+                args.push(format!("{p_min:.2}"));
+            }
+        }
         match settings::normalize_draft_placement(&settings.llama_drafts_on).as_str() {
             "cpu" => {
                 if let Some(flag) = layout.draft_device_flag {
@@ -1231,6 +1296,9 @@ mod tests {
             draft_model_flag: None,
             draft_device_flag: None,
             draft_ngl_flag: None,
+            draft_max_flag: None,
+            draft_min_flag: None,
+            draft_p_min_flag: None,
         };
         let result = build_args(&settings, &layout);
         assert!(result.is_err());
@@ -1269,6 +1337,9 @@ mod tests {
             draft_model_flag: None,
             draft_device_flag: None,
             draft_ngl_flag: None,
+            draft_max_flag: None,
+            draft_min_flag: None,
+            draft_p_min_flag: None,
         };
         let (args, warnings) = build_args(&settings, &layout).expect("args");
         let joined = args.join(" ");
@@ -1313,6 +1384,9 @@ mod tests {
             draft_model_flag: None,
             draft_device_flag: None,
             draft_ngl_flag: None,
+            draft_max_flag: None,
+            draft_min_flag: None,
+            draft_p_min_flag: None,
         };
         let (args, warnings) = build_args(&settings, &layout).expect("args");
         let joined = args.join(" ");
@@ -1351,6 +1425,9 @@ mod tests {
             draft_model_flag: Some("--spec-draft-model"),
             draft_device_flag: Some("--spec-draft-device"),
             draft_ngl_flag: Some("--spec-draft-ngl"),
+            draft_max_flag: Some("--draft-max"),
+            draft_min_flag: Some("--draft-min"),
+            draft_p_min_flag: Some("--draft-p-min"),
         };
 
         let mut settings = AppSettings::default();
@@ -1364,6 +1441,9 @@ mod tests {
         assert!(!joined.contains("--spec-type"));
         assert!(joined.contains(&format!("--spec-draft-model {draft_text}")));
         assert!(joined.contains("--spec-draft-device none"));
+        assert!(joined.contains("--draft-max 8"));
+        assert!(joined.contains("--draft-p-min 0.75"));
+        assert!(!joined.contains("--draft-min"));
         assert!(warnings.is_empty());
 
         // MTP keeps the heads inside the main model. Nothing is offloaded
@@ -1433,6 +1513,9 @@ mod tests {
             draft_model_flag: None,
             draft_device_flag: None,
             draft_ngl_flag: None,
+            draft_max_flag: None,
+            draft_min_flag: None,
+            draft_p_min_flag: None,
         };
         let (args, warnings) = build_args(&settings, &layout).expect("args");
         let joined = args.join(" ");
@@ -1474,6 +1557,9 @@ mod tests {
             draft_model_flag: None,
             draft_device_flag: None,
             draft_ngl_flag: None,
+            draft_max_flag: None,
+            draft_min_flag: None,
+            draft_p_min_flag: None,
         };
         let (args, _) = build_args(&settings, &layout).expect("args");
         let count = |flag: &str| args.iter().filter(|argument| *argument == flag).count();
@@ -1515,6 +1601,9 @@ mod tests {
             draft_model_flag: None,
             draft_device_flag: None,
             draft_ngl_flag: None,
+            draft_max_flag: None,
+            draft_min_flag: None,
+            draft_p_min_flag: None,
         };
         let (args, _) = build_args(&settings, &layout).expect("args");
         let joined = args.join(" ");

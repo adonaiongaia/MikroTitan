@@ -74,6 +74,12 @@ pub struct AppSettings {
     /// llama.cpp only: `--spec-draft-model`, a smaller same-family GGUF used
     /// for speculative decoding.
     pub llama_draft_path: String,
+    /// `--draft-max`: how many tokens the draft model proposes per step.
+    pub llama_draft_max: u32,
+    /// `--draft-min`: the shortest draft run accepted for a speculative step.
+    pub llama_draft_min: u32,
+    /// `--draft-p-min`: the minimum draft probability llama.cpp keeps.
+    pub llama_draft_p_min: f32,
     /// llama.cpp only: where the draft model runs. "auto", "cpu"
     /// (`--spec-draft-device none`) or "gpu" (`--spec-draft-ngl all`).
     pub llama_drafts_on: String,
@@ -107,6 +113,11 @@ pub struct AppSettings {
     pub ssd_cache_dir: String,
     /// Server-side default Top-K, mirrored from the sampling panel.
     pub top_k: u32,
+    /// Saved (main, projector, draft) bundles. The library can activate one
+    /// in a click and the engine loads every component it names.
+    pub model_bundles: Vec<crate::companions::ModelBundle>,
+    /// The bundle the user last activated.
+    pub active_bundle_id: String,
 }
 
 impl Default for AppSettings {
@@ -139,6 +150,9 @@ impl Default for AppSettings {
             llama_mtp_mode: "auto".into(),
             llama_mtp_path: String::new(),
             llama_draft_path: String::new(),
+            llama_draft_max: 8,
+            llama_draft_min: 0,
+            llama_draft_p_min: 0.75,
             llama_drafts_on: "auto".into(),
             llama_port: 8081,
             llama_gpu_layers: 0,
@@ -152,6 +166,8 @@ impl Default for AppSettings {
             ssd_streaming: false,
             ssd_cache_dir: String::new(),
             top_k: 40,
+            model_bundles: Vec::new(),
+            active_bundle_id: String::new(),
         }
     }
 }
@@ -198,12 +214,39 @@ impl AppSettings {
         self.draft_path = self.draft_path.trim().to_string();
         self.llama_mtp_path = self.llama_mtp_path.trim().to_string();
         self.llama_draft_path = self.llama_draft_path.trim().to_string();
+        self.llama_draft_max = self.llama_draft_max.clamp(1, 64);
+        self.llama_draft_min = self.llama_draft_min.min(self.llama_draft_max);
+        if !self.llama_draft_p_min.is_finite() {
+            self.llama_draft_p_min = 0.75;
+        }
+        self.llama_draft_p_min = self.llama_draft_p_min.clamp(0.0, 1.0);
+        self.active_bundle_id = self.active_bundle_id.trim().to_string();
         self.llama_flash_attn = normalize_flash_attn(&self.llama_flash_attn);
         self.llama_kv_cache_k = normalize_kv_cache(&self.llama_kv_cache_k);
         self.llama_kv_cache_v = normalize_kv_cache(&self.llama_kv_cache_v);
         self.llama_cpu_threads = self.llama_cpu_threads.min(256);
         self.llama_model_path = self.llama_model_path.trim().to_string();
         self.llama_mmproj_path = self.llama_mmproj_path.trim().to_string();
+        for bundle in &mut self.model_bundles {
+            bundle.main_model_path = bundle.main_model_path.trim().to_string();
+            bundle.mmproj_path = bundle.mmproj_path.trim().to_string();
+            bundle.draft_model_path = bundle.draft_model_path.trim().to_string();
+            bundle.draft_max_tokens = bundle.draft_max_tokens.clamp(1, 64);
+            bundle.draft_min_tokens = bundle.draft_min_tokens.min(bundle.draft_max_tokens);
+            if !bundle.draft_p_min.is_finite() {
+                bundle.draft_p_min = 0.75;
+            }
+            bundle.draft_p_min = bundle.draft_p_min.clamp(0.0, 1.0);
+        }
+        // A deleted model must not leave a dangling active bundle pointer.
+        if !self.active_bundle_id.is_empty()
+            && !self
+                .model_bundles
+                .iter()
+                .any(|bundle| bundle.id == self.active_bundle_id)
+        {
+            self.active_bundle_id.clear();
+        }
         self.llama_extra_args = self.llama_extra_args.trim().to_string();
         self.ssd_cache_dir = self.ssd_cache_dir.trim().to_string();
         self.hf_token = self.hf_token.trim().to_string();

@@ -24,6 +24,12 @@ import type {
   GgufModelInfo,
   HfModel,
   HfQuant,
+  HfRepoBundles,
+  CompanionPairing,
+  GgufCompanionInfo,
+  LibraryCompanions,
+  ModelBundle,
+  BundleCheck,
   LibraryModel,
   LibraryDisk,
   LocalModel,
@@ -156,6 +162,8 @@ export const api = {
     invoke<HfModel[]>("search_models", { request }),
   listModelQuants: (repo: string) =>
     invoke<HfQuant[]>("list_model_quants", { repo }),
+  inspectRepoBundles: (repo: string) =>
+    invoke<HfRepoBundles>("inspect_repo_bundles", { repo }),
   startDownload: (request: DownloadRequest) =>
     invoke<DownloadStarted>("start_download", { request }),
   cancelDownload: (id: string) => invoke<boolean>("cancel_download", { id }),
@@ -192,6 +200,32 @@ export const api = {
     invoke<ModelVerification>("verify_local_model", { path }),
   deleteLocalModel: (path: string) =>
     invoke<number>("delete_local_model", { path }),
+
+  inspectGgufCompanion: (path: string) =>
+    invoke<GgufCompanionInfo>("inspect_gguf_companion", { path }),
+  inspectModelCompanions: (path: string) =>
+    invoke<CompanionPairing>("inspect_model_companions", { path }),
+  libraryCompanions: () => invoke<LibraryCompanions>("library_companions"),
+  validateModelBundle: (bundle: ModelBundle) =>
+    invoke<BundleCheck>("validate_model_bundle", { bundle }),
+  saveModelBundle: (bundle: ModelBundle) =>
+    invoke<AppSettings>("save_model_bundle", { bundle }),
+  deleteModelBundle: (id: string) =>
+    invoke<AppSettings>("delete_model_bundle", { id }),
+  applyModelBundle: (id: string) =>
+    invoke<AppSettings>("apply_model_bundle", { id }),
+  pairModelCompanions: (
+    mainPath: string,
+    mmprojPath?: string | null,
+    draftPath?: string | null,
+    draftMaxTokens?: number,
+  ) =>
+    invoke<AppSettings>("pair_model_companions", {
+      main_path: mainPath,
+      mmproj_path: mmprojPath ?? null,
+      draft_path: draftPath ?? null,
+      draft_max_tokens: draftMaxTokens ?? null,
+    }),
   mcpProbe: (server: McpServerInput) =>
     invoke<McpProbe>("mcp_probe", { server }),
 

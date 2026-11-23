@@ -126,9 +126,38 @@ export default function App() {
     const isGguf = path.toLowerCase().endsWith(".gguf");
     try {
       const current = await api.getSettings();
+      // Activating a library model re-applies its saved bundle in the same
+      // click: the projector and draft model follow the main weights instead
+      // of whatever the previous model left behind.
+      const bundle = isGguf
+        ? current.model_bundles.find(
+            (candidate) =>
+              candidate.main_model_path.trim().toLowerCase() ===
+              path.trim().toLowerCase(),
+          )
+        : undefined;
       await api.saveSettings(
         isGguf
-          ? { ...current, llama_model_path: path }
+          ? {
+              ...current,
+              llama_model_path: path,
+              ...(bundle
+                ? {
+                    llama_mmproj_path: bundle.mmproj_path,
+                    llama_draft_path: bundle.draft_model_path,
+                    llama_draft_max: bundle.draft_max_tokens,
+                    llama_draft_min: bundle.draft_min_tokens,
+                    llama_draft_p_min: bundle.draft_p_min,
+                    llama_mtp_mode: bundle.draft_model_path
+                      ? "auto"
+                      : current.llama_mtp_mode,
+                    llama_mtp_path: bundle.draft_model_path
+                      ? ""
+                      : current.llama_mtp_path,
+                    active_bundle_id: bundle.id,
+                  }
+                : {}),
+            }
           : { ...current, model_path: path },
       );
       if (engine.snapshot.pid !== null) await engine.stop();

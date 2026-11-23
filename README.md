@@ -20,6 +20,7 @@ The engine is **Janas-LLM** by **Maurizio Cammalleri**, licensed under [GPL-3.0-
 - **Branching chats** — edit a prompt or regenerate a reply without losing the old path; switch versions with arrows or branch a new chat from any message.
 - **Per-chat context** — drafts, project bundles, workspace roots, system prompts and MCP tool scopes follow the chat instead of the window.
 - **Persona library** — save a prompt as a reusable persona; chats without their own prompt inherit a separate saved default.
+- **Smart model companions** — GGUF header inspection pairs vision projectors and vocabulary-matched speculative draft models, saves them as one-click bundles, and refuses unsafe combinations before llama.cpp starts.
 - **Gated models** — an optional Hugging Face access token unlocks gated and private repositories without affecting public downloads.
 - **Crash-safe history** — one JSON file per chat, schema v2, atomic writes, automatic previous-version backups, image assets on disk, and export/import/restore.
 - **MCP scope controls** — a Tools badge, All/None controls, per-chat server selection, and automatic reconciliation when servers are removed or re-created.
@@ -100,6 +101,18 @@ The composer's **Agent** toggle turns a chat into a bounded tool-running loop. I
 - **Streaming resilience**: the Rust SSE proxy tolerates CRLF, split chunks, raw newline-delimited JSON, malformed frames, final chunks without a newline, reasoning aliases, and content arrays. Malformed chunks are counted instead of crashing the app, and the chat view is wrapped in a render boundary so one bad reply cannot blank the window.
 - **Project ingestion**: drop a folder on the window (or pick it) and the studio walks the tree, skips build/vendor noise, and builds a semantic bundle with a token estimate before sending it to the prefill layer.
 - **Message actions** under every prompt and reply: copy, edit and resend, delete, branch, and previous/next version arrows for sibling replies.
+
+### Smart model companions
+
+Large GGUF models are rarely useful alone. A multimodal build needs a matching `--mmproj` projector before it can read an image, and a small same-family draft model can make generation faster through speculative decoding. The companion manager discovers both from real GGUF metadata instead of filenames alone.
+
+- **Header-only GGUF inspector.** A bounds-checked GGUF v2/v3 reader in `src-tauri/src/companions.rs` reads the magic, version, key/value metadata and tensor directory with `std::io::{Read, Seek}`. It captures `general.architecture`, `general.name`, `tokenizer.ggml.model`, the `tokenizer.ggml.tokens` count, `<architecture>.context_length`, `clip.*` / vision markers and tensor shapes. Parameter counts and vocabulary sizes come from the tensor directory; tensor payloads are never loaded, so a 60 GB file costs the same few hundred kilobytes of reads as a 200 MB one. Results are cached by path, size and modification time.
+- **Roles from evidence.** Files are classified as **text model**, **vision model**, **vision projector** (`mmproj` name, `clip` architecture, or a vocab-less file with vision tensors) or **draft-sized** (≤ 3B parameters with a tokenizer). Vision families (Qwen2.5-VL, Qwen3-VL, Gemma 3, LLaVA, MiniCPM-V, Pixtral/Mistral-Small-3, InternVL and others) are normalised for comparison; Gemma 3 1B/270M stay text-only because their files carry no vision tower.
+- **Safe pairing rules.** A draft model is only offered when its `general.architecture` **and** exact vocabulary size match the main model — a mismatch aborts `llama-server` before it binds its port. Projectors are ranked by family match, shared folder, name overlap and quant (f16, then bf16, then q8_0) and are marked incompatible across families rather than guessed.
+- **Library badges and drawer.** **Vision ready**, **Missing MMPROJ · Pair**, **Draft paired (+Speculative)** and **Draft available** badges sit on every library row. **Pair** opens a drawer that lists every local projector and draft-sized model with its compatibility reasons, shows the combined **Main + Draft + MMPROJ** footprint with a resident RAM estimate and a fully-offloaded VRAM estimate, and validates the exact tuple before **Use bundle** applies it and restarts llama.cpp.
+- **Saved bundles.** A bundle stores `(main_model_path, mmproj_path, draft_model_path, draft_max_tokens, draft_min_tokens, draft_p_min)`. Bundles live in `settings.json`; **Use bundle** sets the llama.cpp model, projector and draft paths in one action, and pressing **Use** on a library model that already has a saved bundle re-applies that bundle's projector and draft paths. Deleting a projector or draft file that an active bundle still binds is refused.
+- **Hugging Face bundle inspector.** The download dialog asks the Hub for a repo's tree once, splits `mmproj-*.gguf` files out of the main quantization list, preselects the reference projector (f16 or bf16), shows the combined download size, and queues the main files plus the projector in one download. A non-intrusive hint names a 0.5B / 1B / 1.5B sibling under the same publisher when one exists.
+- **Engine wiring and guardrails.** llama.cpp receives `--mmproj`, `--spec-draft-model` (`--model-draft` on older builds) and, when the probed help text advertises them, `--draft-max` (default 8), `--draft-min` and `--draft-p-min`. The composer inspects the active model as soon as an image is attached; if it is a vision model without a bound projector, an inline banner offers **Pair detected MMPROJ** or **Download MMPROJ** and send is blocked until it is resolved.
 
 ### Models and tools
 
@@ -381,6 +394,7 @@ src-tauri/src/
   chat_store.rs            schema-v2 chat sessions, assets, backups, export/import
   mcp.rs                   stdio MCP client/runtime and probes
   provision.rs             startup hardware detection and engine provisioning
+  companions.rs            GGUF header inspector, projector/draft pairing, saved bundles
   converter.rs             janas-convert job runner
   huggingface.rs           Hub search, quant discovery, downloads
   capabilities.rs          runtime sampling-capability probing
@@ -435,12 +449,13 @@ New UI pieces: `chat/SessionsRail`, `chat/EnginePanel`, `chat/TelemetryPanel`,
 
 - `npm run check` — TypeScript typecheck passed.
 - `npm test` — 23 Vitest tests pass across chat-session normalization/branching and MCP scope/reconciliation, including empty-scope request building and persistence-boundary checks.
-- `cargo test` — 161 tests pass, 0 failed; one network-dependent live-search smoke test is ignored by default.
+- `cargo test` — 173 tests pass, 0 failed; one network-dependent live-search smoke test is ignored by default.
 - `npm run appimage` — release build and AppImage bundling completed:
   - Artifact: `src-tauri/target/release/bundle/appimage/Studio for Janas_0.1.1_amd64.AppImage`
-  - Size: 84,883,960 bytes (80.95 MiB)
-  - SHA-256: `9d46a63bf685a578e85af870489d975a659a4600812ce8acc91cd7a4665c974b`
+  - Size: 84,949,496 bytes (81.01 MiB)
+  - SHA-256: `e7dbd7a95b7b3dba7fe2ac8dfb779f92bb31a1c82bca958b01437b81506b16c3`
   - Contents: no Janas binaries are bundled; `usr/share/licenses/studio-for-janas/LICENSE` and `usr/share/doc/studio-for-janas/THIRD_PARTY_NOTICES.md` match the repository files byte-for-byte.
+- **Companion coverage:** synthetic GGUF v2/v3 headers exercise metadata/array skipping, vocabulary and parameter extraction, `clip` projector classification, vision and plain main models, Gemma 3 1B-vs-4B vision detection, exact architecture/vocab draft pairing, vision-family ranking and bundle validation. llama.cpp argument tests assert that `--draft-max` is emitted with the tested draft path and that `--draft-min` stays absent at its zero default. Repository-tree tests assert that `mmproj` files are split out of the main quant list and that f16 is selected over bf16 and q8_0. The companion UI was typechecked and bundled, but no interactive Tauri click-through or live Hugging Face/mmproj download was performed for this build.
 - Runtime passes in an isolated profile exercised branching and version switching, per-chat drafts and MCP scope, backup restore and export/import, close-time saving, and model verify/delete. The delete confirmation now awaits the Tauri dialog, and window close flushes pending chat writes before destroying the window.
 - The approval-rule store, per-chat prompt normalization and Hugging Face token/error plumbing are covered by the Rust and Vitest suites. Local mock-server tests assert that the bearer token is sent only on authenticated tree/checksum requests, blank tokens add no header, request targets are exact, 401 and 403 return different fixes, checksum auth failures are surfaced, and error strings do not contain the token. No live gated-repository download or Tauri UI pass was performed for this build.
 - The Tools badge, All/None controls, zero-tools hint and scope reconciliation are covered by typecheck, unit tests and the production build; `docs/screenshots/mcp-scope.png` shows the badge, populated scope and All/None controls in the running app.
@@ -450,7 +465,7 @@ New UI pieces: `chat/SessionsRail`, `chat/EnginePanel`, `chat/TelemetryPanel`,
 
 - No Janas binaries or model weights are bundled. Engine setup downloads the current Janas release into the managed `bin` folder, so an offline first run needs a local Janas build selected in Settings.
 - Some telemetry is necessarily an estimate: `janas-server` does not expose expert IDs or per-layer residency, so the RAM/disk split and the expert heatmap are labelled estimates. SSD throughput and IOPS come from the kernel; GPU/NPU counters only appear when the driver publishes them under `/sys/class/drm` or `/sys/class/accel`.
-- llama.cpp image input needs a vision-capable GGUF plus its matching `--mmproj` projector selected in Settings; otherwise the engine's error is shown verbatim.
+- llama.cpp image input needs a vision-capable GGUF plus its matching `--mmproj` projector; the companion manager pairs it from local metadata, and the composer blocks an image send until one is bound. A projector from a different vision family is reported as incompatible instead of being tried at launch. Speculative pairing is deliberately conservative: if a file does not declare both its architecture and vocabulary size, no draft is offered.
 - Persistent memory is an in-app hashed TF-IDF vector store, not ChromaDB, so there is no Python sidecar. Facts live in `memory.json` under the app data directory and never leave the machine.
 - The app assumes a single local engine instance and a single active model.
 - Chat sessions and their images live under `chat-sessions/` in the app data directory, one JSON file per chat plus `assets/<chat-id>/`, with one previous version kept per chat. Engine/agent preferences, theme choice, the saved default system prompt and the persona library live in `localStorage`; memory facts live in `memory.json`; server settings live in the platform config directory.

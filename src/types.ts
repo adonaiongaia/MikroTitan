@@ -176,6 +176,12 @@ export interface AppSettings {
   llama_mtp_path: string;
   /** llama.cpp: --spec-draft-model, a smaller same-family GGUF. */
   llama_draft_path: string;
+  /** llama.cpp: --draft-max, how many tokens the draft proposes per step. */
+  llama_draft_max: number;
+  /** llama.cpp: --draft-min, the shortest accepted draft run. */
+  llama_draft_min: number;
+  /** llama.cpp: --draft-p-min, the minimum draft probability kept. */
+  llama_draft_p_min: number;
   /** llama.cpp: where the draft runs: auto, cpu (--spec-draft-device none) or gpu. */
   llama_drafts_on: "auto" | "cpu" | "gpu" | string;
   llama_port: number;
@@ -192,6 +198,10 @@ export interface AppSettings {
   ssd_streaming: boolean;
   ssd_cache_dir: string;
   top_k: number;
+  /** Saved main + projector + draft bundles. */
+  model_bundles: ModelBundle[];
+  /** The bundle the user last activated. */
+  active_bundle_id: string;
 }
 
 export interface BinaryProbe {
@@ -361,6 +371,28 @@ export interface HfQuant {
   quant: string;
   files: HfFile[];
   size_bytes: number;
+}
+
+export interface HfMmprojFile {
+  path: string;
+  size: number;
+  quant: string;
+  recommended: boolean;
+}
+
+export interface HfDraftHint {
+  repo_id: string;
+  size_label: string;
+  reason: string;
+}
+
+/** A repository split into main quants, vision projectors and a draft hint. */
+export interface HfRepoBundles {
+  repo: string;
+  quants: HfQuant[];
+  available_mmproj: HfMmprojFile[];
+  recommended_mmproj: string | null;
+  draft_hint: HfDraftHint | null;
 }
 
 export interface HfModel {
@@ -551,6 +583,99 @@ export interface LibraryModel {
   capabilities_source: string;
   duplicate: boolean;
   same_repo_count: number;
+}
+
+export type ModelRole = "main_llm" | "vision_main" | "mmproj" | "draft_candidate";
+
+/** Header-only facts about one GGUF file. No tensor data is read. */
+export interface GgufCompanionInfo {
+  path: string;
+  file_name: string;
+  role: ModelRole;
+  architecture: string | null;
+  name: string | null;
+  tokenizer_model: string | null;
+  vocab_size: number | null;
+  context_length: number | null;
+  parameter_estimate: number | null;
+  byte_size: number;
+  quant: string;
+  tensor_count: number;
+  vision_tensor_count: number;
+  vision_markers: string[];
+  vision_family: string | null;
+}
+
+export interface CompanionCandidate {
+  path: string;
+  file_name: string;
+  architecture: string | null;
+  vocab_size: number | null;
+  quant: string;
+  parameter_estimate: number | null;
+  size_bytes: number;
+  score: number;
+  compatible: boolean;
+  reasons: string[];
+}
+
+export interface VisionPairing {
+  bound_path: string | null;
+  recommended: CompanionCandidate | null;
+  candidates: CompanionCandidate[];
+  missing: boolean;
+  message: string;
+}
+
+export interface DraftPairing {
+  bound_path: string | null;
+  recommended: CompanionCandidate | null;
+  candidates: CompanionCandidate[];
+  paired: boolean;
+  message: string;
+  combined_bytes: number;
+}
+
+export interface CompanionPairing {
+  main: GgufCompanionInfo;
+  vision: VisionPairing;
+  draft: DraftPairing;
+  combined_size_bytes: number;
+  estimated_runtime_bytes: number;
+  estimated_ram_bytes: number;
+  estimated_vram_bytes: number;
+  repo: string | null;
+  active_bundle_id: string | null;
+}
+
+export interface LibraryCompanions {
+  models: GgufCompanionInfo[];
+  pairings: CompanionPairing[];
+  warnings: string[];
+}
+
+export interface ModelBundle {
+  id: string;
+  name: string;
+  main_model_path: string;
+  mmproj_path: string;
+  draft_model_path: string;
+  draft_max_tokens: number;
+  draft_min_tokens: number;
+  draft_p_min: number;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export interface BundleCheck {
+  ok: boolean;
+  errors: string[];
+  warnings: string[];
+  main: GgufCompanionInfo | null;
+  mmproj: GgufCompanionInfo | null;
+  draft: GgufCompanionInfo | null;
+  combined_size_bytes: number;
+  estimated_runtime_bytes: number;
 }
 
 export interface ModelVerification {

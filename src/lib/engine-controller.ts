@@ -61,6 +61,17 @@ export function llamaRuntimePreview(settings: AppSettings): string[] {
       : settings.llama_draft_path.trim() || settings.llama_mtp_path.trim();
   if (draftModel) {
     args.push("--spec-draft-model", draftModel);
+    args.push("--draft-max", String(settings.llama_draft_max ?? 8));
+    if ((settings.llama_draft_min ?? 0) > 0) {
+      args.push("--draft-min", String(settings.llama_draft_min));
+    }
+    if (
+      settings.llama_draft_p_min != null &&
+      settings.llama_draft_p_min > 0 &&
+      settings.llama_draft_p_min < 1
+    ) {
+      args.push("--draft-p-min", settings.llama_draft_p_min.toFixed(2));
+    }
     if (settings.llama_drafts_on === "cpu") {
       args.push("--spec-draft-device", "none");
     } else if (settings.llama_drafts_on === "gpu") {
