@@ -64,6 +64,7 @@ interface EnginePanelProps {
     value: AgentPreferences[K],
   ) => void;
   onPickWorkspace: () => Promise<void>;
+  onClearWorkspace: () => void;
   workspaceLocked: boolean;
   systemPrompt: string;
   onSystemPromptChange: (value: string) => void;
@@ -175,6 +176,7 @@ export function EnginePanel({
   agentPreferences,
   onAgentUpdate,
   onPickWorkspace,
+  onClearWorkspace,
   workspaceLocked,
   systemPrompt,
   onSystemPromptChange,
@@ -474,6 +476,7 @@ export function EnginePanel({
           preferences={agentPreferences}
           onUpdate={onAgentUpdate}
           onPickWorkspace={onPickWorkspace}
+          onClearWorkspace={onClearWorkspace}
           workspaceLocked={workspaceLocked}
           workspaceRoot={workspaceRoot}
           approvalRulesVersion={approvalRulesVersion}
@@ -1117,6 +1120,7 @@ function AgentConfiguration({
   preferences,
   onUpdate,
   onPickWorkspace,
+  onClearWorkspace,
   workspaceLocked,
   workspaceRoot,
   approvalRulesVersion,
@@ -1127,6 +1131,7 @@ function AgentConfiguration({
     value: AgentPreferences[K],
   ) => void;
   onPickWorkspace: () => Promise<void>;
+  onClearWorkspace: () => void;
   workspaceLocked: boolean;
   workspaceRoot: string;
   approvalRulesVersion: number;
@@ -1350,27 +1355,27 @@ function AgentConfiguration({
                 disabled={workspaceLocked}
                 className={cn(
                   "inline-flex h-8 min-w-0 flex-1 items-center gap-1.5 rounded-lg border px-2 text-[10px] transition disabled:cursor-not-allowed disabled:opacity-50",
-                  preferences.workspaceRoot
+                  workspaceRoot
                     ? "border-white/10 bg-white/[0.03] text-slate-300 hover:bg-white/[0.06]"
                     : "border-dashed border-white/15 bg-transparent text-slate-500 hover:text-slate-300",
                 )}
                 title={
                   workspaceLocked
                     ? "The agent workspace is pinned while a run or pending undo exists."
-                    : preferences.workspaceRoot || "Choose a workspace folder"
+                    : workspaceRoot || "Choose a workspace folder"
                 }
               >
                 <FolderOpen className="h-3 w-3 shrink-0" />
                 <span className="truncate">
-                  {preferences.workspaceRoot
-                    ? basename(preferences.workspaceRoot)
+                  {workspaceRoot
+                    ? basename(workspaceRoot)
                     : "Choose a workspace folder…"}
                 </span>
               </button>
-              {preferences.workspaceRoot ? (
+              {workspaceRoot ? (
                 <button
                   type="button"
-                  onClick={() => onUpdate("workspaceRoot", "")}
+                  onClick={() => onClearWorkspace()}
                   disabled={workspaceLocked}
                   className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-white/10 bg-white/5 text-slate-500 transition hover:text-rose-300 disabled:cursor-not-allowed disabled:opacity-40"
                   aria-label="Clear the agent workspace root"
@@ -1385,7 +1390,7 @@ function AgentConfiguration({
               ) : null}
             </div>
             <p className="break-all font-mono text-[9px] leading-4 text-slate-600">
-              {preferences.workspaceRoot ||
+              {workspaceRoot ||
                 "File, search and shell tools stay disabled until a folder is chosen. MCP tools still work."}
             </p>
             {workspaceLocked ? (

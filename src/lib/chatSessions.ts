@@ -12,6 +12,7 @@ import type {
   ChatSession,
   Citation,
   ProjectIngest,
+  RagChunk,
 } from "../types";
 
 const UNDO_STATES: AgentUndoState[] = [
@@ -39,6 +40,52 @@ export function normalizeCitation(value: unknown): Citation | null {
     url: citation.url,
     snippet:
       typeof citation.snippet === "string" ? citation.snippet : undefined,
+  };
+}
+
+/**
+ * A retrieved document chunk persisted with a reply. The content is stored with
+ * the message so the `[D1]` drawer still works after the collection is
+ * re-indexed or deleted.
+ */
+export function normalizeRagChunk(value: unknown): RagChunk | null {
+  if (!value || typeof value !== "object") return null;
+  const chunk = value as Partial<RagChunk>;
+  if (
+    typeof chunk.chunk_id !== "string" ||
+    typeof chunk.content !== "string" ||
+    typeof chunk.file_path !== "string"
+  ) {
+    return null;
+  }
+  const number = (candidate: unknown, fallback = 0): number =>
+    typeof candidate === "number" && Number.isFinite(candidate)
+      ? candidate
+      : fallback;
+  return {
+    chunk_id: chunk.chunk_id,
+    collection_id:
+      typeof chunk.collection_id === "string" ? chunk.collection_id : "",
+    collection_name:
+      typeof chunk.collection_name === "string" ? chunk.collection_name : "",
+    file_path: chunk.file_path,
+    relative_path:
+      typeof chunk.relative_path === "string" && chunk.relative_path
+        ? chunk.relative_path
+        : chunk.file_path,
+    start_line: Math.max(1, Math.round(number(chunk.start_line, 1))),
+    end_line: Math.max(1, Math.round(number(chunk.end_line, 1))),
+    content: chunk.content,
+    heading: typeof chunk.heading === "string" ? chunk.heading : "",
+    token_estimate: Math.max(0, Math.round(number(chunk.token_estimate))),
+    score: Math.min(1, Math.max(0, number(chunk.score))),
+    lexical_score: Math.max(0, number(chunk.lexical_score)),
+    semantic_score: Math.max(0, number(chunk.semantic_score)),
+    // Sessions saved before the citation contract changed stored `[D1]`.
+    citation:
+      typeof chunk.citation === "string"
+        ? chunk.citation.replace(/^\[|\]$/g, "")
+        : "D1",
   };
 }
 
@@ -311,6 +358,11 @@ export function normalizeMessage(value: unknown): ChatMessage | null {
           .map(normalizeCitation)
           .filter((citation): citation is Citation => citation !== null)
       : undefined,
+    rag_sources: Array.isArray(message.rag_sources)
+      ? message.rag_sources
+          .map(normalizeRagChunk)
+          .filter((chunk): chunk is RagChunk => chunk !== null)
+      : undefined,
     images,
     agentTrace: normalizeAgentTrace(message.agentTrace),
     // Leave missing links undefined so backfillTree can infer the legacy
@@ -368,6 +420,13 @@ export function normalizeSession(value: unknown): ChatSession | null {
         (id): id is string => typeof id === "string",
       )
     : undefined;
+  // An empty array is meaningful here: it means "no collections", not "all",
+  // so it must survive a reload instead of collapsing to undefined.
+  const attachedCollectionIds = Array.isArray(session.attached_collection_ids)
+    ? session.attached_collection_ids.filter(
+        (id): id is string => typeof id === "string" && id.length > 0,
+      )
+    : undefined;
   return {
     id: session.id,
     schema_version:
@@ -396,6 +455,16 @@ export function normalizeSession(value: unknown): ChatSession | null {
     system_prompt:
       typeof session.system_prompt === "string"
         ? session.system_prompt
+        : undefined,
+    attached_collection_ids: attachedCollectionIds,
+    rag_top_k:
+      typeof session.rag_top_k === "number" && Number.isFinite(session.rag_top_k)
+        ? session.rag_top_k
+        : undefined,
+    rag_max_tokens:
+      typeof session.rag_max_tokens === "number" &&
+      Number.isFinite(session.rag_max_tokens)
+        ? session.rag_max_tokens
         : undefined,
   };
 }

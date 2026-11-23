@@ -6,6 +6,7 @@ import {
   branchPrefix,
   forkAssistantTurn,
   forkUserTurn,
+  normalizeRagChunk,
   normalizeSession,
   siblingsFor,
   switchMessageVersion,
@@ -200,5 +201,17 @@ describe("branching turns", () => {
     const prefix = branchPrefix(linearSession(), "a1");
     expect(prefix.map((item) => item.id)).toEqual(["u1", "a1"]);
     expect(prefix[1].active_child_id).toBeNull();
+  });
+});
+
+describe("stored document sources", () => {
+  it("normalizes legacy bracketed citations", () => {
+    const chunk = {
+      chunk_id: "c1",
+      content: "text",
+      file_path: "/tmp/a.md",
+    };
+    expect(normalizeRagChunk({ ...chunk, citation: "[D2]" })?.citation).toBe("D2");
+    expect(normalizeRagChunk({ ...chunk, citation: "D3" })?.citation).toBe("D3");
   });
 });

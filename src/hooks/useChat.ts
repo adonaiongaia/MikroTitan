@@ -44,7 +44,9 @@ import type {
   McpServerConfig,
   McpServerInput,
   ProjectIngest,
+  RagSourcesEvent,
 } from "../types";
+import { ragSettingsFor } from "../lib/rag";
 
 /** Pre-disk-store history. Read once for migration and then removed. */
 const LEGACY_STORAGE_KEY = "janas.sessions.v1";
@@ -195,6 +197,10 @@ export function useChat() {
     null,
   );
   const [error, setError] = useState<string | null>(null);
+  // Informational lines from the Rust turn (currently document retrieval).
+  // Kept apart from `error` so a successful vault lookup never renders as a
+  // failure banner.
+  const [ragNotice, setRagNotice] = useState<string | null>(null);
   const [usage, setUsage] = useState<ChatUsage | null>(null);
   const [elapsedMs, setElapsedMs] = useState<number | null>(null);
   const [firstTokenMs, setFirstTokenMs] = useState<number | null>(null);
@@ -533,7 +539,27 @@ export function useChat() {
         (event) => {
           const request = activeRequest.current;
           if (!request || event.payload.request_id !== request.requestId) return;
-          setError(event.payload.message);
+          if (event.payload.level === "info") {
+            setRagNotice(event.payload.message);
+          } else {
+            setError(event.payload.message);
+          }
+        },
+      );
+      // The Rust turn attaches the retrieved chunks to the message it is
+      // streaming, so [D1] pills and their drawer survive a reload.
+      const ragSourcesUnlisten = await listen<RagSourcesEvent>(
+        Events.chatRagSources,
+        (event) => {
+          const request = activeRequest.current;
+          if (!request) return;
+          const chunks = Array.isArray(event.payload.chunks)
+            ? event.payload.chunks
+            : [];
+          updateMessage(request.requestId, request.sessionId, (message) => ({
+            ...message,
+            rag_sources: chunks,
+          }));
         },
       );
       const mcpActivityUnlisten = await listen<McpActivityEvent>(
@@ -717,6 +743,11 @@ export function useChat() {
           const request = activeRequest.current;
           if (!request || event.payload.run_id !== request.requestId) return;
           setError(event.payload.message);
+          // An error is terminal for the generation even if checkpoint cleanup
+          // delays `agent:done`; do not leave the composer spinning meanwhile.
+          setStreaming(false);
+          setStreamingSessionId(null);
+          setToolApproval(null);
           updateTrace(request.requestId, request.sessionId, (trace) => ({
             ...trace,
             error: event.payload.message,
@@ -736,6 +767,13 @@ export function useChat() {
           updateMessage(request.requestId, request.sessionId, (message) => ({
             ...message,
             content: event.payload.final_content || message.content,
+            // Chunks the agent looked up with search_knowledge_base. Attaching
+            // them here makes its [D#] tags render as pills after a reload too.
+            rag_sources:
+              Array.isArray(event.payload.rag_sources) &&
+              event.payload.rag_sources.length
+                ? event.payload.rag_sources
+                : message.rag_sources,
             agentTrace: message.agentTrace
               ? {
                   ...message.agentTrace,
@@ -779,6 +817,7 @@ export function useChat() {
         doneUnlisten();
         errorUnlisten();
         noticeUnlisten();
+        ragSourcesUnlisten();
         mcpActivityUnlisten();
         toolApprovalUnlisten();
         planUnlisten();
@@ -796,6 +835,7 @@ export function useChat() {
           doneUnlisten,
           errorUnlisten,
           noticeUnlisten,
+          ragSourcesUnlisten,
           mcpActivityUnlisten,
           toolApprovalUnlisten,
           planUnlisten,
@@ -873,6 +913,7 @@ export function useChat() {
       setStreaming(true);
       setStreamingSessionId(sessionId);
       setError(null);
+      setRagNotice(null);
       setUsage(null);
       setElapsedMs(null);
       setFirstTokenMs(null);
@@ -886,6 +927,10 @@ export function useChat() {
       };
       streamStartedAt.current = Date.now();
 
+      const rag = ragSettingsFor(
+        nextSession.rag_top_k,
+        nextSession.rag_max_tokens,
+      );
       try {
         await api.streamChat({
           request_id: assistantId,
@@ -901,6 +946,11 @@ export function useChat() {
           images: input.images ?? options.images ?? [],
           max_tokens: options.maxTokens,
           mcp_servers: options.mcpServers ?? [],
+          rag_collections: Array.isArray(nextSession.attached_collection_ids)
+            ? nextSession.attached_collection_ids
+            : [],
+          rag_top_k: rag.topK,
+          rag_max_tokens: rag.maxTokens,
         });
       } catch (err) {
         setError(errorMessage(err));
@@ -1171,6 +1221,7 @@ export function useChat() {
       setStreaming(true);
       setStreamingSessionId(sessionId);
       setError(null);
+      setRagNotice(null);
       setUsage(null);
       setElapsedMs(null);
       setFirstTokenMs(null);
@@ -1180,6 +1231,10 @@ export function useChat() {
       activeRequest.current = { requestId, sessionId, mode: "agent" };
       streamStartedAt.current = Date.now();
 
+      const rag = ragSettingsFor(
+        titled.rag_top_k,
+        titled.rag_max_tokens,
+      );
       try {
         await api.startAgent({
           run_id: requestId,
@@ -1206,6 +1261,11 @@ export function useChat() {
           web_search: options.webSearch,
           verify_command: (options.agent.verifyCommand ?? "").trim(),
           mcp_servers: options.mcpServers ?? [],
+          rag_collections: Array.isArray(titled.attached_collection_ids)
+            ? titled.attached_collection_ids
+            : [],
+          rag_top_k: rag.topK,
+          rag_max_tokens: rag.maxTokens,
         });
       } catch (err) {
         const message = errorMessage(err);
@@ -1246,16 +1306,48 @@ export function useChat() {
   const stop = useCallback(async () => {
     const request = activeRequest.current;
     if (!request) return;
+    setToolApproval(null);
+    if (request.mode === "agent") {
+      // Abort reaches the run asynchronously, so stop the UI now. Clearing the
+      // active request also makes a late `agent:done` a no-op, which is the
+      // point: a stalled run must not keep the composer spinning.
+      setStreaming(false);
+      setStreamingSessionId(null);
+      setSessions((previous) =>
+        previous.map((session) =>
+          session.id === request.sessionId
+            ? {
+                ...session,
+                messages: session.messages.map((message) =>
+                  message.id === request.requestId && message.agentTrace
+                    ? {
+                        ...message,
+                        agentTrace: {
+                          ...message.agentTrace,
+                          status: "aborted",
+                          pending: null,
+                          live_text: "",
+                          live_reasoning: "",
+                        },
+                      }
+                    : message,
+                ),
+              }
+            : session,
+        ),
+      );
+      activeRequest.current = null;
+    }
     try {
       await cancelRequest(request);
     } catch (err) {
-      setError(errorMessage(err));
-      if (request.mode === "agent") {
+      if (request.mode === "chat") {
+        setError(errorMessage(err));
         setStreaming(false);
         setStreamingSessionId(null);
+        activeRequest.current = null;
       }
     }
-    setToolApproval(null);
     flushSession(request.sessionId);
   }, [flushSession]);
 
@@ -1483,6 +1575,28 @@ export function useChat() {
     [updateActiveSession],
   );
 
+  /** Replace this chat's attached collections. `[]` means "query nothing". */
+  const setSessionCollectionIds = useCallback(
+    (ids: string[]) => {
+      updateActiveSession((session) => ({
+        ...session,
+        attached_collection_ids: ids,
+      }));
+    },
+    [updateActiveSession],
+  );
+
+  const setSessionRagTuning = useCallback(
+    (tuning: { topK?: number; maxTokens?: number }) => {
+      updateActiveSession((session) => ({
+        ...session,
+        rag_top_k: tuning.topK ?? session.rag_top_k,
+        rag_max_tokens: tuning.maxTokens ?? session.rag_max_tokens,
+      }));
+    },
+    [updateActiveSession],
+  );
+
   const reconcileMcpScopes = useCallback((servers: McpServerConfig[]) => {
     setSessions((previous) => {
       let changed = false;
@@ -1671,6 +1785,10 @@ export function useChat() {
     project: activeSession?.project ?? null,
     workspaceRoot: activeSession?.workspace_root ?? "",
     mcpServerIds: activeSession?.mcp_server_ids,
+    collectionIds: activeSession?.attached_collection_ids,
+    ragTopK: activeSession?.rag_top_k,
+    ragMaxTokens: activeSession?.rag_max_tokens,
+    ragNotice,
     messages,
     loading: !hydrated,
     streaming: activeStreaming,
@@ -1700,6 +1818,8 @@ export function useChat() {
     setSessionWorkspace,
     setSessionSystemPrompt,
     setSessionMcpServerIds,
+    setSessionCollectionIds,
+    setSessionRagTuning,
     reconcileMcpScopes,
     switchVersion,
     branchFromMessage,
@@ -1715,6 +1835,7 @@ export function useChat() {
     deleteChat,
     deleteMessage,
     setError,
+    dismissRagNotice: () => setRagNotice(null),
   };
 }
 

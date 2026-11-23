@@ -25,6 +25,10 @@ import type {
   HfModel,
   HfQuant,
   HfRepoBundles,
+  KnowledgeCollection,
+  KnowledgeCollectionDetail,
+  RagIndexSummary,
+  RagQueryResult,
   CompanionPairing,
   GgufCompanionInfo,
   LibraryCompanions,
@@ -75,6 +79,8 @@ export const Events = {
   agentDone: "agent:done",
   agentError: "agent:error",
   agentNotice: "agent:notice",
+  ragIndexProgress: "rag://index-progress",
+  chatRagSources: "chat://rag-sources",
 } as const;
 
 export const api = {
@@ -170,6 +176,51 @@ export const api = {
   pauseDownload: (id: string) => invoke<boolean>("pause_download", { id }),
   resumeDownload: (id: string) => invoke<boolean>("resume_download", { id }),
 
+  ragListCollections: () =>
+    invoke<KnowledgeCollection[]>("rag_list_collections"),
+  ragCollectionDetail: (id: string) =>
+    invoke<KnowledgeCollectionDetail>("rag_collection_detail", { id }),
+  ragCreateCollection: (
+    name: string,
+    description: string,
+    sourcePaths: string[],
+  ) =>
+    invoke<KnowledgeCollection>("rag_create_collection", {
+      name,
+      description,
+      source_paths: sourcePaths,
+    }),
+  ragDeleteCollection: (id: string) =>
+    invoke<boolean>("rag_delete_collection", { id }),
+  ragIndexPaths: (collectionId: string, paths: string[]) =>
+    invoke<RagIndexSummary>("rag_index_paths", {
+      collection_id: collectionId,
+      paths,
+    }),
+  ragReindexCollection: (collectionId: string) =>
+    invoke<RagIndexSummary>("rag_reindex_collection", {
+      collection_id: collectionId,
+    }),
+  ragCancelIndex: (collectionId: string) =>
+    invoke<boolean>("rag_cancel_index", { collection_id: collectionId }),
+  ragQuery: (
+    collectionIds: string[],
+    query: string,
+    topK?: number,
+    maxTokens?: number,
+  ) =>
+    invoke<RagQueryResult>("rag_query", {
+      collection_ids: collectionIds,
+      query,
+      top_k: topK ?? null,
+      max_tokens: maxTokens ?? null,
+    }),
+  ragRemovePath: (collectionId: string, path: string) =>
+    invoke<KnowledgeCollection>("rag_remove_path", {
+      collection_id: collectionId,
+      path,
+    }),
+
   memoryList: () => invoke<MemoryFact[]>("memory_list"),
   saveToMemoryBank: (fact: string) =>
     invoke<MemoryFact>("save_to_memory_bank", { fact }),
@@ -245,6 +296,8 @@ export const api = {
     invoke<string[]>("agent_undo_availability", { run_ids: runIds }),
   agentUndoState: (runId: string) =>
     invoke<AgentUndoResult>("agent_undo_state", { run_id: runId }),
+  agentValidateWorkspace: (path: string) =>
+    invoke<string | null>("agent_validate_workspace", { path }),
   agentApprovalRules: (workspace: string) =>
     invoke<string[]>("agent_approval_rules", { workspace }),
   forgetApprovalRule: (workspace: string, command: string) =>

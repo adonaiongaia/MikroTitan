@@ -24,6 +24,11 @@ import { useTelemetry } from "../../hooks/useTelemetry";
 import { api } from "../../lib/api";
 import { cn } from "../../lib/cn";
 import { errorMessage, basename } from "../../lib/format";
+import {
+  ragScopeLabel,
+  ragSettingsFor,
+  reconcileCollectionScope,
+} from "../../lib/rag";
 import { recallFacts, useMemory } from "../../lib/memory";
 import { buildWebContext, CORE_SYSTEM_PROMPT } from "../../lib/prompts";
 import { siblingsFor } from "../../lib/chatSessions";
@@ -33,11 +38,16 @@ import type {
   Citation,
   CompanionPairing,
   EngineKind,
+  KnowledgeCollection,
   LibraryModel,
   LocalModel,
   McpServerConfig,
+  RagChunk,
   StorageBenchmark,
 } from "../../types";
+import { knowledgeApi } from "../knowledge/api";
+import { DocsDrawer } from "../knowledge/DocsDrawer";
+import { RagSourceDrawer } from "../knowledge/RagSourceDrawer";
 import { Logo } from "../Logo";
 import { Button } from "../ui/Button";
 import type { AgentActions } from "./AgentTrace";
@@ -53,6 +63,8 @@ import { ToolApprovalCard } from "./ToolApprovalCard";
 interface ChatViewProps {
   engine: EngineController;
   chat: ChatController;
+  /** Opens the Knowledge Vault view from the Docs drawer. */
+  onOpenKnowledge: () => void;
 }
 
 const SUGGESTIONS = [
@@ -73,7 +85,7 @@ const SUGGESTIONS = [
   },
 ];
 
-export function ChatView({ engine, chat }: ChatViewProps) {
+export function ChatView({ engine, chat, onOpenKnowledge }: ChatViewProps) {
   const { settings, save } = useSettings();
   const { preferences, update, setPreferences } = useEnginePreferences();
   const agent = useAgentPreferences();
@@ -164,6 +176,11 @@ export function ChatView({ engine, chat }: ChatViewProps) {
   const [benchmark, setBenchmark] = useState<StorageBenchmark | null>(null);
   const [benchmarkBusy, setBenchmarkBusy] = useState(false);
   const [mcpOpen, setMcpOpen] = useState(false);
+  const [docsOpen, setDocsOpen] = useState(false);
+  const [collections, setCollections] = useState<KnowledgeCollection[]>([]);
+  const [collectionsLoading, setCollectionsLoading] = useState(false);
+  const [collectionsError, setCollectionsError] = useState<string | null>(null);
+  const [sourceChunk, setSourceChunk] = useState<RagChunk | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
 
   const workspaceLocked = useMemo(
@@ -180,6 +197,56 @@ export function ChatView({ engine, chat }: ChatViewProps) {
       ),
     [chat.sessions],
   );
+
+  const attachedCollectionIds = useMemo(
+    () =>
+      Array.isArray(chat.collectionIds)
+        ? chat.collectionIds.filter((id) =>
+            collections.some((collection) => collection.id === id),
+          )
+        : [],
+    [chat.collectionIds, collections],
+  );
+  const ragSettings = ragSettingsFor(chat.ragTopK, chat.ragMaxTokens);
+  const docsScopeLabel = ragScopeLabel(attachedCollectionIds, collections);
+
+  const refreshCollections = useCallback(async () => {
+    setCollectionsLoading(true);
+    try {
+      const next = await knowledgeApi.list();
+      setCollections(Array.isArray(next) ? next : []);
+      setCollectionsError(null);
+    } catch (err) {
+      setCollectionsError(errorMessage(err));
+    } finally {
+      setCollectionsLoading(false);
+    }
+  }, []);
+
+  // Load once so the Docs badge can show a real count before the drawer opens.
+  useEffect(() => {
+    void refreshCollections();
+  }, [refreshCollections]);
+
+  useEffect(() => {
+    if (docsOpen) void refreshCollections();
+  }, [docsOpen, refreshCollections]);
+
+  // A collection deleted in the vault must not stay attached to this chat, or
+  // every later turn would report a missing collection.
+  useEffect(() => {
+    if (chat.loading || collectionsLoading || !collections.length) return;
+    const reconciled = reconcileCollectionScope(chat.collectionIds, collections);
+    if (reconciled.changed) {
+      chat.setSessionCollectionIds(reconciled.ids ?? []);
+    }
+  }, [
+    chat.collectionIds,
+    chat.loading,
+    chat.setSessionCollectionIds,
+    collections,
+    collectionsLoading,
+  ]);
 
   const ready = engine.snapshot.status === "ready";
   const activeKind = engine.active?.kind ?? null;
@@ -339,12 +406,31 @@ export function ChatView({ engine, chat }: ChatViewProps) {
     try {
       const picked = await open({ multiple: false, directory: true });
       if (typeof picked === "string") {
-        chat.setSessionWorkspace(picked);
-        agent.update("workspaceRoot", picked);
+        // Canonicalise and verify with Rust before pinning the folder, so a
+        // path that vanished between the dialog and this point is rejected
+        // now instead of failing every later run.
+        const canonical = await api.agentValidateWorkspace(picked);
+        if (canonical) {
+          chat.setSessionWorkspace(canonical);
+          agent.update("workspaceRoot", canonical);
+        }
       }
     } catch (err) {
       chat.setError(errorMessage(err));
     }
+  }, [agent, chat, workspaceLocked]);
+
+  const clearWorkspace = useCallback(() => {
+    if (workspaceLocked) {
+      chat.setError(
+        "The agent workspace is locked while a run or pending undo exists.",
+      );
+      return;
+    }
+    // A chat can pin its own workspace, which takes precedence over the
+    // default. Clear both so no stale path survives a later run.
+    chat.setSessionWorkspace("");
+    agent.update("workspaceRoot", "");
   }, [agent, chat, workspaceLocked]);
 
   const agentActions = useMemo<AgentActions>(
@@ -945,6 +1031,7 @@ export function ChatView({ engine, chat }: ChatViewProps) {
                           : undefined
                       }
                       agentActions={agentActions}
+                      onOpenRagSource={setSourceChunk}
                     />
                     </MessageBoundary>
                   );
@@ -993,6 +1080,11 @@ export function ChatView({ engine, chat }: ChatViewProps) {
           onPickProject={() => void pickProject()}
           onClearProject={() => chat.setSessionProject(null)}
           activity={activity}
+          docsCount={attachedCollectionIds.length}
+          docsLabel={docsScopeLabel}
+          onOpenDocs={() => setDocsOpen(true)}
+          ragNotice={chat.ragNotice}
+          onDismissRagNotice={chat.dismissRagNotice}
           error={chat.error ?? modelError}
           onDismissError={() => {
             chat.setError(null);
@@ -1047,6 +1139,7 @@ export function ChatView({ engine, chat }: ChatViewProps) {
         agentPreferences={agent.preferences}
         onAgentUpdate={agent.update}
         onPickWorkspace={pickWorkspace}
+        onClearWorkspace={clearWorkspace}
         workspaceLocked={workspaceLocked}
         systemPrompt={systemPrompt}
         onSystemPromptChange={setSystemPrompt}
@@ -1065,6 +1158,28 @@ export function ChatView({ engine, chat }: ChatViewProps) {
         streaming={chat.streaming}
         startedAtMs={chat.startedAtMs}
       />
+
+      <DocsDrawer
+        open={docsOpen}
+        onClose={() => setDocsOpen(false)}
+        collections={collections}
+        loading={collectionsLoading}
+        error={collectionsError}
+        selectedIds={attachedCollectionIds}
+        onChange={chat.setSessionCollectionIds}
+        settings={ragSettings}
+        onSettings={(next) => chat.setSessionRagTuning(next)}
+        contextWindow={contextMax}
+        maxReply={preferences.maxTokens}
+        promptTokensInUse={contextUsed}
+        onOpenVault={() => {
+          setDocsOpen(false);
+          onOpenKnowledge();
+        }}
+        onRefresh={() => void refreshCollections()}
+      />
+
+      <RagSourceDrawer chunk={sourceChunk} onClose={() => setSourceChunk(null)} />
 
       <McpLogDrawer
         open={mcpOpen}

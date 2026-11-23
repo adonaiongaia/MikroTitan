@@ -5,6 +5,7 @@ import {
   ChevronRight,
   Copy,
   ExternalLink,
+  FileText,
   GitBranch,
   Pencil,
   RefreshCw,
@@ -15,7 +16,14 @@ import remarkGfm from "remark-gfm";
 
 import { api } from "../../lib/api";
 import { errorMessage } from "../../lib/format";
-import type { ChatMessage, Citation } from "../../types";
+import {
+  formatRagScore,
+  linkifyDocCitations,
+  ragChunkForCitation,
+  ragFileLabel,
+  sortByCitation,
+} from "../../lib/rag";
+import type { ChatMessage, Citation, RagChunk } from "../../types";
 import { Logo } from "../Logo";
 import { AgentTraceView, type AgentActions } from "./AgentTrace";
 import { ChatImage } from "./ChatImage";
@@ -33,6 +41,8 @@ interface MessageBubbleProps {
   regenerable?: boolean;
   editable?: boolean;
   agentActions?: AgentActions;
+  /** Opens the snippet drawer behind a [D#] pill. */
+  onOpenRagSource?: (chunk: RagChunk) => void;
 }
 
 function safeCitations(citations: Citation[] | undefined): Citation[] {
@@ -75,6 +85,7 @@ export function MessageBubble({
   regenerable,
   editable,
   agentActions,
+  onOpenRagSource,
 }: MessageBubbleProps) {
   const [copied, setCopied] = useState(false);
   const [linkError, setLinkError] = useState<string | null>(null);
@@ -85,6 +96,10 @@ export function MessageBubble({
   const reasoning =
     typeof message.reasoning === "string" ? message.reasoning : "";
   const citations = safeCitations(message.citations);
+  const ragSources = Array.isArray(message.rag_sources)
+    ? sortByCitation(message.rag_sources)
+    : [];
+  const renderedContent = linkifyDocCitations(content, ragSources);
   const trace = message.agentTrace ?? null;
   const empty = !content && !reasoning && !trace;
   const versions = versionIds?.length ? versionIds : [message.id];
@@ -313,25 +328,48 @@ export function MessageBubble({
           <div className="md">
             <ReactMarkdown
               remarkPlugins={[remarkGfm]}
+              // The default transform blanks non-http schemes, which would
+              // turn rag:// citation markers into plain text. The `a`
+              // renderer below decides what may actually be followed.
+              urlTransform={(url) => url}
               components={{
                 // The webview cannot navigate away from the studio, and the
                 // system opener keeps http(s) links in the user's browser.
-                a: ({ href, children }) => (
-                  <a
-                    href={isWebUrl(href) ? href : undefined}
-                    onClick={(event) => {
-                      if (!isWebUrl(href)) return;
-                      event.preventDefault();
-                      void openLink(href);
-                    }}
-                    rel="noreferrer noopener"
-                  >
-                    {children}
-                  </a>
-                ),
+                a: ({ href, children }) => {
+                  // A [D#] marker is rewritten to rag:// before rendering. It
+                  // opens the exact retrieved snippet instead of a URL.
+                  const chunk = href?.startsWith("rag://")
+                    ? ragChunkForCitation(ragSources, href.slice("rag://".length))
+                    : null;
+                  if (chunk) {
+                    return (
+                      <button
+                        type="button"
+                        onClick={() => onOpenRagSource?.(chunk)}
+                        title={`${chunk.relative_path} · lines ${chunk.start_line}–${chunk.end_line} · ${formatRagScore(chunk.score)} relevance`}
+                        className="mx-0.5 inline-flex items-center gap-0.5 rounded border border-acid-400/30 bg-acid-400/10 px-1 py-px align-baseline font-mono text-[9.5px] text-acid-200 transition hover:border-acid-400/60 hover:bg-acid-400/20"
+                      >
+                        [{children}]
+                      </button>
+                    );
+                  }
+                  return (
+                    <a
+                      href={isWebUrl(href) ? href : undefined}
+                      onClick={(event) => {
+                        if (!isWebUrl(href)) return;
+                        event.preventDefault();
+                        void openLink(href);
+                      }}
+                      rel="noreferrer noopener"
+                    >
+                      {children}
+                    </a>
+                  );
+                },
               }}
             >
-              {content}
+              {renderedContent}
             </ReactMarkdown>
             {streaming ? (
               <span className="ml-0.5 inline-block h-4 w-1.5 translate-y-0.5 animate-pulse-soft rounded-sm bg-acid-400/80" />
@@ -366,6 +404,36 @@ export function MessageBubble({
                 </a>
               );
             })}
+          </div>
+        ) : null}
+
+        {ragSources.length ? (
+          <div className="mt-3 flex flex-wrap items-center gap-1.5">
+            <span className="flex items-center gap-1 text-[9px] uppercase tracking-wider text-slate-600">
+              <FileText className="h-2.5 w-2.5" />
+              Docs
+            </span>
+            {ragSources.map((chunk) => (
+              <button
+                key={chunk.chunk_id}
+                type="button"
+                onClick={() => onOpenRagSource?.(chunk)}
+                title={`${chunk.file_path}\nlines ${chunk.start_line}–${chunk.end_line}\n${formatRagScore(chunk.score)} relevance`}
+                aria-label={`Open document source ${chunk.citation}`}
+                className="inline-flex max-w-[280px] items-center gap-1 rounded-full border border-acid-400/20 bg-acid-400/5 px-2 py-0.5 text-[9.5px] text-acid-200/90 transition hover:border-acid-400/40 hover:bg-acid-400/10"
+              >
+                <span className="font-mono text-[8px] text-acid-400/80">
+                  [{chunk.citation}]
+                </span>
+                <span className="truncate">{ragFileLabel(chunk)}</span>
+                <span className="font-mono text-[8px] text-slate-600">
+                  {chunk.start_line}–{chunk.end_line}
+                </span>
+                <span className="font-mono text-[8px] text-slate-600">
+                  {formatRagScore(chunk.score)}
+                </span>
+              </button>
+            ))}
           </div>
         ) : null}
 

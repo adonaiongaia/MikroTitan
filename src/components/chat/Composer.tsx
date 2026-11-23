@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import {
   ArrowUp,
+  BookOpen,
   Bot,
+  Database,
   Eye,
   FolderOpen,
   Globe,
@@ -60,6 +62,13 @@ interface ComposerProps {
   error: string | null;
   onDismissError: () => void;
   visionWarning?: ComposerVisionWarning | null;
+  /** Collections attached to this chat; 0 renders the muted Docs badge. */
+  docsCount: number;
+  docsLabel: string | null;
+  onOpenDocs: () => void;
+  /** Informational line from the Rust turn, e.g. the retrieval summary. */
+  ragNotice: string | null;
+  onDismissRagNotice: () => void;
 }
 
 function readImage(file: File): Promise<ComposerImage> {
@@ -107,6 +116,11 @@ export function Composer({
   error,
   onDismissError,
   visionWarning,
+  docsCount,
+  docsLabel,
+  onOpenDocs,
+  ragNotice,
+  onDismissRagNotice,
 }: ComposerProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -220,6 +234,21 @@ export function Composer({
               aria-label="Dismiss message"
             >
               <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        ) : null}
+
+        {ragNotice ? (
+          <div className="mb-2 flex items-start gap-2 rounded-xl border border-acid-400/20 bg-acid-400/[0.04] px-3 py-1.5 text-[10px] leading-5 text-acid-200/90">
+            <Database className="mt-0.5 h-3 w-3 shrink-0 text-acid-400" />
+            <span className="min-w-0 flex-1">{ragNotice}</span>
+            <button
+              type="button"
+              onClick={onDismissRagNotice}
+              className="text-acid-400/60 transition hover:text-acid-100"
+              aria-label="Dismiss retrieval summary"
+            >
+              <X className="h-3 w-3" />
             </button>
           </div>
         ) : null}
@@ -385,6 +414,30 @@ export function Composer({
               >
                 <Globe className="h-3 w-3" />
                 {internet ? "Web on" : "Web off"}
+              </button>
+              <button
+                type="button"
+                onClick={onOpenDocs}
+                className={cn(
+                  "inline-flex h-7 items-center gap-1.5 rounded-lg border px-2 text-[10px] transition",
+                  docsCount
+                    ? "border-acid-400/40 bg-acid-400/10 text-acid-200"
+                    : "border-white/10 bg-white/5 text-slate-500 hover:text-slate-300",
+                )}
+                aria-pressed={docsCount > 0}
+                title={
+                  docsCount
+                    ? `Docs: ${docsLabel ?? `${docsCount} collections`}`
+                    : "Attach knowledge collections to this chat"
+                }
+              >
+                <BookOpen className="h-3 w-3" />
+                Docs
+                {docsCount ? (
+                  <span className="rounded bg-acid-400/20 px-1 font-mono text-[8.5px] text-acid-100">
+                    {docsCount}
+                  </span>
+                ) : null}
               </button>
 
             </div>

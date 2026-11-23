@@ -3,6 +3,7 @@ import { Loader2, Play, Square, X } from "lucide-react";
 
 import { ChatView } from "./components/chat/ChatView";
 import { ConverterView } from "./components/converter/ConverterView";
+import { KnowledgeVaultView } from "./components/knowledge/KnowledgeVaultView";
 import { McpView } from "./components/mcp/McpView";
 import { DownloadsTray } from "./components/models/DownloadsTray";
 import { ModelLibraryView } from "./components/models/ModelLibraryView";
@@ -36,6 +37,10 @@ const HEADINGS: Record<ViewId, { title: string; subtitle: string }> = {
   compiler: {
     title: "GGUF → JNS Compiler",
     subtitle: "Rewrite GGUF weights into Janas's native format",
+  },
+  knowledge: {
+    title: "Knowledge Vault",
+    subtitle: "Persistent local document collections for retrieval",
   },
   mcp: {
     title: "MCP Server Hub",
@@ -235,7 +240,13 @@ export default function App() {
         ) : null}
 
         <div className="min-h-0 flex-1 overflow-hidden">
-          {view === "chat" ? <ChatView engine={engine} chat={chat} /> : null}
+          {view === "chat" ? (
+            <ChatView
+              engine={engine}
+              chat={chat}
+              onOpenKnowledge={() => setView("knowledge")}
+            />
+          ) : null}
           {view === "models" ? (
             <ModelsView
               downloads={downloads.downloads}
@@ -251,6 +262,7 @@ export default function App() {
           {view === "compiler" ? (
             <ConverterView converter={converter} onUseModel={useModel} />
           ) : null}
+          {view === "knowledge" ? <KnowledgeVaultView /> : null}
           {view === "mcp" ? <McpView /> : null}
           {view === "settings" ? <SettingsView engine={engine} /> : null}
         </div>

@@ -198,6 +198,9 @@ fn request_with(workspace: &Path, policy: ApprovalPolicy) -> AgentRequest {
         web_search: false,
         verify_command: String::new(),
         mcp_servers: Vec::new(),
+        rag_collections: Vec::new(),
+        rag_top_k: None,
+        rag_max_tokens: None,
     }
 }
 
@@ -251,6 +254,8 @@ fn execute_headless_with_recorder(
             run_id: &request.run_id,
             conversation_id: &request.conversation_id,
             recorder,
+            knowledge: None,
+            knowledge_sources: Default::default(),
         };
         execute(&context).await
     })

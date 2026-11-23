@@ -455,7 +455,7 @@ pub struct ProjectIngest {
     pub truncated: bool,
 }
 
-const IGNORED_DIRS: &[&str] = &[
+pub(crate) const IGNORED_DIRS: &[&str] = &[
     ".git",
     ".hg",
     ".svn",

@@ -19,6 +19,7 @@ use crate::{
     error::{AppError, AppResult},
     mcp::{McpActivityEvent, McpRuntime, McpServerSpec},
     memory::{tool_result_json, MemoryStore},
+    rag::{self, KnowledgeStore, RagSourcesEvent},
     settings::{self, AppSettings},
     util::{now_ms, truncate_line},
 };
@@ -76,6 +77,9 @@ pub struct ChatErrorEvent {
 pub struct ChatNoticeEvent {
     pub request_id: String,
     pub message: String,
+    /// "error" keeps the existing banner behaviour; "info" is a progress line
+    /// (for example a document-retrieval summary) that is not a failure.
+    pub level: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -125,6 +129,14 @@ pub struct ChatRequest {
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub mcp_servers: Vec<McpServerSpec>,
+    /// Knowledge collections attached to this chat. Retrieval happens here,
+    /// against the live `--ctx`, not in the webview.
+    #[serde(default)]
+    pub rag_collections: Vec<String>,
+    #[serde(default)]
+    pub rag_top_k: Option<usize>,
+    #[serde(default)]
+    pub rag_max_tokens: Option<usize>,
 }
 
 pub struct EngineManager {
@@ -481,6 +493,7 @@ impl EngineManager {
         app: &AppHandle,
         settings: &AppSettings,
         memory: &MemoryStore,
+        knowledge: Arc<KnowledgeStore>,
         request: ChatRequest,
     ) -> AppResult<()> {
         let mut messages = Vec::with_capacity(request.messages.len() + 1);
@@ -547,6 +560,7 @@ impl EngineManager {
                         ChatNoticeEvent {
                             request_id: request.request_id.clone(),
                             message: format!("MCP tools could not be prepared: {err}"),
+                            level: "error".into(),
                         },
                     );
                     None
@@ -563,6 +577,7 @@ impl EngineManager {
                             "MCP server warning: {}",
                             truncate_line(&runtime.warnings().join(" "), 900)
                         ),
+                        level: "error".into(),
                     },
                 );
             }
@@ -590,6 +605,132 @@ impl EngineManager {
                     "The enabled MCP server advertises {omitted} tools whose definitions need about {tools_cost} tokens. They do not fit in this {context_window}-token context, so this turn is running without MCP tools. Disable the server in MCP Hub or use a smaller MCP server."
                 ),
             );
+        }
+
+        // Local document vault retrieval. It runs before the first request and
+        // is capped by whatever is left of the engine's real prompt budget
+        // after the system prompt, this turn's messages and any tool schema.
+        // That is what keeps an attached collection from turning a chat into
+        // an HTTP 400 when the context window is tight.
+        if !request.rag_collections.is_empty() {
+            let query = request
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == "user")
+                .map(|message| message.content.trim().to_string())
+                .unwrap_or_default();
+            if query.is_empty() {
+                emit_chat_notice_level(
+                    app,
+                    &request.request_id,
+                    "Document retrieval was skipped because this turn has no user message to search."
+                        .into(),
+                    "info",
+                );
+            } else {
+                let essentials = message_cost + tool_schema_tokens(&mcp_tools);
+                let available = prompt_budget
+                    .saturating_sub(essentials)
+                    .saturating_sub(rag::prompt_reserve_tokens())
+                    .saturating_sub(64);
+                let requested = request
+                    .rag_max_tokens
+                    .unwrap_or(rag::DEFAULT_MAX_TOKENS)
+                    .min(rag::MAX_MAX_TOKENS);
+                let budget = requested.min(available);
+                if budget < rag::MIN_MAX_TOKENS {
+                    emit_chat_notice_level(
+                        app,
+                        &request.request_id,
+                        format!(
+                            "This {context_window}-token context has no room for document chunks after the system prompt, the conversation and the reply reserve, so the turn is running without vault context. Raise Context window, lower Max reply, or attach fewer collections."
+                        ),
+                        "info",
+                    );
+                } else {
+                    let store = knowledge.clone();
+                    let ids = request.rag_collections.clone();
+                    let top_k = request.rag_top_k.unwrap_or(rag::DEFAULT_TOP_K);
+                    let search = query.clone();
+                    let outcome = tauri::async_runtime::spawn_blocking(move || {
+                        store.query(&ids, &search, top_k, budget)
+                    })
+                    .await;
+                    match outcome {
+                        Ok(Ok(result)) if !result.chunks.is_empty() => {
+                            let system_index = messages
+                                .iter()
+                                .position(|message| message["role"] == "system");
+                            let current_system = request
+                                .system_prompt
+                                .as_deref()
+                                .unwrap_or_default();
+                            let (combined, _block_tokens) =
+                                rag::append_to_system(current_system, &result.chunks);
+                            match system_index {
+                                Some(index) => {
+                                    messages[index]["content"] =
+                                        serde_json::Value::String(combined);
+                                }
+                                None => messages.insert(
+                                    0,
+                                    serde_json::json!({ "role": "system", "content": combined }),
+                                ),
+                            }
+                            let sources = result.chunks.clone();
+                            let _ = app.emit(
+                                "chat://rag-sources",
+                                RagSourcesEvent {
+                                    request_id: request.request_id.clone(),
+                                    chunks: sources,
+                                    tokens_used: result.tokens_used,
+                                    collections: result.collections.clone(),
+                                },
+                            );
+                            let scope = if result.collections.is_empty() {
+                                "the attached collections".to_string()
+                            } else {
+                                result.collections.join(", ")
+                            };
+                            let mut notice = format!(
+                                "Retrieved {} document chunk{} (~{} tokens, {} of {} budget) from {} as [D1]–[D{}].",
+                                result.chunks.len(),
+                                if result.chunks.len() == 1 { "" } else { "s" },
+                                result.tokens_used,
+                                result.tokens_used,
+                                budget,
+                                scope,
+                                result.chunks.len()
+                            );
+                            if let Some(note) = result.note {
+                                notice.push(' ');
+                                notice.push_str(&note);
+                            }
+                            emit_chat_notice_level(app, &request.request_id, notice, "info");
+                        }
+                        Ok(Ok(result)) => emit_chat_notice_level(
+                            app,
+                            &request.request_id,
+                            format!(
+                                "No document chunks matched this turn. {}",
+                                result.note.unwrap_or_default()
+                            ),
+                            "info",
+                        ),
+                        Ok(Err(err)) => emit_chat_notice(
+                            app,
+                            &request.request_id,
+                            format!("Document retrieval failed: {err}"),
+                        ),
+                        Err(err) => emit_chat_notice(
+                            app,
+                            &request.request_id,
+                            format!("Document retrieval stopped: {err}"),
+                        ),
+                    }
+                }
+            }
         }
 
         use futures_util::StreamExt;
@@ -1657,11 +1798,21 @@ fn emit_batch(
 }
 
 fn emit_chat_notice(app: &AppHandle, request_id: &str, message: String) {
+    emit_chat_notice_level(app, request_id, message, "error");
+}
+
+fn emit_chat_notice_level(
+    app: &AppHandle,
+    request_id: &str,
+    message: String,
+    level: &str,
+) {
     let _ = app.emit(
         "chat://notice",
         ChatNoticeEvent {
             request_id: request_id.to_string(),
             message,
+            level: level.to_string(),
         },
     );
 }

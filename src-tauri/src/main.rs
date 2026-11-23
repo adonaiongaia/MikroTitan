@@ -15,6 +15,7 @@ mod huggingface;
 mod mcp;
 mod memory;
 mod provision;
+mod rag;
 mod settings;
 mod system;
 mod util;
@@ -29,6 +30,9 @@ use chat_store::{
 use converter::{ConversionStarted, ConvertRequest, ConverterManager};
 use memory::{MemoryFact, MemoryStore};
 use provision::Provisioner;
+use rag::{
+    KnowledgeCollection, KnowledgeCollectionDetail, KnowledgeStore, RagIndexSummary, RagQueryResult,
+};
 use engine::{ChatRequest, EngineManager, EngineSnapshot, EngineStatus};
 use engines::binary::BinaryManager;
 use engines::{ActiveEngineInfo, EngineKind, EngineSupervisor};
@@ -138,10 +142,12 @@ async fn stream_chat(
     supervisor: State<'_, Arc<EngineSupervisor>>,
     store: State<'_, Arc<SettingsStore>>,
     memory: State<'_, Arc<MemoryStore>>,
+    knowledge: State<'_, Arc<KnowledgeStore>>,
     request: ChatRequest,
 ) -> AppResult<()> {
     let engine = engine.inner().clone();
     let memory = memory.inner().clone();
+    let knowledge = knowledge.inner().clone();
     let active = supervisor
         .active_info()
         .await
@@ -161,7 +167,110 @@ async fn stream_chat(
     config.ctx_size = active.context_window;
     config.llama_ctx_size = active.context_window;
     config.model_path = active.model;
-    engine.stream_chat(&app, &config, &memory, request).await
+    engine
+        .stream_chat(&app, &config, &memory, knowledge, request)
+        .await
+}
+
+// ---------------------------------------------------------------------------
+// Local document vault
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+fn rag_list_collections(store: State<'_, Arc<KnowledgeStore>>) -> Vec<KnowledgeCollection> {
+    store.list()
+}
+
+#[tauri::command]
+fn rag_collection_detail(
+    store: State<'_, Arc<KnowledgeStore>>,
+    id: String,
+) -> AppResult<KnowledgeCollectionDetail> {
+    store.detail(&id)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn rag_create_collection(
+    store: State<'_, Arc<KnowledgeStore>>,
+    name: String,
+    description: String,
+    source_paths: Vec<String>,
+) -> AppResult<KnowledgeCollection> {
+    store.create(&name, &description, &source_paths)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn rag_delete_collection(
+    store: State<'_, Arc<KnowledgeStore>>,
+    id: String,
+) -> AppResult<bool> {
+    store.delete(&id)
+}
+
+/// Indexing reads and chunks files, so it runs on the blocking pool and streams
+/// `rag://index-progress` back to the vault view. Cancelling sets a flag the
+/// worker checks between files; the index keeps every file it finished.
+#[tauri::command(rename_all = "snake_case")]
+async fn rag_index_paths(
+    app: AppHandle,
+    store: State<'_, Arc<KnowledgeStore>>,
+    collection_id: String,
+    paths: Vec<String>,
+) -> AppResult<RagIndexSummary> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        store.index_paths(Some(&app), &collection_id, &paths)
+    })
+    .await
+    .map_err(|err| AppError::message(format!("Indexing stopped: {err}")))?
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn rag_reindex_collection(
+    app: AppHandle,
+    store: State<'_, Arc<KnowledgeStore>>,
+    collection_id: String,
+) -> AppResult<RagIndexSummary> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        // An empty path list re-walks the collection's source paths; unchanged
+        // files are skipped by mtime and SHA-256.
+        store.index_paths(Some(&app), &collection_id, &[])
+    })
+    .await
+    .map_err(|err| AppError::message(format!("Re-indexing stopped: {err}")))?
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn rag_cancel_index(store: State<'_, Arc<KnowledgeStore>>, collection_id: String) -> bool {
+    store.cancel(&collection_id)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn rag_query(
+    store: State<'_, Arc<KnowledgeStore>>,
+    collection_ids: Vec<String>,
+    query: String,
+    top_k: Option<usize>,
+    max_tokens: Option<usize>,
+) -> AppResult<RagQueryResult> {
+    let store = store.inner().clone();
+    let top_k = top_k.unwrap_or(rag::DEFAULT_TOP_K);
+    let max_tokens = max_tokens.unwrap_or(rag::DEFAULT_MAX_TOKENS);
+    tauri::async_runtime::spawn_blocking(move || {
+        store.query(&collection_ids, &query, top_k, max_tokens)
+    })
+    .await
+    .map_err(|err| AppError::message(format!("The knowledge search stopped: {err}")))?
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn rag_remove_path(
+    store: State<'_, Arc<KnowledgeStore>>,
+    collection_id: String,
+    path: String,
+) -> AppResult<KnowledgeCollection> {
+    store.remove_path(&collection_id, &path)
 }
 
 fn publish_memory(app: &AppHandle, memory: &MemoryStore) {
@@ -397,6 +506,14 @@ fn main() {
             let port = store.get().port;
             let memory = MemoryStore::load(data_dir.join("memory.json"));
             let chat_store = ChatStore::load(data_dir.join("chat-sessions"));
+            // The vault lives beside the chats in the *local* data directory, so
+            // a roaming profile or a synced home never copies an index of the
+            // user's documents to another machine.
+            let knowledge = KnowledgeStore::load(
+                app.path()
+                    .app_local_data_dir()?
+                    .join("knowledge"),
+            );
 
             engines::cleanup_stale_processes(app.handle())?;
             let engine = Arc::new(EngineManager::new(port));
@@ -406,6 +523,7 @@ fn main() {
 
             app.manage(store);
             app.manage(Arc::new(chat_store));
+            app.manage(Arc::new(knowledge));
             app.manage(Arc::new(memory));
             app.manage(engine);
             app.manage(supervisor.clone());
@@ -472,6 +590,15 @@ fn main() {
             memory_update,
             memory_delete,
             memory_clear,
+            rag_list_collections,
+            rag_collection_detail,
+            rag_create_collection,
+            rag_delete_collection,
+            rag_index_paths,
+            rag_reindex_collection,
+            rag_cancel_index,
+            rag_query,
+            rag_remove_path,
             start_conversion,
             cancel_conversion,
             search_models,
@@ -510,6 +637,7 @@ fn main() {
             agent::agent_approval_rules,
             agent::agent_forget_approval_rule,
             agent::agent_clear_approval_rules,
+            agent::agent_validate_workspace,
             agent::agent_abort,
             agent::agent_undo,
             agent::agent_undo_file,

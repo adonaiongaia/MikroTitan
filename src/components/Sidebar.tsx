@@ -3,6 +3,7 @@ import {
   Boxes,
   Compass,
   Cpu,
+  Database,
   Loader2,
   MessageSquare,
   Play,
@@ -36,6 +37,12 @@ const NAV: Array<{
   { id: "models", label: "Models", hint: "Hugging Face explorer", icon: Compass },
   { id: "library", label: "Library", hint: "Local model shelf", icon: Boxes },
   { id: "compiler", label: "Compiler", hint: "GGUF to JNS", icon: Binary },
+  {
+    id: "knowledge",
+    label: "Knowledge",
+    hint: "Local document vault",
+    icon: Database,
+  },
   { id: "mcp", label: "MCP Hub", hint: "Local tool servers", icon: Plug },
   { id: "settings", label: "Settings", hint: "Runtime and paths", icon: Settings },
 ];

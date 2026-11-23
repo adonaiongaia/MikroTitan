@@ -2,7 +2,7 @@
 
 **An independent, unofficial desktop studio for the [Janas-LLM](https://github.com/prabanta-dev/janas) C inference engine.**
 
-A local AI studio with **agent mode**, branching chat history, per-chat workspaces, system prompts and MCP tool scopes, crash-safe session storage, and three themes.
+A local AI studio with **agent mode**, a local document vault, branching chat history, per-chat workspaces, system prompts and MCP tool scopes, crash-safe session storage, and three themes.
 
 Studio for Janas is built with **Tauri 2**, **Rust**, **React 18**, **TypeScript**, and **Tailwind CSS**. It manages the `janas-server` process, proxies its OpenAI-compatible SSE stream into the webview, browses GGUF repositories on Hugging Face, and drives `janas-convert` / upstream `gguf2jns` with a live console.
 
@@ -17,6 +17,7 @@ The engine is **Janas-LLM** by **Maurizio Cammalleri**, licensed under [GPL-3.0-
 ## Highlights
 
 - **Agent mode** — a bounded Think → Act → Observe loop with workspace tools, a live trace, risk-aware approvals (including per-workspace remembered commands), planning, auto-compaction, verification and per-file undo.
+- **Local document vault** — persistent collections of notes, code, data and PDFs, searched on-device with hybrid BM25 + hashed TF-IDF retrieval, a per-chat Docs scope, and clickable `[D#]` citations in both chat and agent replies.
 - **Branching chats** — edit a prompt or regenerate a reply without losing the old path; switch versions with arrows or branch a new chat from any message.
 - **Per-chat context** — drafts, project bundles, workspace roots, system prompts and MCP tool scopes follow the chat instead of the window.
 - **Persona library** — save a prompt as a reusable persona; chats without their own prompt inherit a separate saved default.
@@ -52,7 +53,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the release history.
 
 ## Privacy and network access
 
-Studio for Janas has no accounts, analytics, crash reporting or telemetry upload. Chat history, images, project bundles and memory facts are written to the local app data directory, and runtime settings to the platform config directory; small UI preferences such as the theme, agent defaults, the saved default system prompt and personas live in local storage. The settings file (which may contain the local API key and Hugging Face token) and the agent approval-rule file are restricted to the owner on Unix. The engine runs locally and binds to loopback by default, and the webview's CSP only permits its own origin, Tauri IPC and the local dev server, so network calls happen in the Rust backend.
+Studio for Janas has no accounts, analytics, crash reporting or telemetry upload. Chat history, images, project bundles, document-vault collections and memory facts are written to the local app data directory, and runtime settings to the platform config directory; small UI preferences such as the theme, agent defaults, the saved default system prompt and personas live in local storage. The settings file (which may contain the local API key and Hugging Face token) and the agent approval-rule file are restricted to the owner on Unix. The engine runs locally and binds to loopback by default, and the webview's CSP only permits its own origin, Tauri IPC and the local dev server, so network calls happen in the Rust backend.
 
 **Engine setup runs automatically at startup**, whether or not you open Settings. On every launch the app detects the host and checks GitHub for the latest llama.cpp release, so one request reaches `api.github.com` even if you never download a model. It looks up Janas releases only when its managed Janas tools are missing or unusable, and it downloads a binary only when one needs installing or you press **Retry setup**. Apart from that startup check, the remaining network features are user-triggered:
 
@@ -73,8 +74,8 @@ MCP servers run as local stdio processes. The app does not proxy their traffic, 
 
 The composer's **Agent** toggle turns a chat into a bounded tool-running loop. Instead of one completion, the model plans, calls tools, reads observations and continues until it finishes, hits the step limit or is stopped. The run is shown inline as a trace attached to the reply.
 
-- Built-in workspace tools: `read_file`, `write_file`, `edit_file`, `list_directory`, `search_files` and `run_command`. `web_search` is exposed only when the Internet toggle is on; enabled MCP tools in the chat's scope join the same tool list.
-- **Workspace root:** file, search and shell tools stay disabled until a folder is chosen. A run pins that folder and cannot switch while it is active or has pending undo state. Each chat can override the global workspace, and `AGENTS.md` or `.janas/instructions.md` in the workspace is injected into the agent prompt.
+- Built-in workspace tools: `read_file`, `write_file`, `edit_file`, `list_directory`, `search_files` and `run_command`. `search_knowledge_base` joins them when the chat has document collections attached. `web_search` is exposed only when the Internet toggle is on; enabled MCP tools in the chat's scope join the same tool list.
+- **Workspace root:** file, search and shell tools stay disabled until a folder is chosen. A run pins that folder and cannot switch while it is active or has pending undo state. Picking a folder canonicalizes and validates it first. Each chat can override the global workspace, the Agent settings clear button removes both that override and the saved default, and a missing-folder error names the exact path. `AGENTS.md` or `.janas/instructions.md` in the workspace is injected into the agent prompt.
 - **Approval policies:** *destructive* (read-only tools run automatically; writes, shell and MCP ask), *all* (everything except reads asks), or *full auto*. Irreversible commands (force-push, hard reset, recursive delete, publishing, `curl | sh`) and sensitive paths (`.env`, `.git`, SSH keys, cloud credentials) always ask, even under full auto. Tool output is scrubbed for likely secrets before it reaches the trace or model.
 - **Remembered commands:** an approval card can remember one plain shell command for the current workspace. The rule covers the same command with extra arguments, but never compound commands, commands the secret scrubber recognises, irreversible commands or sensitive paths. Rules are stored per canonical workspace in `agent-approvals.json` and can be revoked individually or cleared in Engine Settings → Agent configuration. MCP tools are not covered.
 - **File-edit shortcut:** approving a `write_file` or `edit_file` with “allow file edits for this run” skips later file-edit prompts for that run; shell and MCP calls remain gated.
@@ -82,20 +83,34 @@ The composer's **Agent** toggle turns a chat into a bounded tool-running loop. I
 - **Planning and limits:** an optional `<plan>` checklist before the first tool call, a 1–25 iteration cap, optional auto-compaction at a configurable share of the context window, and an optional verification command that runs after edits and before the agent may finish.
 - **Trace:** plan, thoughts, each tool call with its risk and duration, approval cards, compaction notices, final status and changed files. The trace is stored with the chat message.
 - **Undo:** workspace checkpoints keep bounded pre-images for a whole-run undo or per-file restore/keep. A run with pending changes locks the workspace root until those changes are undone or kept.
+- **Stall protection and cancellation:** each model call allows up to 180 s for response headers and for the first streamed token, then 90 s of silence on an open stream. Stop aborts the pending HTTP request as well as the stream loop; a timeout ends the run with an actionable error instead of leaving the trace spinning, and Stop marks it **Stopped** immediately.
 - **Broad model support:** engines with native tool calling use it directly; models without a tool template get a prompt-mode tool catalogue and fenced-JSON protocol. Tool schemas are budgeted against the active context window.
 - **Safety:** paths resolve inside the pinned workspace, symlink escapes are rejected, commands run in their own process group and are killed on timeout or abort, and the approval matrix is covered by Rust tests.
+
+### Local document vault
+
+The **Knowledge** view builds persistent, local collections from folders and files. Collections are independent of any chat; a chat attaches one or more of them with the composer's **Docs** button, and every turn retrieves only from that scope.
+
+- **What can be indexed:** Markdown (`md`, `markdown`, `mdx`, `rst`), plain text (`txt`, `text`, `log`), source code (Rust, TypeScript/JavaScript, Python, Go, Java, C/C++, C#, Ruby, PHP, Swift, Kotlin, shell, SQL, HTML/CSS, Vue, Svelte, Lua, R and Elixir), structured data (`json`, `toml`, `yaml`/`yml`, `csv`/`tsv`, `ini`, `conf`, `cfg`, `xml`) and text PDFs. Scanned PDFs are reported as unreadable instead of silently producing an empty index. Hidden folders and the same `node_modules` / `target` / `.git` ignore list as project ingestion are skipped.
+- **Incremental indexing:** each collection keeps a per-file manifest with modification time and SHA-256. Adding a folder indexes only new or changed files, while **Re-index** re-walks every saved source and skips unchanged ones. Indexing runs on the Rust blocking pool, streams `rag://index-progress`, can be cancelled between files, and keeps completed files. Removing a source or deleting a collection updates the manifest and index immediately.
+- **Local hybrid retrieval:** Okapi BM25 ranks exact symbols, names and paths; a 512-dimensional hashed TF-IDF vector cosine ranks paraphrases and prose. Reciprocal Rank Fusion combines the two rankings. There is no embedding server, Python sidecar or network call.
+- **Structure-aware chunks:** documents are split on headings and code/data boundaries toward about 420 tokens per chunk (520 maximum, 3 lines of overlap), with the nearest heading and a stable chunk id. Chunks carry their file and 1-based line range.
+- **Budgeted citations:** retrieval runs before the prompt is sent, using only what is left of the running engine's real prompt budget after the system prompt, conversation, reply reserve and tool schemas. The selected chunks are appended to the system prompt as `[D1]`, `[D2]`, … and charged to the same token budget; if the context is too tight, the turn runs without vault context and says so rather than failing with HTTP 400.
+- **Evidence and pills:** `chat://rag-sources` carries the retrieved chunks, token use and collection names. Inline `[D#]` markers become clickable pills, and a **Docs** row lists the cited files; clicking either opens the source drawer with the collection, path, line range, score and chunk text. The per-chat **Docs** drawer also exposes Top-K (1–16) and Max RAG tokens (128–4000), clamped against the live context window.
+- **Agent lookups:** when collections are attached, the agent receives a read-only `search_knowledge_base` tool and can search across its iterations instead of a single prefetched block. The chunks it retrieves are attached to the final `agent:done` payload as `rag_sources`, so the agent's `[D#]` tags are clickable exactly like normal chat; repeated chunks and citation tags are deduplicated so one tag always points at one snippet.
+- **Scope hygiene:** attached collection IDs are stored per chat, pruned when a collection is deleted, and shown in the composer's Docs badge. An empty scope means no retrieval, not every collection.
 
 ### Chat workspace
 
 - **Chat sessions rail** (left, collapsible) with multiple chats, search, rename, pinning, per-chat deletion, per-chat import/export, and a **Memory** tab.
 - **Rust-backed chat store (schema v2):** each chat is one JSON file under the app data directory, with images extracted to `assets/<chat-id>/`. Saves are atomic and keep one previous version per chat. Settings → Chat history and backups exposes size stats, whole-shelf export/import, restore of the previous version, and orphaned-image cleanup.
 - **Branching and version history:** editing a user turn or regenerating a reply preserves the old suffix as an archived branch. Previous/next arrows switch sibling versions; **Branch** creates a new chat from the selected message's prefix. Branches inherit the source chat's project, workspace and MCP scope but not its draft.
-- **Per-chat drafts and context:** composer text and pending images are saved per chat and restored after restart. Attached projects, workspace roots, system prompts and MCP server scopes are also per chat, while sampling settings remain global. A debounced save plus close-time flush keeps pending edits from being lost when the window closes.
+- **Per-chat drafts and context:** composer text and pending images are saved per chat and restored after restart. Attached projects, workspace roots, document collections, system prompts and MCP server scopes are also per chat, while sampling settings remain global. A debounced save plus close-time flush keeps pending edits from being lost when the window closes.
 - **Per-chat system prompt and personas:** the system prompt panel shows whether the chat is using the saved default or its own prompt. **Use default** clears the override, **Make default** copies the current prompt into the default for new and unmodified chats, and **Save as persona** stores a reusable prompt in a machine-local persona library. Personas can be applied to a chat or deleted; deleting one does not alter chats that already use its text. Branches inherit the source chat's prompt.
 - **Token-aware context budget**: every send reserves space for the reply, keeps the system prompt and current turn, trims attached project/web context first, then drops or truncates the oldest turns until the prompt fits the **context the running engine was actually launched with**, not an edited setting that has not been restarted. If the current message and system prompt alone cannot fit, the send is stopped before it is added to the transcript, and the input stays editable. The Rust proxy is also a safety net: if either server still returns HTTP 400 with its context size, the prompt is rebuilt around the current turn and retried once automatically. MCP tool definitions count as prompt input too; when an enabled server's schema cannot fit, the turn runs without those tools and the app explains why instead of sending an impossible request.
 - **Engine Settings** (right, collapsible): temperature, top-p, top-k, min-p, repeat penalty, max reply, thinking mode, structured JSON output, context-prefetch window, LRU/LFU eviction, and the active chat's system prompt — all applied per request. Sampling controls the active engine does not advertise are hidden at runtime. Server runtime flags are edited here too: `--ctx`, `--cache`, `--mtp` / `--no-mtp`, draft model, `--prompt-on` / `--reply-on` / `--drafts-on`, `--npu-int8`, `--mode`, plus Janas's `JANAS_ATTN` and `JANAS_KV` overrides, with an explicit restart action. When llama.cpp is active, the panel also has the llama-only Direct CPU MoE Compute toggle, `--cpu-moe` / `--moe-cache-mib` / `--moe-cache-cpu-share` launch pipeline, and `--threads` cap; those values never reach Janas. A trash button in the header restores the sampling, context and runtime defaults, clears the active chat's prompt and clears the saved default; Settings also has a Reset defaults action that loads the AppSettings defaults into the form for review before Save changes.
 - **System Telemetry** (bottom, collapsible): a separate **prompt-read** and **reply-write** token ticker, SSD read throughput and IOPS sampled from the engine's `/proc/<pid>/io`, RSS/CPU, GPU/NPU counters from sysfs when the driver exposes them, an estimated RAM-vs-disk layer split, an expert-routing heatmap, and a 64 MB storage benchmark that warns when a drive will bottleneck 48 GB or 70 B+ mixtures.
-- **Composer**: a context-window ring next to Send, image attachments with a patch-token estimate, drag-and-drop project ingestion, and an Internet toggle.
+- **Composer**: a context-window ring next to Send, image attachments with a patch-token estimate, drag-and-drop project ingestion, an Internet toggle, and the per-chat Docs scope with retrieval tuning.
 - **Internet pipeline**: DuckDuckGo (with a Bing fallback) → top three pages fetched and converted to text → bundled with the prompt as numbered `[S1]` evidence. A live ticker reports each stage, and the reply carries clickable source badges that open in the system browser.
 - **Persistent memory**: the model can call its `save_to_memory_bank` tool to store durable facts in a Rust-managed JSON bank on disk. Facts are recalled by local vector similarity, injected into the next relevant turn, and can be added, corrected, or forgotten from the Memory tab. The system prompt tells the model when to save and forbids storing secrets.
 - **Streaming resilience**: the Rust SSE proxy tolerates CRLF, split chunks, raw newline-delimited JSON, malformed frames, final chunks without a newline, reasoning aliases, and content arrays. Malformed chunks are counted instead of crashing the app, and the chat view is wrapped in a render boundary so one bad reply cannot blank the window.
@@ -379,17 +394,20 @@ src/
   lib/api.ts               typed invoke wrappers + event names
   lib/chatSessions.ts      session normalization, branching, versions, drafts
   lib/mcpScope.ts          per-chat MCP filtering, request inputs, reconciliation
+  lib/rag.ts               citation pills, per-chat retrieval tuning and scope helpers
   hooks/                   engine, settings, chat, agent, downloads, converter
   components/chat/         workspace, messages, composer, agent trace, MCP drawer, sessions rail
+  components/knowledge/    knowledge vault, Docs drawer, source drawer
   components/models/       marketplace, library, download dialog/tray
   components/mcp/          server hub
   components/converter/    compiler form and console
   components/settings/     runtime, theme, and chat-history panels
 src-tauri/src/
   main.rs                  Tauri setup, state, command registration
-  engine.rs                Janas lifecycle, SSE proxy and tool loop
+  engine.rs                Janas lifecycle, SSE proxy, knowledge retrieval and tool loop
   agent.rs                 agent loop, workspace tools, approvals, approval rules and safety
   agent/checkpoint.rs      per-run file pre-images and undo state
+  rag.rs                   local document vault: indexing, hybrid retrieval and citations
   engines/                 dual-engine supervisor, Janas/llama adapters, binary installer
   chat_store.rs            schema-v2 chat sessions, assets, backups, export/import
   mcp.rs                   stdio MCP client/runtime and probes
@@ -429,8 +447,10 @@ New UI pieces: `chat/SessionsRail`, `chat/EnginePanel`, `chat/TelemetryPanel`,
 | `chat_export_session`, `chat_import_session`, `chat_branch_session`, `chat_export_all`, `chat_import_all`, `chat_backup_list`, `chat_restore_backup`, `chat_store_gc`, `chat_store_stats` | branching, backup, export/import and maintenance |
 | `verify_local_model`, `delete_local_model` | SHA-256 verification and model deletion |
 | `agent_start`, `agent_resolve_approval`, `agent_abort` | agent run, approval decisions and cancellation |
+| `agent_validate_workspace` | canonicalize and validate a workspace folder before it is pinned |
 | `agent_approval_rules`, `agent_forget_approval_rule`, `agent_clear_approval_rules` | list, revoke and clear remembered shell commands for a workspace |
 | `agent_undo`, `agent_undo_file`, `agent_keep_file`, `agent_undo_availability`, `agent_undo_state` | per-run and per-file agent undo |
+| `rag_list_collections`, `rag_collection_detail`, `rag_create_collection`, `rag_delete_collection`, `rag_index_paths`, `rag_reindex_collection`, `rag_cancel_index`, `rag_query`, `rag_remove_path` | local document vault collections, indexing and retrieval |
 
 | Event | Payload |
 | --- | --- |
@@ -441,20 +461,25 @@ New UI pieces: `chat/SessionsRail`, `chat/EnginePanel`, `chat/TelemetryPanel`,
 | `convert://log` / `convert://progress` / `convert://finished` | build console |
 | `download://progress` | aggregate download status |
 | `chat://notice` / `chat://tool-approval` | context/tool notices and MCP approval requests |
+| `chat://rag-sources` | retrieved document chunks, token use and collection names |
+| `rag://index-progress` | collection index phase, file/chunk counts and percentage |
 | `mcp://activity` | MCP handshake and tool activity |
 | `agent:plan` / `agent:thought` / `agent:tool_start` / `agent:tool_result` | agent plan, live reasoning and tool steps |
-| `agent:approval_needed` / `agent:context_compacted` / `agent:done` / `agent:error` / `agent:notice` | agent approvals, compaction and completion |
+| `agent:approval_needed` / `agent:context_compacted` / `agent:done` / `agent:error` / `agent:notice` | agent approvals, compaction and completion; `agent:done` also carries the run's `rag_sources` |
 
 ## Verification performed
 
 - `npm run check` — TypeScript typecheck passed.
-- `npm test` — 23 Vitest tests pass across chat-session normalization/branching and MCP scope/reconciliation, including empty-scope request building and persistence-boundary checks.
-- `cargo test` — 173 tests pass, 0 failed; one network-dependent live-search smoke test is ignored by default.
+- `npm test` — 33 Vitest tests pass across chat-session normalization/branching, MCP scope/reconciliation, and document citation linkification, citation lookup, scope reconciliation and retrieval-budget clamping.
+- `cargo test` — 193 tests pass, 0 failed; one network-dependent live-search smoke test is ignored by default.
 - `npm run appimage` — release build and AppImage bundling completed:
   - Artifact: `src-tauri/target/release/bundle/appimage/Studio for Janas_0.1.1_amd64.AppImage`
-  - Size: 84,949,496 bytes (81.01 MiB)
-  - SHA-256: `e7dbd7a95b7b3dba7fe2ac8dfb779f92bb31a1c82bca958b01437b81506b16c3`
+  - Size: 85,080,568 bytes (81.14 MiB)
+  - SHA-256: `0c28505a40a366e67bf0f8f113a1c309b1a448f848befdac1b1ce628543cedc0`
   - Contents: no Janas binaries are bundled; `usr/share/licenses/studio-for-janas/LICENSE` and `usr/share/doc/studio-for-janas/THIRD_PARTY_NOTICES.md` match the repository files byte-for-byte.
+- **Document vault coverage:** Rust tests exercise stable chunking, hybrid ranking, incremental re-indexing, restart persistence, collection deletion, source removal, scanned-PDF handling, secret/heavy-directory skipping and index cancellation. Vitest covers `[D#]` linkification, citation lookup and ordering, deleted-collection pruning and retrieval-budget clamping. In the rebuilt AppImage, a collection was created and indexed, attached to a chat, retrieved as `[D1]` with the Docs row and source drawer, and the agent's `search_knowledge_base` answer kept its clickable citation after a reload.
+- **Agent run resilience:** a scripted engine verified that Stop ends a stalled request immediately, and that a silent stream is ended by the 90 s idle timeout and a silent pre-stream request by the 180 s first-token timeout, each with an actionable error and an unlocked composer.
+- **Workspace recovery:** the rebuilt app validated a picked folder, reported the full missing path after that folder was deleted, and cleared both the chat pin and the default workspace from the Agent settings X; a subsequent agent run completed without a workspace.
 - **Companion coverage:** synthetic GGUF v2/v3 headers exercise metadata/array skipping, vocabulary and parameter extraction, `clip` projector classification, vision and plain main models, Gemma 3 1B-vs-4B vision detection, exact architecture/vocab draft pairing, vision-family ranking and bundle validation. llama.cpp argument tests assert that `--draft-max` is emitted with the tested draft path and that `--draft-min` stays absent at its zero default. Repository-tree tests assert that `mmproj` files are split out of the main quant list and that f16 is selected over bf16 and q8_0. The companion UI was typechecked and bundled, but no interactive Tauri click-through or live Hugging Face/mmproj download was performed for this build.
 - Runtime passes in an isolated profile exercised branching and version switching, per-chat drafts and MCP scope, backup restore and export/import, close-time saving, and model verify/delete. The delete confirmation now awaits the Tauri dialog, and window close flushes pending chat writes before destroying the window.
 - The approval-rule store, per-chat prompt normalization and Hugging Face token/error plumbing are covered by the Rust and Vitest suites. Local mock-server tests assert that the bearer token is sent only on authenticated tree/checksum requests, blank tokens add no header, request targets are exact, 401 and 403 return different fixes, checksum auth failures are surfaced, and error strings do not contain the token. No live gated-repository download or Tauri UI pass was performed for this build.
@@ -467,6 +492,7 @@ New UI pieces: `chat/SessionsRail`, `chat/EnginePanel`, `chat/TelemetryPanel`,
 - Some telemetry is necessarily an estimate: `janas-server` does not expose expert IDs or per-layer residency, so the RAM/disk split and the expert heatmap are labelled estimates. SSD throughput and IOPS come from the kernel; GPU/NPU counters only appear when the driver publishes them under `/sys/class/drm` or `/sys/class/accel`.
 - llama.cpp image input needs a vision-capable GGUF plus its matching `--mmproj` projector; the companion manager pairs it from local metadata, and the composer blocks an image send until one is bound. A projector from a different vision family is reported as incompatible instead of being tried at launch. Speculative pairing is deliberately conservative: if a file does not declare both its architecture and vocabulary size, no draft is offered.
 - Persistent memory is an in-app hashed TF-IDF vector store, not ChromaDB, so there is no Python sidecar. Facts live in `memory.json` under the app data directory and never leave the machine.
+- The document vault lives under `knowledge/` in the app data directory: `collections.json`, plus `collections/<id>/manifest.json` and `index.json.gz` per collection. Files are capped at 4 MiB, a collection at 4,000 files and the vault at 256 collections. Only selectable PDF text is extracted, so scanned PDFs need OCR before indexing. Retrieval uses BM25 and hashed TF-IDF, not neural embeddings.
 - The app assumes a single local engine instance and a single active model.
 - Chat sessions and their images live under `chat-sessions/` in the app data directory, one JSON file per chat plus `assets/<chat-id>/`, with one previous version kept per chat. Engine/agent preferences, theme choice, the saved default system prompt and the persona library live in `localStorage`; memory facts live in `memory.json`; server settings live in the platform config directory.
 - Remembered agent commands live in `agent-approvals.json` in the app data directory, one rule set per canonical workspace, and are restricted to the owner on Unix. They cover shell commands only; MCP tools remain governed by their per-server auto-approve setting. Rules for a workspace that no longer exists stay in the file; delete `agent-approvals.json` to remove them.

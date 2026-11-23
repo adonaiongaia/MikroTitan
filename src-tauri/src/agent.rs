@@ -39,6 +39,7 @@ use crate::{
     },
     error::{AppError, AppResult},
     mcp::{McpActivityEvent, McpRuntime, McpServerSpec},
+    rag::{self, KnowledgeStore},
     settings::SettingsStore,
     util::truncate_line,
 };
@@ -59,6 +60,13 @@ const MAX_SELF_CORRECTIONS: usize = 3;
 const MAX_CLAIM_RETRIES: usize = 1;
 const MAX_VERIFY_ATTEMPTS: usize = 2;
 const VERIFY_TIMEOUT_SECS: u64 = 120;
+/// How long the engine may take to answer with response headers. Prompt
+/// processing happens before the first byte, so this stays generous.
+const COMPLETION_RESPONSE_TIMEOUT_SECS: u64 = 180;
+/// How long the stream may take to produce its first byte after the headers.
+const COMPLETION_FIRST_TOKEN_TIMEOUT_SECS: u64 = 180;
+/// How long an open stream may stay silent before it is treated as stalled.
+const COMPLETION_IDLE_TIMEOUT_SECS: u64 = 90;
 const MAX_VERIFY_COMMAND_CHARS: usize = 500;
 const MAX_DIFF_LINES: usize = 160;
 const DIFF_CONTEXT_LINES: usize = 3;
@@ -170,6 +178,15 @@ pub struct AgentRequest {
     pub verify_command: String,
     #[serde(default)]
     pub mcp_servers: Vec<McpServerSpec>,
+    /// Knowledge collections attached to this chat. When they are present the
+    /// agent gets a read-only `search_knowledge_base` tool instead of a single
+    /// pre-fetched block, so it can look things up across its own iterations.
+    #[serde(default)]
+    pub rag_collections: Vec<String>,
+    #[serde(default)]
+    pub rag_top_k: Option<usize>,
+    #[serde(default)]
+    pub rag_max_tokens: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -567,6 +584,10 @@ pub struct AgentDoneEvent {
     pub changes: Vec<RunFileChange>,
     /// Canonical workspace root pinned for this run.
     pub workspace_root: Option<String>,
+    /// Document chunks the run looked up with `search_knowledge_base`, in the
+    /// order they were first retrieved, so the chat can render their `[D#]`
+    /// tags as clickable pills.
+    pub rag_sources: Vec<rag::RetrievedChunk>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1247,11 +1268,13 @@ pub async fn agent_start(
     supervisor: State<'_, Arc<crate::engines::EngineSupervisor>>,
     store: State<'_, Arc<SettingsStore>>,
     approvals: State<'_, Arc<ApprovalRuleStore>>,
+    knowledge: State<'_, Arc<KnowledgeStore>>,
     request: AgentRequest,
 ) -> AppResult<()> {
     let manager = manager.inner().clone();
     let supervisor = supervisor.inner().clone();
     let approvals = approvals.inner().clone();
+    let knowledge = knowledge.inner().clone();
     let settings = store.get();
 
     if request.run_id.trim().is_empty() {
@@ -1341,6 +1364,7 @@ pub async fn agent_start(
             journal,
             checkpoint_setup,
             config,
+            knowledge,
             request,
         )
         .await;
@@ -1456,6 +1480,16 @@ pub fn agent_abort(manager: State<'_, Arc<AgentManager>>, run_id: String) -> App
     } else {
         Err(AppError::message("That agent run is no longer active."))
     }
+}
+
+/// Canonicalise a folder picked in the UI before it is pinned to a chat, so a
+/// stale or unreadable path is rejected at selection time. Returns `None` for
+/// an empty selection, which means "run without file tools".
+#[tauri::command(rename_all = "snake_case")]
+pub fn agent_validate_workspace(path: String) -> AppResult<Option<String>> {
+    prepare_workspace(&path)
+        .map(|path| path.map(|path| path.to_string_lossy().to_string()))
+        .map_err(AppError::message)
 }
 
 #[derive(Clone)]
@@ -1627,6 +1661,38 @@ struct CheckpointSetup {
     workspace: Option<PathBuf>,
 }
 
+/// Chunks returned by `search_knowledge_base` during one run. A later search
+/// can repeat a chunk or reuse a citation; the first occurrence wins so the
+/// agent's `[D#]` tags keep pointing at one snippet.
+#[derive(Default)]
+struct KnowledgeSources {
+    chunks: Mutex<Vec<rag::RetrievedChunk>>,
+}
+
+impl KnowledgeSources {
+    fn record(&self, chunks: &[rag::RetrievedChunk]) {
+        let Ok(mut guard) = self.chunks.lock() else {
+            return;
+        };
+        for chunk in chunks {
+            let known = guard.iter().any(|existing| {
+                existing.chunk_id == chunk.chunk_id
+                    || (!chunk.citation.is_empty() && existing.citation == chunk.citation)
+            });
+            if !known {
+                guard.push(chunk.clone());
+            }
+        }
+    }
+
+    fn list(&self) -> Vec<rag::RetrievedChunk> {
+        self.chunks
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+}
+
 struct RunContext<'a> {
     events: &'a AgentEvents,
     control: &'a RunControl,
@@ -1638,6 +1704,10 @@ struct RunContext<'a> {
     conversation_id: &'a str,
     /// Present when this run has a workspace checkpoint to attribute changes to.
     recorder: Option<Arc<RunRecorder>>,
+    /// Present for every run; the `search_knowledge_base` tool is only offered
+    /// when the chat actually has collections attached.
+    knowledge: Option<&'a Arc<KnowledgeStore>>,
+    knowledge_sources: KnowledgeSources,
 }
 
 /// The payload of a finished tool call, kept separate from the event struct so
@@ -1787,6 +1857,7 @@ async fn run_agent(
     journal: Arc<RunJournal>,
     checkpoint_setup: CheckpointSetup,
     config: AgentRuntimeConfig,
+    knowledge: Arc<KnowledgeStore>,
     request: AgentRequest,
 ) {
     let CheckpointSetup {
@@ -1818,6 +1889,8 @@ async fn run_agent(
         run_id: &run_id,
         conversation_id: &conversation_id,
         recorder: recorder.clone(),
+        knowledge: Some(&knowledge),
+        knowledge_sources: KnowledgeSources::default(),
     };
 
     if let Some(note) = note {
@@ -1888,6 +1961,7 @@ async fn run_agent(
     // Remove the run before announcing it as done: the UI offers Undo as soon
     // as this event arrives, and undo refuses while a run is active.
     manager.finish(&run_id);
+    let rag_sources = context.knowledge_sources.list();
     let _ = app.emit(
         "agent:done",
         AgentDoneEvent {
@@ -1900,6 +1974,7 @@ async fn run_agent(
             changed_files,
             changes,
             workspace_root,
+            rag_sources,
         },
     );
 }
@@ -1910,7 +1985,11 @@ async fn execute(context: &RunContext<'_>) -> Result<AgentFinish, AgentFailure> 
     let instructions = workspace.as_deref().and_then(load_workspace_instructions);
 
     let mcp_runtime = connect_mcp(context).await;
-    let mut tools = workspace_tools(workspace.is_some(), request.web_search);
+    let mut tools = workspace_tools(
+        workspace.is_some(),
+        request.web_search,
+        context.knowledge.is_some() && !request.rag_collections.is_empty(),
+    );
     if let Some(runtime) = mcp_runtime.as_ref() {
         if let Ok(guard) = runtime.lock() {
             tools.extend(guard.tool_definitions());
@@ -2468,6 +2547,14 @@ enum CompleteFailure {
     Fatal(String),
 }
 
+/// Resolves once the user cancels the run. Polling keeps this selectable
+/// against a socket that never answers.
+async fn wait_for_cancel(control: &RunControl) {
+    while !control.is_cancelled() {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
 async fn complete(
     context: &RunContext<'_>,
     iteration: u32,
@@ -2511,11 +2598,28 @@ async fn complete(
         builder = builder.bearer_auth(context.config.api_key.trim());
     }
 
-    let response = builder.send().await.map_err(|error| {
-        CompleteFailure::Fatal(format!(
-            "Could not reach the local inference server: {error}"
-        ))
-    })?;
+    // A cancelled run must also abort while it waits for the response headers;
+    // otherwise Stop would leave this future parked on the socket.
+    let response = tokio::select! {
+        _ = wait_for_cancel(context.control) => return Err(CompleteFailure::Cancelled),
+        result = tokio::time::timeout(
+            Duration::from_secs(COMPLETION_RESPONSE_TIMEOUT_SECS),
+            builder.send(),
+        ) => match result {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                return Err(CompleteFailure::Fatal(format!(
+                    "Could not reach the local inference server: {error}"
+                )))
+            }
+            Err(_) => {
+                return Err(CompleteFailure::Fatal(format!(
+                    "The inference engine did not respond within {}s, so the run was stopped. Check the engine log or restart it.",
+                    COMPLETION_RESPONSE_TIMEOUT_SECS
+                )))
+            }
+        },
+    };
 
     if !response.status().is_success() {
         let status = response.status();
@@ -2541,9 +2645,31 @@ async fn complete(
     let mut ticker = tokio::time::interval(Duration::from_millis(150));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut done = false;
+    let mut received_bytes = false;
+    // The first wait is longer: prompt processing can be slow on CPU. Once
+    // bytes arrive, any silence longer than the idle limit means the stream
+    // stalled rather than the model thinking.
+    let mut stall_at = tokio::time::Instant::now()
+        + Duration::from_secs(COMPLETION_FIRST_TOKEN_TIMEOUT_SECS);
 
     while !done {
         let chunk = tokio::select! {
+            _ = tokio::time::sleep_until(stall_at) => {
+                if context.control.is_cancelled() {
+                    return Err(CompleteFailure::Cancelled);
+                }
+                return Err(CompleteFailure::Fatal(if received_bytes {
+                    format!(
+                        "The inference stream went silent for {}s, so the run was stopped. Try a shorter prompt or restart the engine.",
+                        COMPLETION_IDLE_TIMEOUT_SECS
+                    )
+                } else {
+                    format!(
+                        "The inference engine did not stream a first token within {}s, so the run was stopped. The model may be too large for this context.",
+                        COMPLETION_FIRST_TOKEN_TIMEOUT_SECS
+                    )
+                }));
+            }
             _ = ticker.tick() => {
                 if context.control.is_cancelled() {
                     return Err(CompleteFailure::Cancelled);
@@ -2555,6 +2681,9 @@ async fn complete(
                 None => break,
             },
         };
+        received_bytes = true;
+        stall_at = tokio::time::Instant::now()
+            + Duration::from_secs(COMPLETION_IDLE_TIMEOUT_SECS);
         let chunk = chunk.map_err(|error| {
             CompleteFailure::Fatal(format!("The inference stream stopped: {error}"))
         })?;
@@ -2941,8 +3070,25 @@ fn load_workspace_instructions(root: &Path) -> Option<(String, String)> {
 // Workspace tools
 // ---------------------------------------------------------------------------
 
-fn workspace_tools(has_workspace: bool, web_search: bool) -> Vec<Value> {
+fn workspace_tools(has_workspace: bool, web_search: bool, knowledge: bool) -> Vec<Value> {
     let mut tools = Vec::new();
+    if knowledge {
+        tools.push(json!({
+            "type": "function",
+            "function": {
+                "name": "search_knowledge_base",
+                "description": "Search the document collections attached to this chat (notes, code, PDFs) and return the best matching chunks with their file, line range and [D#] citation tag. Use it for project documentation, specifications and code you have not opened yet.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "What to look for. Exact symbol names, function names and file names work well." },
+                        "top_k": { "type": "integer", "description": "How many chunks to return, 1 to 12. Defaults to 6." }
+                    },
+                    "required": ["query"]
+                }
+            }
+        }));
+    }
     if has_workspace {
         tools.push(json!({
             "type": "function",
@@ -3549,7 +3695,7 @@ fn validate_tool_arguments(
     mcp: Option<&Arc<Mutex<McpRuntime>>>,
 ) -> Option<String> {
     let object = arguments.as_object()?;
-    let mut definitions = workspace_tools(true, true);
+    let mut definitions = workspace_tools(true, true, true);
     if let Some(runtime) = mcp {
         if let Ok(guard) = runtime.lock() {
             definitions.extend(guard.tool_definitions());
@@ -3694,6 +3840,39 @@ async fn execute_tool(
         "run_command" => {
             let root = require_workspace(workspace)?;
             run_command_tool(context, root, arguments).await
+        }
+        "search_knowledge_base" => {
+            let Some(knowledge) = context.knowledge else {
+                return Err("The knowledge vault is not available in this run.".into());
+            };
+            if context.request.rag_collections.is_empty() {
+                return Err(
+                    "This chat has no document collections attached. Attach one with the Docs button in the composer."
+                        .into(),
+                );
+            }
+            let query = string_arg(arguments, "query")?;
+            let top_k = arguments
+                .get("top_k")
+                .and_then(Value::as_u64)
+                .map(|value| value.clamp(1, 12) as usize)
+                .unwrap_or(context.request.rag_top_k.unwrap_or(rag::DEFAULT_TOP_K));
+            let budget = context
+                .request
+                .rag_max_tokens
+                .unwrap_or(rag::DEFAULT_MAX_TOKENS)
+                .min(rag::MAX_MAX_TOKENS);
+            let ids = context.request.rag_collections.clone();
+            let store = knowledge.clone();
+            let query = query.to_string();
+            let (text, result) = tauri::async_runtime::spawn_blocking(move || {
+                store.search_text(&ids, &query, top_k, budget)
+            })
+            .await
+            .map_err(|error| format!("The knowledge search stopped: {error}"))?
+            .map_err(|error| error.to_string())?;
+            context.knowledge_sources.record(&result.chunks);
+            Ok(text)
         }
         "web_search" => {
             let query = string_arg(arguments, "query")?;
@@ -4703,8 +4882,12 @@ fn prepare_workspace(raw: &str) -> Result<Option<PathBuf>, String> {
         return Ok(None);
     }
     let expanded = crate::settings::expand_home(raw);
-    let canonical = std::fs::canonicalize(&expanded)
-        .map_err(|error| format!("The workspace root does not exist: {error}"))?;
+    let canonical = std::fs::canonicalize(&expanded).map_err(|error| {
+        format!(
+            "The workspace root does not exist: {} ({error})",
+            expanded.display()
+        )
+    })?;
     if !canonical.is_dir() {
         return Err(format!(
             "The workspace root is not a directory: {}",
@@ -5963,7 +6146,7 @@ mod tests {
     #[test]
     fn token_estimate_counts_tools_and_messages() {
         let messages = vec![json!({"role":"user","content":"hello world"})];
-        let tools = workspace_tools(true, true);
+        let tools = workspace_tools(true, true, false);
         assert!(account_tokens(&messages, &[]) > 0);
         assert!(account_tokens(&messages, &tools) > account_tokens(&messages, &[]));
     }
@@ -5981,9 +6164,9 @@ mod tests {
 
     #[test]
     fn tool_schemas_only_expose_available_builtins() {
-        let without = workspace_tools(false, false);
+        let without = workspace_tools(false, false, false);
         assert!(without.is_empty());
-        let with_workspace = workspace_tools(true, false);
+        let with_workspace = workspace_tools(true, false, false);
         let names: Vec<&str> = with_workspace
             .iter()
             .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
@@ -5991,16 +6174,21 @@ mod tests {
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"run_command"));
         assert!(!names.contains(&"web_search"));
-        let with_web = workspace_tools(true, true);
+        let with_web = workspace_tools(true, true, false);
         assert!(with_web
             .iter()
             .any(|tool| tool.pointer("/function/name").and_then(Value::as_str)
                 == Some("web_search")));
+        let with_vault = workspace_tools(false, false, true);
+        assert!(with_vault
+            .iter()
+            .any(|tool| tool.pointer("/function/name").and_then(Value::as_str)
+                == Some("search_knowledge_base")));
     }
 
     #[test]
     fn prompt_mode_system_prompt_lists_tools() {
-        let tools = workspace_tools(true, false);
+        let tools = workspace_tools(true, false, false);
         let prompt = system_prompt_for_mode("base", &tools, true, 16_384);
         assert!(prompt.contains("read_file"));
         assert!(prompt.contains("\"tool\""));
@@ -6496,6 +6684,47 @@ mod tests {
             Some(&root),
         );
         assert!(cwd_decision.requires_approval);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn knowledge_sources_keep_one_chunk_per_citation() {
+        let chunk = |id: &str, citation: &str| rag::RetrievedChunk {
+            chunk_id: id.into(),
+            collection_id: "c".into(),
+            collection_name: "Docs".into(),
+            file_path: "/tmp/a.md".into(),
+            relative_path: "a.md".into(),
+            start_line: 1,
+            end_line: 2,
+            content: "text".into(),
+            heading: String::new(),
+            token_estimate: 3,
+            score: 1.0,
+            lexical_score: 1.0,
+            semantic_score: 1.0,
+            citation: citation.into(),
+        };
+        let sources = KnowledgeSources::default();
+        sources.record(&[chunk("a", "D1"), chunk("b", "D2")]);
+        // A second search repeats the tag and reuses a chunk id.
+        sources.record(&[chunk("c", "D1"), chunk("a", "D1")]);
+        let kept = sources.list();
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].chunk_id, "a");
+        assert_eq!(kept[1].chunk_id, "b");
+    }
+
+    #[test]
+    fn missing_workspace_error_names_the_attempted_path() {
+        let root = temp_workspace("missing-workspace");
+        let missing = root.join("deleted-folder");
+        let error = prepare_workspace(&missing.to_string_lossy()).expect_err("missing path");
+        assert!(error.contains("does not exist"), "{error}");
+        assert!(
+            error.contains(&missing.display().to_string()),
+            "error should name the path: {error}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

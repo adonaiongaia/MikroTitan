@@ -3,6 +3,7 @@ export type ViewId =
   | "models"
   | "library"
   | "compiler"
+  | "knowledge"
   | "mcp"
   | "settings";
 
@@ -237,6 +238,101 @@ export interface Citation {
   snippet?: string;
 }
 
+/**
+ * A chunk returned by the local document vault. `citation` is the bare tag
+ * ("D1"); replies reference it as `[D1]`, the same shape the web pipeline uses
+ * for `[S1]`.
+ */
+export interface RagChunk {
+  chunk_id: string;
+  collection_id: string;
+  collection_name: string;
+  /** Absolute path on this machine. */
+  file_path: string;
+  relative_path: string;
+  start_line: number;
+  end_line: number;
+  content: string;
+  heading: string;
+  token_estimate: number;
+  score: number;
+  lexical_score: number;
+  semantic_score: number;
+  /** Bare tag (`D1`); prompts and pills add the surrounding brackets. */
+  citation: string;
+}
+
+export interface RagQueryResult {
+  chunks: RagChunk[];
+  tokens_used: number;
+  budget_tokens: number;
+  candidates: number;
+  elapsed_ms: number;
+  collections: string[];
+  note: string | null;
+}
+
+/** Emitted for the turn currently streaming, keyed by the assistant message id. */
+export interface RagSourcesEvent {
+  request_id: string;
+  chunks: RagChunk[];
+  tokens_used: number;
+  collections: string[];
+}
+
+export interface KnowledgeCollection {
+  id: string;
+  name: string;
+  description: string;
+  source_paths: string[];
+  file_count: number;
+  chunk_count: number;
+  token_count: number;
+  byte_count: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface IndexedKnowledgeFile {
+  path: string;
+  relative_path: string;
+  bytes: number;
+  modified_ms: number;
+  sha256: string;
+  chunks: number;
+  tokens: number;
+  indexed_at: number;
+  /** Present for a readable file that produced no text, such as a scanned PDF. */
+  skipped_reason?: string | null;
+}
+
+export interface KnowledgeCollectionDetail {
+  collection: KnowledgeCollection;
+  files: IndexedKnowledgeFile[];
+}
+
+export interface RagIndexProgress {
+  collection_id: string;
+  phase: "scanning" | "indexing" | "writing" | "done" | "cancelled" | "error" | string;
+  files_total: number;
+  files_done: number;
+  chunks_done: number;
+  current_file: string;
+  percent: number;
+  message: string;
+}
+
+export interface RagIndexSummary {
+  collection: KnowledgeCollection;
+  files_indexed: number;
+  files_unchanged: number;
+  files_removed: number;
+  chunks: number;
+  tokens: number;
+  cancelled: boolean;
+  warnings: string[];
+}
+
 export interface MemoryFact {
   id: string;
   text: string;
@@ -261,6 +357,8 @@ export interface ChatMessage {
   }>;
   /** Structured agent trace. Absent on legacy chats and normal replies. */
   agentTrace?: AgentTrace | null;
+  /** Document chunks retrieved for this reply, so `[D1]` pills survive reload. */
+  rag_sources?: RagChunk[];
   /** Parent in the conversation tree. Null/undefined marks a root message. */
   parent_id?: string | null;
   /** The child that was active when this message was last on the main path. */
@@ -303,6 +401,11 @@ export interface ChatSession {
   mcp_server_names?: Record<string, string>;
   /** Per-chat instructions; undefined falls back to the saved default. */
   system_prompt?: string;
+  /** Knowledge collections this chat may query; undefined or [] means none. */
+  attached_collection_ids?: string[];
+  /** Per-chat retrieval tuning. */
+  rag_top_k?: number;
+  rag_max_tokens?: number;
 }
 
 export interface ChatOutboundMessage {
@@ -324,6 +427,9 @@ export interface ChatRequestPayload {
   images: string[];
   max_tokens: number | null;
   mcp_servers: McpServerInput[];
+  rag_collections: string[];
+  rag_top_k: number;
+  rag_max_tokens: number;
 }
 
 export interface ChatDelta {
@@ -349,6 +455,8 @@ export interface ChatErrorEvent {
 export interface ChatNotice {
   request_id: string;
   message: string;
+  /** "error" renders in the banner; "info" is a non-failing progress line. */
+  level?: "error" | "info" | string;
 }
 
 /** A paused MCP tool call that needs the user's decision before it runs. */
@@ -905,6 +1013,9 @@ export interface AgentRunRequest {
   web_search: boolean;
   verify_command: string;
   mcp_servers: McpServerInput[];
+  rag_collections: string[];
+  rag_top_k: number;
+  rag_max_tokens: number;
 }
 
 export interface AgentApprovalReply {
@@ -1030,6 +1141,8 @@ export interface AgentDoneEvent {
   /** Present for runs without a workspace checkpoint. */
   changes: AgentChangedFile[];
   workspace_root?: string | null;
+  /** Chunks returned by `search_knowledge_base` during the run. */
+  rag_sources?: RagChunk[];
 }
 
 export interface AgentErrorEvent {
