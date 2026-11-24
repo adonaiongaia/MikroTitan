@@ -20,6 +20,18 @@ if [[ -d "$ROOT/.tools/link-libs" ]]; then
   export LD_LIBRARY_PATH="$ROOT/.tools/link-libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 
+# Tauri's GStreamer bundling plugin shells out to patchelf, but linuxdeploy's
+# embedded copy is not on PATH. Prefer the system tool, then the workspace-local
+# copy used by this host.
+if ! command -v patchelf >/dev/null 2>&1; then
+  if [[ -x "$ROOT/.tools/patchelf/usr/bin/patchelf" ]]; then
+    export PATH="$ROOT/.tools/patchelf/usr/bin:$PATH"
+  else
+    echo "patchelf is required to bundle GStreamer plugins; install it or place it in .tools/patchelf/usr/bin" >&2
+    exit 1
+  fi
+fi
+
 # linuxdeploy's GTK plugin resolves runtime directories through pkg-config.
 # The local stubs intentionally carry no install paths, so put corrected
 # multiarch metadata ahead of them for the bundling step.

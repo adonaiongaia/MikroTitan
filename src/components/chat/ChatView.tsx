@@ -54,6 +54,7 @@ import type {
   McpServerConfig,
   RagChunk,
   StorageBenchmark,
+  WhisperStatus,
 } from "../../types";
 import { ArtifactPane } from "../artifacts/ArtifactPane";
 import { knowledgeApi } from "../knowledge/api";
@@ -76,6 +77,8 @@ interface ChatViewProps {
   chat: ChatController;
   /** Opens the Knowledge Vault view from the Docs drawer. */
   onOpenKnowledge: () => void;
+  /** Opens Settings so the mic can install Whisper. */
+  onOpenSettings: () => void;
 }
 
 const SUGGESTIONS = [
@@ -96,8 +99,30 @@ const SUGGESTIONS = [
   },
 ];
 
-export function ChatView({ engine, chat, onOpenKnowledge }: ChatViewProps) {
+export function ChatView({
+  engine,
+  chat,
+  onOpenKnowledge,
+  onOpenSettings,
+}: ChatViewProps) {
   const { settings, save } = useSettings();
+  const [whisperStatus, setWhisperStatus] = useState<WhisperStatus | null>(null);
+  const refreshWhisper = useCallback(async () => {
+    try {
+      setWhisperStatus(await api.getWhisperStatus());
+    } catch {
+      setWhisperStatus(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshWhisper();
+  }, [
+    refreshWhisper,
+    settings?.voice_input_enabled,
+    settings?.whisper_model,
+    settings?.whisper_language,
+  ]);
   const { preferences, update, setPreferences } = useEnginePreferences();
   const agent = useAgentPreferences();
   const memory = useMemory();
@@ -758,8 +783,8 @@ export function ChatView({ engine, chat, onOpenKnowledge }: ChatViewProps) {
     ],
   );
 
-  const handleSend = useCallback(async () => {
-    const text = input.trim();
+  const handleSend = useCallback(async (override?: string) => {
+    const text = (override ?? input).trim();
     if (!text || chat.busy || !ready) return;
     if (images.length && visionGuard) {
       chat.setError(
@@ -847,6 +872,50 @@ export function ChatView({ engine, chat, onOpenKnowledge }: ChatViewProps) {
     visionGuard,
     workspaceRoot,
   ]);
+
+  const inputRef = useRef(input);
+  inputRef.current = input;
+
+  const insertVoiceTranscript = useCallback(
+    (transcript: string) => {
+      const text = transcript.trim();
+      if (!text) return;
+      const current = inputRef.current;
+      const next = current.trim()
+        ? `${current.replace(/\s+$/, "")} ${text}`
+        : text;
+      inputRef.current = next;
+      setInput(next);
+    },
+    [setInput],
+  );
+
+  const sendVoiceTranscript = useCallback(
+    (transcript: string) => {
+      // Never discard a draft or queued images silently: only auto-send when
+      // the composer is empty and the engine can accept a turn right now.
+      if (!ready || chat.busy || input.trim() || images.length) {
+        insertVoiceTranscript(transcript);
+        return;
+      }
+      inputRef.current = transcript;
+      setInput(transcript);
+      void handleSend(transcript);
+    },
+    [chat.busy, handleSend, images.length, input, insertVoiceTranscript, ready, setInput],
+  );
+
+  const setVoiceAutoSend = useCallback(
+    async (value: boolean) => {
+      if (!settings) return;
+      try {
+        await save({ ...settings, voice_auto_send: value });
+      } catch (err) {
+        chat.setError(errorMessage(err));
+      }
+    },
+    [chat, save, settings],
+  );
 
   const handleRegenerateMessage = useCallback(
     async (messageId: string) => {
@@ -1189,6 +1258,21 @@ export function ChatView({ engine, chat, onOpenKnowledge }: ChatViewProps) {
           onDismissError={() => {
             chat.setError(null);
             setModelError(null);
+          }}
+          voice={{
+            enabled: Boolean(settings?.voice_input_enabled),
+            ready: Boolean(
+              whisperStatus?.installed && whisperStatus.active_model,
+            ),
+            status: whisperStatus,
+            activation:
+              settings?.voice_activation === "hold" ? "hold" : "toggle",
+            autoSend: Boolean(settings?.voice_auto_send),
+            stripNonSpeech: settings?.voice_strip_non_speech !== false,
+            onAutoSendChange: (value) => void setVoiceAutoSend(value),
+            onTranscript: insertVoiceTranscript,
+            onAutoSendTranscript: sendVoiceTranscript,
+            onOpenSettings,
           }}
           visionWarning={
             visionGuard

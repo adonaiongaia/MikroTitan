@@ -2,7 +2,7 @@
 
 **An independent, unofficial desktop studio for the [Janas-LLM](https://github.com/prabanta-dev/janas) C inference engine.**
 
-A local AI studio with **agent mode**, a local document vault, branching chat history, per-chat workspaces, system prompts and MCP tool scopes, crash-safe session storage, and three themes.
+A local AI studio with **agent mode**, a local document vault, **local voice input**, branching chat history, per-chat workspaces, system prompts and MCP tool scopes, crash-safe session storage, and three themes.
 
 Studio for Janas is built with **Tauri 2**, **Rust**, **React 18**, **TypeScript**, and **Tailwind CSS**. It manages the `janas-server` process, proxies its OpenAI-compatible SSE stream into the webview, browses GGUF repositories on Hugging Face, and drives `janas-convert` / upstream `gguf2jns` with a live console.
 
@@ -18,6 +18,7 @@ The engine is **Janas-LLM** by **Maurizio Cammalleri**, licensed under [GPL-3.0-
 
 - **Agent mode** — a bounded Think → Act → Observe loop with workspace tools, a live trace, risk-aware approvals (including per-workspace remembered commands), planning, auto-compaction, verification and per-file undo.
 - **Local document vault** — persistent collections of notes, code, data and PDFs, searched on-device with hybrid BM25 + hashed TF-IDF retrieval, a per-chat Docs scope, and clickable `[D#]` citations in both chat and agent replies.
+- **Local voice input** — toggle or hold-to-talk dictation backed by a managed `whisper.cpp` runtime and curated on-device models. Linux records the system-default Pulse/PipeWire microphone through native `parec`, with a `pw-record` fallback; transcripts can be inserted into the draft or sent immediately.
 - **Branching chats** — edit a prompt or regenerate a reply without losing the old path; switch versions with arrows or branch a new chat from any message.
 - **Per-chat context** — drafts, project bundles, workspace roots, system prompts and MCP tool scopes follow the chat instead of the window.
 - **Persona library** — save a prompt as a reusable persona; chats without their own prompt inherit a separate saved default.
@@ -50,16 +51,18 @@ See [CHANGELOG.md](CHANGELOG.md) for the release history.
 3. **Get a model.** Open **Models**, search Hugging Face, pick a quantization and download it. The file lands in your models folder and appears in **Library**.
 4. **Load it.** Press **Use** in **Library**, or pick the file in the model selector at the top of the chat. A `.gguf` loads with llama.cpp; a `.jns` loads with Janas. To run a GGUF on Janas, compile it first in the **Compiler**. The Janas / llama.cpp switch and runtime flags live in **Engine Settings** on the right.
 5. **Wait for Ready, then chat.** The bottom-left status card and the header pill show **Ready** once the engine is up. **Agent** enables agent mode, and **Tools** opens the per-chat MCP scope.
+6. **Optional: set up voice input.** In **Settings → Voice**, install the managed `whisper-cli`, download a speech model, enable the composer microphone, and save the change. The mic button then records the system-default input; `Ctrl + Space` toggles dictation from the chat view.
 
 ## Privacy and network access
 
-Studio for Janas has no accounts, analytics, crash reporting or telemetry upload. Chat history, images, project bundles, document-vault collections and memory facts are written to the local app data directory, and runtime settings to the platform config directory; small UI preferences such as the theme, agent defaults, the saved default system prompt and personas live in local storage. The settings file (which may contain the local API key and Hugging Face token) and the agent approval-rule file are restricted to the owner on Unix. The engine runs locally and binds to loopback by default, and the webview's CSP only permits its own origin, Tauri IPC and the local dev server, so network calls happen in the Rust backend.
+Studio for Janas has no accounts, analytics, crash reporting or telemetry upload. Chat history, images, project bundles, document-vault collections and memory facts are written to the local app data directory, and runtime settings to the platform config directory; small UI preferences such as the theme, agent defaults, the saved default system prompt and personas live in local storage. Voice audio is captured and transcribed locally by the managed `whisper-cli`; recordings are not uploaded and are not added to chat history. The transcript becomes a draft or chat message under the same local storage rules. The settings file (which may contain the local API key and Hugging Face token) and the agent approval-rule file are restricted to the owner on Unix. The engine runs locally and binds to loopback by default, and the webview's CSP only permits its own origin, Tauri IPC and the local dev server, so network calls happen in the Rust backend.
 
-**Engine setup runs automatically at startup**, whether or not you open Settings. On every launch the app detects the host and checks GitHub for the latest llama.cpp release, so one request reaches `api.github.com` even if you never download a model. It looks up Janas releases only when its managed Janas tools are missing or unusable, and it downloads a binary only when one needs installing or you press **Retry setup**. Apart from that startup check, the remaining network features are user-triggered:
+**Engine setup runs automatically at startup**, whether or not you open Settings. On every launch the app detects the host and checks GitHub for the latest llama.cpp release, so one request reaches `api.github.com` even if you never download a model. It looks up Janas releases only when its managed Janas tools are missing or unusable, and it downloads a binary only when one needs installing or you press **Retry setup**. Whisper's runtime and models are downloaded only when you press **Install** or **Download** in Settings → Voice. Apart from those explicit setup actions and the startup check, the remaining network features are user-triggered:
 
 | Feature | What is sent | Destination |
 | --- | --- | --- |
 | Engine setup | An automatic release lookup at every startup; binary downloads when an engine needs installing, or when you retry setup | `api.github.com` and GitHub release assets |
+| Voice setup and models | A whisper.cpp release lookup and runtime download when you press Install; the selected GGML model from Hugging Face when you press Download. Audio and transcripts are never uploaded | `api.github.com`, GitHub release assets and `huggingface.co` |
 | Model search and download | Search terms, the selected repository/file, and the optional Hugging Face token when one is configured | `huggingface.co` |
 | Web search, with **Internet** on | The search query, then the result pages it reads | DuckDuckGo (Bing fallback) and those result sites |
 | Opening a citation | The URL you click | Your default browser |
@@ -116,6 +119,16 @@ The **Knowledge** view builds persistent, local collections from folders and fil
 - **Streaming resilience**: the Rust SSE proxy tolerates CRLF, split chunks, raw newline-delimited JSON, malformed frames, final chunks without a newline, reasoning aliases, and content arrays. Malformed chunks are counted instead of crashing the app, and the chat view is wrapped in a render boundary so one bad reply cannot blank the window.
 - **Project ingestion**: drop a folder on the window (or pick it) and the studio walks the tree, skips build/vendor noise, and builds a semantic bundle with a token estimate before sending it to the prefill layer.
 - **Message actions** under every prompt and reply: copy, edit and resend, delete, branch, and previous/next version arrows for sibling replies.
+
+### Voice input
+
+Voice input is local dictation backed by a managed `whisper.cpp` runtime. It is off until enabled in **Settings → Voice**, where you can install or update `whisper-cli`, download one of four curated GGML models (Tiny English, Base English, Small multilingual, Large v3 Turbo Q5_0), choose a spoken language, and test the microphone. The runtime and models live in the app data directory; on Linux, no system Whisper installation is required.
+
+- **Composer dictation:** the mic button records canonical 16 kHz mono WAV. Use click-to-toggle or hold-to-talk, `Ctrl + Space` to toggle, `Enter` to finish and transcribe, and `Esc` to cancel. Finished text is inserted into the current chat's draft, or sent immediately when **Auto-send transcripts** is enabled and the composer is empty and idle; a non-empty draft or pending images are never discarded. **Strip non-speech annotations** removes Whisper output such as `[BLANK_AUDIO]` and `(music)`.
+- **Linux default source:** on Linux the webview's `getUserMedia` path is bypassed. Rust records the Pulse/PipeWire system default through `parec --device=@DEFAULT_SOURCE@`, falling back to `pw-record` when `parec` is absent. This avoids WebKitGTK selecting the first enumerated input instead of the desktop default. Other platforms use the Web Audio path.
+- **Microphone test and setup:** Settings → Voice installs the isolated `whisper-cli` runtime with its own libraries and keeps one previous runtime for update rollback. Model downloads show progress and are verified against pinned SHA-256 digests. A four-second mic test exercises the same capture path without transcribing.
+- **Audio files:** attach or drop WAV, MP3, OGG or FLAC files up to 200 MB (two per drop); their transcripts are appended to the draft. WebM/Opus is converted in the webview when its decoder is available, because whisper.cpp's release CLI does not decode it.
+- **Local only:** audio is normalised to 16 kHz mono WAV and handed to the local `whisper-cli` process; it is never uploaded. Runtime installation and model downloads are explicit actions.
 
 ### Smart model companions
 
@@ -178,6 +191,7 @@ Large GGUF models are rarely useful alone. A multimodal build needs a matching `
 - Active `.jns` model, models folder, server host/port, extra arguments, local API key, and the optional Hugging Face access token.
 - Scan for local `.jns` models and select one.
 - Theme picker (Acid, Ember, Tide), agent preferences, remembered command rules, and reset-defaults actions.
+- Voice input setup: managed `whisper-cli` install/update, curated model download, spoken language, toggle/hold activation, auto-send, annotation stripping, and a microphone test.
 - Chat history statistics, whole-shelf backup/export/import, previous-version restore, and orphaned-image cleanup.
 
 ## Requirements
@@ -185,6 +199,7 @@ Large GGUF models are rarely useful alone. A multimodal build needs a matching `
 - **Tested platform:** Linux x86-64, running the AppImage built below. This is the only bundle target in `tauri.conf.json`; the build and runtime checks below were run on it.
 - **Untested platforms:** the engine and provisioning modules contain macOS and Windows paths, but no macOS or Windows installer is configured or tested here. Treat those paths as unverified.
 - Rust 1.77.2+ and Node 18+.
+- For voice input on Linux, at least one of `parec` (usually from `pulseaudio-utils`) or `pw-record` (usually from `pipewire-bin`). The app prefers `parec` and falls back to `pw-record`. Whisper itself is downloaded by the app on demand.
 - WebKitGTK 4.1 / GTK3 development packages:
 
 ```bash
@@ -395,13 +410,13 @@ src/
   lib/chatSessions.ts      session normalization, branching, versions, drafts
   lib/mcpScope.ts          per-chat MCP filtering, request inputs, reconciliation
   lib/rag.ts               citation pills, per-chat retrieval tuning and scope helpers
-  hooks/                   engine, settings, chat, agent, downloads, converter
+  hooks/                   engine, settings, chat, agent, downloads, converter, voice
   components/chat/         workspace, messages, composer, agent trace, MCP drawer, sessions rail
   components/knowledge/    knowledge vault, Docs drawer, source drawer
   components/models/       marketplace, library, download dialog/tray
   components/mcp/          server hub
   components/converter/    compiler form and console
-  components/settings/     runtime, theme, and chat-history panels
+  components/settings/     runtime, theme, voice, and chat-history panels
 src-tauri/src/
   main.rs                  Tauri setup, state, command registration
   engine.rs                Janas lifecycle, SSE proxy, knowledge retrieval and tool loop
@@ -409,6 +424,9 @@ src-tauri/src/
   agent/checkpoint.rs      per-run file pre-images and undo state
   rag.rs                   local document vault: indexing, hybrid retrieval and citations
   engines/                 dual-engine supervisor, Janas/llama adapters, binary installer
+  linux_media.rs           WebKitGTK media-capture permission and stream setup
+  native_audio.rs          Linux default-source capture (parec, then pw-record)
+  whisper.rs               managed whisper.cpp runtime, WAV normalisation and transcription
   chat_store.rs            schema-v2 chat sessions, assets, backups, export/import
   mcp.rs                   stdio MCP client/runtime and probes
   provision.rs             startup hardware detection and engine provisioning
@@ -425,7 +443,11 @@ src-tauri/src/
 New UI pieces: `chat/SessionsRail`, `chat/EnginePanel`, `chat/TelemetryPanel`,
 `chat/TokenTicker`, `chat/Composer` (multimodal), `chat/AgentTrace`,
 `chat/McpLogDrawer`, `models/ModelLibraryView`, `mcp/McpView`,
-`settings/ThemePicker`, and `settings/ChatHistoryPanel`.
+`settings/ThemePicker`, `settings/VoiceSettings`, and `settings/ChatHistoryPanel`.
+
+Voice capture lives in `hooks/useVoiceRecorder.ts`. On Linux it delegates to the
+native commands; elsewhere it uses Web Audio and encodes the same canonical WAV
+before invoking Whisper.
 
 ### IPC/event contract
 
@@ -438,11 +460,13 @@ New UI pieces: `chat/SessionsRail`, `chat/EnginePanel`, `chat/TelemetryPanel`,
 | `start_download`, `cancel_download`, `pause_download`, `resume_download` | downloads and pause/resume |
 | `get_settings`, `save_settings`, `probe_binary`, `scan_local_models` | configuration |
 | `get_telemetry`, `benchmark_storage` | hardware sampling and drive test |
-| `ingest_project`, `web_search`, `transcribe_audio` | project, web and speech pipelines |
+| `ingest_project`, `web_search`, `transcribe_audio`, `transcribe_audio_file` | project, web and speech pipelines |
 | `save_to_memory_bank`, `memory_list`, `memory_update`, `memory_delete`, `memory_clear` | persistent memory bank |
 | `open_external` | open a citation in the system browser |
 | `library_models`, `mcp_probe` | local model shelf with thinking/tool badges and MCP handshake with stderr/exit diagnostics |
 | `get_backend_capabilities` | dynamic sampling-control availability from the active engine |
+| `get_whisper_status`, `install_whisper_binary`, `download_whisper_model`, `cancel_whisper_download` | Whisper runtime/model management and progress |
+| `start_native_capture`, `stop_native_capture`, `cancel_native_capture`, `native_capture_level` | Linux default-source microphone capture and live meter |
 | `chat_sessions_list`, `chat_session_save`, `chat_session_delete`, `chat_asset_data_url` | schema-v2 session store and image assets |
 | `chat_export_session`, `chat_import_session`, `chat_branch_session`, `chat_export_all`, `chat_import_all`, `chat_backup_list`, `chat_restore_backup`, `chat_store_gc`, `chat_store_stats` | branching, backup, export/import and maintenance |
 | `verify_local_model`, `delete_local_model` | SHA-256 verification and model deletion |
@@ -460,6 +484,7 @@ New UI pieces: `chat/SessionsRail`, `chat/EnginePanel`, `chat/TelemetryPanel`,
 | `memory://changed` | the full memory list after a model or user write |
 | `convert://log` / `convert://progress` / `convert://finished` | build console |
 | `download://progress` | aggregate download status |
+| `whisper://progress` | Whisper runtime install or model download phase, bytes and percentage |
 | `chat://notice` / `chat://tool-approval` | context/tool notices and MCP approval requests |
 | `chat://rag-sources` | retrieved document chunks, token use and collection names |
 | `rag://index-progress` | collection index phase, file/chunk counts and percentage |
@@ -470,14 +495,15 @@ New UI pieces: `chat/SessionsRail`, `chat/EnginePanel`, `chat/TelemetryPanel`,
 ## Verification performed
 
 - `npm run check` — TypeScript typecheck passed.
-- `npm test` — 33 Vitest tests pass across chat-session normalization/branching, MCP scope/reconciliation, and document citation linkification, citation lookup, scope reconciliation and retrieval-budget clamping.
-- `cargo test` — 193 tests pass, 0 failed; one network-dependent live-search smoke test is ignored by default.
+- `npm test` — 57 Vitest tests pass across chat-session normalization/branching, MCP scope/reconciliation, document citation and retrieval-budget helpers, and artifacts.
+- `cargo test` — 216 tests pass, 0 failed; one network-dependent live-search smoke test is ignored by default.
 - `npm run appimage` — release build and AppImage bundling completed:
   - Artifact: `src-tauri/target/release/bundle/appimage/Studio for Janas_0.1.1_amd64.AppImage`
-  - Size: 85,080,568 bytes (81.14 MiB)
-  - SHA-256: `0c28505a40a366e67bf0f8f113a1c309b1a448f848befdac1b1ce628543cedc0`
-  - Contents: no Janas binaries are bundled; `usr/share/licenses/studio-for-janas/LICENSE` and `usr/share/doc/studio-for-janas/THIRD_PARTY_NOTICES.md` match the repository files byte-for-byte.
+  - Size: 170,904,056 bytes (162.99 MiB)
+  - SHA-256: `f9ecb6f47dd1e73a7c8eddd37397f840dc56162af798f68cd3e17f793f4092b4`
+  - Contents: no Janas binaries are bundled; `usr/share/licenses/studio-for-janas/LICENSE` and `usr/share/doc/studio-for-janas/THIRD_PARTY_NOTICES.md` match the repository files byte-for-byte. The AppImage bundles the WebKit media framework used by microphone capture.
 - **Document vault coverage:** Rust tests exercise stable chunking, hybrid ranking, incremental re-indexing, restart persistence, collection deletion, source removal, scanned-PDF handling, secret/heavy-directory skipping and index cancellation. Vitest covers `[D#]` linkification, citation lookup and ordering, deleted-collection pruning and retrieval-budget clamping. In the rebuilt AppImage, a collection was created and indexed, attached to a chat, retrieved as `[D1]` with the Docs row and source drawer, and the agent's `search_knowledge_base` answer kept its clickable citation after a reload.
+- **Voice input coverage:** the final AppImage opened the USB microphone as the Pulse/PipeWire default through `parec`, and a stop/transcription run against a virtual system default produced the expected transcript. The fallback was exercised with the final release binary and a PATH containing only `pw-record`: it selected `pw-record`, captured the system-default virtual source, stopped cleanly, and produced the same transcript. Closing while recording left no capture process or source-output. Rust tests cover WAV normalisation/resampling, transcript cleanup, language validation, and isolated backend preference (`parec` before `pw-record`).
 - **Agent run resilience:** a scripted engine verified that Stop ends a stalled request immediately, and that a silent stream is ended by the 90 s idle timeout and a silent pre-stream request by the 180 s first-token timeout, each with an actionable error and an unlocked composer.
 - **Workspace recovery:** the rebuilt app validated a picked folder, reported the full missing path after that folder was deleted, and cleared both the chat pin and the default workspace from the Agent settings X; a subsequent agent run completed without a workspace.
 - **Companion coverage:** synthetic GGUF v2/v3 headers exercise metadata/array skipping, vocabulary and parameter extraction, `clip` projector classification, vision and plain main models, Gemma 3 1B-vs-4B vision detection, exact architecture/vocab draft pairing, vision-family ranking and bundle validation. llama.cpp argument tests assert that `--draft-max` is emitted with the tested draft path and that `--draft-min` stays absent at its zero default. Repository-tree tests assert that `mmproj` files are split out of the main quant list and that f16 is selected over bf16 and q8_0. The companion UI was typechecked and bundled, but no interactive Tauri click-through or live Hugging Face/mmproj download was performed for this build.
@@ -500,6 +526,8 @@ New UI pieces: `chat/SessionsRail`, `chat/EnginePanel`, `chat/TelemetryPanel`,
 - Per-chat MCP scopes store server IDs and names. On chat load, missing servers are pruned and servers re-created under the same name are remapped automatically.
 - Janas writes its own cache under `~/.cache/janas`. Converting large models can need roughly three times the model size in free disk space, as documented upstream.
 - Only GGUF quantizations supported by the installed converter will compile.
+- Voice input is opt-in. The managed `whisper-cli` runtime and curated models are downloaded on demand; on Linux the microphone is the Pulse/PipeWire system default (there is no per-app input picker), and capture needs at least one of `parec` or `pw-record`. Recordings are not persisted as audio; only the resulting transcript is inserted into the draft or chat.
+- The AppImage bundles WebKitGTK's media framework so microphone capture works in the packaged app; this is the main reason the current artifact is larger than earlier builds.
 - The AppImage is unsigned.
 
 ## License

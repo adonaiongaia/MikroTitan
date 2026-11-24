@@ -37,6 +37,7 @@ import { EngineLogsPanel } from "./EngineLogsPanel";
 import { ChatHistoryPanel } from "./ChatHistoryPanel";
 import { SetupPanel } from "./SetupPanel";
 import { ThemePicker } from "./ThemePicker";
+import { VoiceSettings } from "./VoiceSettings";
 import { StatusPill } from "../ui/StatusPill";
 
 interface SettingsViewProps {
@@ -348,6 +349,8 @@ export function SettingsView({ engine }: SettingsViewProps) {
         >
           <ThemePicker theme={theme} onChange={setTheme} />
         </Section>
+
+        <VoiceSettings form={form} update={update} onError={setError} />
 
         <SetupPanel />
 

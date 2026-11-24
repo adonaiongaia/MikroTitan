@@ -13,14 +13,17 @@ mod dual_engine_harness;
 mod error;
 mod gguf;
 mod huggingface;
+mod linux_media;
 mod logging;
 mod mcp;
 mod memory;
+mod native_audio;
 mod provision;
 mod rag;
 mod settings;
 mod system;
 mod util;
+mod whisper;
 
 use std::sync::Arc;
 
@@ -535,6 +538,12 @@ fn main() {
             }
 
             let store = Arc::new(SettingsStore::load(config_dir, data_dir.clone())?);
+            // WebKitGTK disables getUserMedia and denies permission requests by
+            // default. Enable audio-only capture for this trusted app origin so
+            // the Composer's microphone works on Linux without a sidecar.
+            if let Some(window) = app.get_webview_window("main") {
+                linux_media::enable_media_capture(window.as_ref());
+            }
             app.manage(artifact_frame::ArtifactFrames::default());
             let port = store.get().port;
             let memory = MemoryStore::load(data_dir.join("memory.json"));
@@ -564,6 +573,8 @@ fn main() {
             app.manage(provisioner.clone());
             app.manage(Arc::new(ConverterManager::new()));
             app.manage(Arc::new(DownloadManager::new()));
+            app.manage(Arc::new(whisper::WhisperManager::new()));
+            app.manage(Arc::new(native_audio::NativeAudioCapture::new()));
             app.manage(Arc::new(agent::AgentManager::with_checkpoints(
                 data_dir.join("agent-checkpoints"),
             )));
@@ -649,6 +660,15 @@ fn main() {
             system::web_search,
             system::open_external,
             system::transcribe_audio,
+            system::transcribe_audio_file,
+            native_audio::start_native_capture,
+            native_audio::stop_native_capture,
+            native_audio::cancel_native_capture,
+            native_audio::native_capture_level,
+            whisper::get_whisper_status,
+            whisper::install_whisper_binary,
+            whisper::download_whisper_model,
+            whisper::cancel_whisper_download,
             system::library_models,
             system::library_disk,
             system::verify_local_model,

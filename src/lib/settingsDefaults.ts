@@ -49,4 +49,10 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   top_k: 40,
   model_bundles: [],
   active_bundle_id: "",
+  whisper_model: "base.en",
+  whisper_language: "auto",
+  voice_input_enabled: false,
+  voice_activation: "toggle",
+  voice_auto_send: false,
+  voice_strip_non_speech: true,
 };

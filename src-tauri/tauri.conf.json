@@ -46,7 +46,7 @@
     "longDescription": "Studio for Janas is an independent, unofficial desktop studio for the Janas-LLM C inference engine by Maurizio Cammalleri. It downloads the current Janas release at startup, runs it on your own machine, streams chat from local .jns models, browses and downloads GGUF models from Hugging Face, and compiles them into the Janas .jns format with a live build console.",
     "linux": {
       "appimage": {
-        "bundleMediaFramework": false,
+        "bundleMediaFramework": true,
         "files": {
           "/usr/share/licenses/studio-for-janas/LICENSE": "../LICENSE",
           "/usr/share/doc/studio-for-janas/THIRD_PARTY_NOTICES.md": "../THIRD_PARTY_NOTICES.md"

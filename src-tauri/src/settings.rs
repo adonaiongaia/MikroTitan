@@ -118,6 +118,18 @@ pub struct AppSettings {
     pub model_bundles: Vec<crate::companions::ModelBundle>,
     /// The bundle the user last activated.
     pub active_bundle_id: String,
+    /// Curated whisper.cpp model id used for voice input ("base.en", ...).
+    pub whisper_model: String,
+    /// whisper-cli `-l` value: "auto" or a language code such as "en".
+    pub whisper_language: String,
+    /// Show the microphone in the chat composer.
+    pub voice_input_enabled: bool,
+    /// "toggle" (click to start/stop) or "hold" (push-to-talk).
+    pub voice_activation: String,
+    /// Send a finished transcript immediately instead of inserting it.
+    pub voice_auto_send: bool,
+    /// Drop Whisper annotations such as [BLANK_AUDIO] or (music).
+    pub voice_strip_non_speech: bool,
 }
 
 impl Default for AppSettings {
@@ -168,6 +180,12 @@ impl Default for AppSettings {
             top_k: 40,
             model_bundles: Vec::new(),
             active_bundle_id: String::new(),
+            whisper_model: "base.en".into(),
+            whisper_language: "auto".into(),
+            voice_input_enabled: false,
+            voice_activation: "toggle".into(),
+            voice_auto_send: false,
+            voice_strip_non_speech: true,
         }
     }
 }
@@ -255,6 +273,18 @@ impl AppSettings {
         self.hf_token
             .retain(|character| !character.is_whitespace() && !character.is_control());
         self.top_k = self.top_k.clamp(1, 100);
+        self.whisper_model = self.whisper_model.trim().to_ascii_lowercase();
+        if self.whisper_model.is_empty() {
+            self.whisper_model = "base.en".into();
+        }
+        self.whisper_language = self.whisper_language.trim().to_ascii_lowercase();
+        if self.whisper_language.is_empty() {
+            self.whisper_language = "auto".into();
+        }
+        self.voice_activation = match self.voice_activation.trim().to_ascii_lowercase().as_str() {
+            "hold" => "hold".into(),
+            _ => "toggle".into(),
+        };
     }
 
     /// Align the offload setting with the layers the selected model actually

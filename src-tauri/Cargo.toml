@@ -38,6 +38,12 @@ tar = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
 
+# WebKitGTK needs enable-media-stream plus a permission-request handler before
+# getUserMedia can open the microphone. Pinned to the exact version wry links so
+# both resolve to one webkit2gtk-sys and the AppImage carries one copy.
+[target.'cfg(target_os = "linux")'.dependencies]
+webkit2gtk = { version = "=2.0.2", features = ["v2_40"] }
+
 [profile.release]
 codegen-units = 1
 lto = true

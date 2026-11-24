@@ -245,6 +245,7 @@ export default function App() {
               engine={engine}
               chat={chat}
               onOpenKnowledge={() => setView("knowledge")}
+              onOpenSettings={() => setView("settings")}
             />
           ) : null}
           {view === "models" ? (

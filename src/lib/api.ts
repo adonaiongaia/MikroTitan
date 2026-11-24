@@ -46,7 +46,11 @@ import type {
   SetupReport,
   StorageBenchmark,
   Telemetry,
+  TranscriptionResult,
   WebSearchResponse,
+  WhisperInstallResult,
+  WhisperModelDownload,
+  WhisperStatus,
 } from "../types";
 
 export const Events = {
@@ -57,6 +61,7 @@ export const Events = {
   engineTelemetry: "engine://telemetry",
   engineAdapterWarning: "engine://adapter-warning",
   engineBinaryProgress: "engine://binary-progress",
+  whisperProgress: "whisper://progress",
   engineSetupStatus: "setup://status",
   chatDelta: "chat://delta",
   chatDone: "chat://done",
@@ -240,11 +245,50 @@ export const api = {
     invoke<ProjectIngest>("ingest_project", { path }),
   webSearch: (query: string, pages = 3) =>
     invoke<WebSearchResponse>("web_search", { query, pages }),
-  transcribeAudio: (audioBase64: string, mime: string) =>
-    invoke<string>("transcribe_audio", {
+  transcribeAudio: (
+    audioBase64: string,
+    mime: string,
+    fileName?: string | null,
+    model?: string | null,
+    language?: string | null,
+    stripNonSpeech?: boolean,
+  ) =>
+    invoke<TranscriptionResult>("transcribe_audio", {
       audioBase64,
       mime,
+      fileName: fileName ?? null,
+      model: model ?? null,
+      language: language ?? null,
+      stripNonSpeech: stripNonSpeech ?? true,
     }),
+  transcribeAudioFile: (
+    path: string,
+    model?: string | null,
+    language?: string | null,
+  ) =>
+    invoke<TranscriptionResult>("transcribe_audio_file", {
+      path,
+      model: model ?? null,
+      language: language ?? null,
+    }),
+  getWhisperStatus: () => invoke<WhisperStatus>("get_whisper_status"),
+  startNativeCapture: () => invoke<void>("start_native_capture"),
+  stopNativeCapture: () =>
+    invoke<{
+      audioBase64: string;
+      mime: string;
+      durationMs: number;
+    }>("stop_native_capture"),
+  cancelNativeCapture: () => invoke<boolean>("cancel_native_capture"),
+  nativeCaptureLevel: () => invoke<number>("native_capture_level"),
+  installWhisperBinary: (backend?: "auto" | "cpu" | "cuda" | "vulkan") =>
+    invoke<WhisperInstallResult>("install_whisper_binary", {
+      backend: backend ?? "auto",
+    }),
+  downloadWhisperModel: (modelId: string) =>
+    invoke<WhisperModelDownload>("download_whisper_model", { modelId }),
+  cancelWhisperDownload: () =>
+    invoke<boolean>("cancel_whisper_download"),
   libraryModels: () => invoke<LibraryModel[]>("library_models"),
   libraryDisk: () => invoke<LibraryDisk>("library_disk"),
   verifyLocalModel: (path: string) =>

@@ -1,20 +1,29 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ArrowUp,
   BookOpen,
   Bot,
+  Check,
   Database,
   Eye,
   FolderOpen,
   Globe,
   ImagePlus,
   Loader2,
+  Mic,
   Square,
   X,
 } from "lucide-react";
 
+import {
+  bytesToBase64,
+  decodeAudioFileToWav,
+  useVoiceRecorder,
+} from "../../hooks/useVoiceRecorder";
+import { api } from "../../lib/api";
 import { cn } from "../../lib/cn";
 import { errorMessage, formatCount } from "../../lib/format";
+import type { WhisperStatus } from "../../types";
 import { Button } from "../ui/Button";
 import { ProgressBar } from "../ui/ProgressBar";
 
@@ -34,6 +43,22 @@ export interface ComposerVisionWarning {
   busy: boolean;
   onPair: () => void;
   onDownload: () => void;
+}
+
+export interface ComposerVoiceProps {
+  enabled: boolean;
+  /** whisper-cli and at least one model are installed. */
+  ready: boolean;
+  status: WhisperStatus | null;
+  activation: "toggle" | "hold" | string;
+  autoSend: boolean;
+  stripNonSpeech: boolean;
+  onAutoSendChange: (value: boolean) => void;
+  /** Insert a finished transcript into this chat's draft. */
+  onTranscript: (text: string) => void;
+  /** Send a finished transcript immediately. */
+  onAutoSendTranscript: (text: string) => void;
+  onOpenSettings: () => void;
 }
 
 interface ComposerProps {
@@ -69,6 +94,7 @@ interface ComposerProps {
   /** Informational line from the Rust turn, e.g. the retrieval summary. */
   ragNotice: string | null;
   onDismissRagNotice: () => void;
+  voice: ComposerVoiceProps;
 }
 
 function readImage(file: File): Promise<ComposerImage> {
@@ -121,12 +147,16 @@ export function Composer({
   onOpenDocs,
   ragNotice,
   onDismissRagNotice,
+  voice,
 }: ComposerProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
   const [localError, setLocalError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
+  const [voiceBusy, setVoiceBusy] = useState(false);
+  const recorder = useVoiceRecorder();
+  const holdMode = voice.activation === "hold";
 
   useEffect(() => {
     const element = textareaRef.current;
@@ -135,8 +165,140 @@ export function Composer({
     element.style.height = `${Math.min(element.scrollHeight, 220)}px`;
   }, [value]);
 
+  const startVoice = useCallback(async () => {
+    setLocalError(null);
+    recorder.clearError();
+    if (!voice.enabled) {
+      setLocalError(
+        "Voice input is turned off. Enable it in Settings → Voice and save the change.",
+      );
+      return;
+    }
+    if (!voice.ready) {
+      setLocalError(
+        "Voice input needs whisper-cli and a downloaded model. Opening Settings → Voice.",
+      );
+      voice.onOpenSettings();
+      return;
+    }
+    await recorder.start();
+  }, [
+    recorder.clearError,
+    recorder.start,
+    voice.enabled,
+    voice.onOpenSettings,
+    voice.ready,
+  ]);
+
+  const finishVoice = useCallback(async () => {
+    const audio = await recorder.finish();
+    if (!audio) return;
+    setVoiceBusy(true);
+    setLocalError(null);
+    try {
+      const result = await api.transcribeAudio(
+        audio.base64,
+        audio.mime,
+        "recording.wav",
+        null,
+        null,
+        voice.stripNonSpeech,
+      );
+      const text = result.text.trim();
+      if (!text) {
+        setLocalError(
+          "No speech was detected. Try again closer to the microphone.",
+        );
+        return;
+      }
+      if (voice.autoSend) voice.onAutoSendTranscript(text);
+      else voice.onTranscript(text);
+    } catch (err) {
+      setLocalError(errorMessage(err));
+    } finally {
+      setVoiceBusy(false);
+    }
+  }, [
+    recorder.finish,
+    voice.autoSend,
+    voice.onAutoSendTranscript,
+    voice.onTranscript,
+    voice.stripNonSpeech,
+  ]);
+
+  const transcribeAudioFiles = async (files: File[]) => {
+    if (!voice.enabled) {
+      setLocalError(
+        "Voice input is turned off. Enable it in Settings → Voice and save the change.",
+      );
+      return;
+    }
+    if (!voice.ready) {
+      setLocalError(
+        "Audio attachments need whisper-cli and a downloaded model. Opening Settings → Voice.",
+      );
+      voice.onOpenSettings();
+      return;
+    }
+    setVoiceBusy(true);
+    setLocalError(null);
+    try {
+      const pieces: string[] = [];
+      for (const file of files) {
+        if (file.size > 200 * 1024 * 1024) {
+          setLocalError(`${file.name} is larger than the 200 MB audio limit.`);
+          continue;
+        }
+        let base64: string;
+        let mime: string;
+        let name: string;
+        if (isWebmFile(file)) {
+          // whisper.cpp does not decode WebM/Opus. WebKit's own decoder turns
+          // it into PCM here, then the backend receives the same WAV the mic
+          // recorder produces.
+          try {
+            const converted = await decodeAudioFileToWav(file);
+            base64 = converted.base64;
+            mime = converted.mime;
+            name = `${file.name.replace(/\.[^.]+$/, "") || "recording"}.wav`;
+          } catch {
+            setLocalError(
+              `${file.name} contains a WebM/Opus track this webview could not decode. Convert it to WAV, MP3, OGG or FLAC, or use the microphone button.`,
+            );
+            continue;
+          }
+        } else {
+          const bytes = new Uint8Array(await file.arrayBuffer());
+          base64 = bytesToBase64(bytes);
+          mime = file.type || "application/octet-stream";
+          name = file.name;
+        }
+        const result = await api.transcribeAudio(
+          base64,
+          mime,
+          name,
+          null,
+          null,
+          voice.stripNonSpeech,
+        );
+        const text = result.text.trim();
+        if (text) pieces.push(text);
+        else setLocalError(`No speech was detected in ${file.name}.`);
+      }
+      if (pieces.length) voice.onTranscript(pieces.join(" "));
+    } catch (err) {
+      setLocalError(errorMessage(err));
+    } finally {
+      setVoiceBusy(false);
+    }
+  };
+
   const addFiles = async (files: FileList | File[]) => {
-    const picked = Array.from(files)
+    const list = Array.from(files);
+    const audio = list.filter(isAudioFile).slice(0, 2);
+    if (audio.length) void transcribeAudioFiles(audio);
+
+    const picked = list
       .filter((file) => file.type.startsWith("image/"))
       .slice(0, 4 - images.length);
     if (!picked.length) return;
@@ -147,6 +309,45 @@ export function Composer({
     } catch (err) {
       setLocalError(errorMessage(err));
     }
+  };
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.code === "Space") {
+        if (!voice.enabled) return;
+        event.preventDefault();
+        if (recorder.state === "recording") void finishVoice();
+        else if (recorder.state === "idle" && !voiceBusy) void startVoice();
+        return;
+      }
+      if (event.key === "Escape" && recorder.state === "recording") {
+        event.preventDefault();
+        recorder.cancel();
+        return;
+      }
+      if (
+        event.key === "Enter" &&
+        !event.shiftKey &&
+        recorder.state === "recording"
+      ) {
+        event.preventDefault();
+        void finishVoice();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [
+    finishVoice,
+    recorder.cancel,
+    recorder.state,
+    startVoice,
+    voice.enabled,
+    voiceBusy,
+  ]);
+
+  const toggleMic = () => {
+    if (recorder.state === "recording") void finishVoice();
+    else void startVoice();
   };
 
   const contextPercent =
@@ -224,12 +425,15 @@ export function Composer({
           </div>
         ) : null}
 
-        {localError ? (
+        {localError || recorder.error ? (
           <div className="mb-2 flex items-start gap-2 rounded-xl border border-amber-400/20 bg-amber-400/5 px-3.5 py-2.5 text-[11px] leading-5 text-amber-200">
-            <span className="flex-1">{localError}</span>
+            <span className="flex-1">{localError ?? recorder.error}</span>
             <button
               type="button"
-              onClick={() => setLocalError(null)}
+              onClick={() => {
+                setLocalError(null);
+                recorder.clearError();
+              }}
               className="text-amber-300/60 transition hover:text-amber-100"
               aria-label="Dismiss message"
             >
@@ -330,6 +534,83 @@ export function Composer({
               : "border-white/10 focus-within:border-acid-400/30",
           )}
         >
+          {recorder.state === "recording" ||
+          recorder.state === "encoding" ||
+          voiceBusy ? (
+            <div className="mb-1.5 flex flex-wrap items-center gap-2 rounded-xl border border-acid-400/25 bg-acid-400/[0.06] px-2.5 py-2">
+              <span className="relative flex h-2 w-2 shrink-0">
+                {recorder.state === "recording" ? (
+                  <>
+                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-rose-400/70" />
+                    <span className="relative inline-flex h-2 w-2 rounded-full bg-rose-400" />
+                  </>
+                ) : (
+                  <Loader2 className="h-2.5 w-2.5 animate-spin text-acid-300" />
+                )}
+              </span>
+              <div className="flex h-5 min-w-[90px] flex-1 items-end gap-[2px] overflow-hidden">
+                {recorder.levels.slice(-36).map((value, index) => (
+                  <span
+                    key={index}
+                    className="flex-1 rounded-sm bg-acid-400/80 transition-[height] duration-75"
+                    style={{
+                      height: `${
+                        recorder.state === "recording"
+                          ? Math.max(8, Math.round(value * 100))
+                          : 12
+                      }%`,
+                    }}
+                  />
+                ))}
+              </div>
+              <span className="font-mono text-[10px] tabular-nums text-acid-200">
+                {voiceBusy && recorder.state !== "recording"
+                  ? "transcribing…"
+                  : formatClock(recorder.elapsedMs)}
+              </span>
+              {voice.status?.active_model ? (
+                <span className="hidden font-mono text-[8.5px] text-acid-500/70 sm:inline">
+                  {voice.status.active_model}
+                </span>
+              ) : null}
+              <button
+                type="button"
+                onClick={() => voice.onAutoSendChange(!voice.autoSend)}
+                className={cn(
+                  "inline-flex h-6 items-center rounded-md border px-2 text-[9px] transition",
+                  voice.autoSend
+                    ? "border-acid-400/40 bg-acid-400/15 text-acid-100"
+                    : "border-white/10 bg-white/5 text-slate-400 hover:text-slate-200",
+                )}
+                title="Choose whether a finished transcript is sent immediately or inserted into the draft"
+              >
+                {voice.autoSend ? "Auto-send" : "Insert to draft"}
+              </button>
+              {recorder.state === "recording" ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => recorder.cancel()}
+                    className="inline-flex h-6 items-center gap-1 rounded-md border border-white/10 bg-white/5 px-2 text-[9px] text-slate-400 transition hover:text-slate-200"
+                    title="Cancel recording (Esc)"
+                  >
+                    <X className="h-3 w-3" />
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void finishVoice()}
+                    className="inline-flex h-6 items-center gap-1 rounded-md bg-acid-400 px-2 text-[9px] font-semibold text-ink-950 transition hover:bg-acid-300"
+                    title="Finish and transcribe (Enter)"
+                  >
+                    <Check className="h-3 w-3" />
+                    Finish
+                  </button>
+                </>
+              ) : null}
+            </div>
+          ) : null}
+
           <textarea
             ref={textareaRef}
             rows={1}
@@ -359,7 +640,7 @@ export function Composer({
               <input
                 ref={fileRef}
                 type="file"
-                accept="image/*"
+                accept="image/*,audio/wav,audio/mpeg,audio/ogg,audio/flac,audio/webm,video/webm,.wav,.mp3,.ogg,.flac,.webm"
                 multiple
                 className="hidden"
                 onChange={(event) => {
@@ -371,7 +652,7 @@ export function Composer({
                 label={
                   agentMode
                     ? "Image attachments are not available in Agent Mode"
-                    : "Attach images"
+                    : "Attach images or audio"
                 }
                 onClick={() => fileRef.current?.click()}
                 disabled={images.length >= 4 || agentMode}
@@ -450,6 +731,96 @@ export function Composer({
                 color={ringColor}
               />
 
+              {voice.enabled ? (
+                <button
+                  type="button"
+                  disabled={
+                    voiceBusy ||
+                    recorder.state === "requesting" ||
+                    recorder.state === "encoding"
+                  }
+                  onClick={holdMode ? undefined : toggleMic}
+                  onPointerDown={
+                    holdMode
+                                              ? (event) => {
+                            if (event.button !== 0) return;
+                            event.preventDefault();
+                            try {
+                              event.currentTarget.setPointerCapture(
+                                event.pointerId,
+                              );
+                            } catch {
+                              // Pointer capture is best-effort.
+                            }
+                            if (recorder.state === "idle") void startVoice();
+                          }
+                      : undefined
+                  }
+                  onPointerUp={
+                    holdMode
+                      ? () => {
+                          if (recorder.state === "recording")
+                            void finishVoice();
+                        }
+                      : undefined
+                  }
+                  onPointerCancel={
+                    holdMode ? () => recorder.cancel() : undefined
+                  }
+                  onKeyDown={
+                    holdMode
+                      ? (event) => {
+                          if (event.code === "Space" && !event.repeat) {
+                            event.preventDefault();
+                            if (recorder.state === "idle") void startVoice();
+                          }
+                        }
+                      : undefined
+                  }
+                  onKeyUp={
+                    holdMode
+                      ? (event) => {
+                          if (event.code === "Space") {
+                            event.preventDefault();
+                            if (recorder.state === "recording")
+                              void finishVoice();
+                          }
+                        }
+                      : undefined
+                  }
+                  aria-pressed={recorder.state === "recording"}
+                  aria-label={
+                    voice.ready
+                      ? holdMode
+                        ? "Hold to talk"
+                        : "Record voice input"
+                      : "Set up voice input in Settings"
+                  }
+                  title={
+                    voice.ready
+                      ? holdMode
+                        ? "Hold to talk · Ctrl+Space toggles"
+                        : "Voice input · Ctrl+Space"
+                      : "Whisper is not set up yet · open Settings → Voice"
+                  }
+                  className={cn(
+                    "inline-flex h-8 w-8 items-center justify-center rounded-lg border transition disabled:cursor-not-allowed disabled:opacity-40",
+                    recorder.state === "recording"
+                      ? "border-rose-400/40 bg-rose-500/15 text-rose-200 shadow-glow"
+                      : voice.ready
+                        ? "border-white/10 bg-white/5 text-slate-400 hover:border-acid-400/30 hover:text-acid-200"
+                        : "border-amber-400/25 bg-amber-400/5 text-amber-300/80 hover:text-amber-200",
+                  )}
+                >
+                  {recorder.state === "requesting" ||
+                  recorder.state === "encoding" ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Mic className="h-3.5 w-3.5" />
+                  )}
+                </button>
+              ) : null}
+
               {streaming ? (
                 <Button
                   size="sm"
@@ -497,7 +868,8 @@ export function Composer({
         <div className="mt-1.5 flex items-center justify-between text-[9.5px] text-slate-600">
           <span>
             {agentMode ? "Enter to assign · " : "Enter to send · "}
-            Shift + Enter for a new line ·{" "}
+            Shift + Enter for a new line
+            {voice.enabled ? " · Ctrl + Space dictation" : ""} ·{" "}
             <span className="text-acid-500/80">
               {agentMode ? "agent workspace" : ready ? "local engine" : "engine offline"}
             </span>
@@ -509,6 +881,31 @@ export function Composer({
       </div>
     </div>
   );
+}
+
+function isAudioFile(file: File): boolean {
+  const name = file.name.toLowerCase();
+  return (
+    file.type.startsWith("audio/") ||
+    [".wav", ".mp3", ".ogg", ".oga", ".flac", ".webm"].some((extension) =>
+      name.endsWith(extension),
+    )
+  );
+}
+
+function isWebmFile(file: File): boolean {
+  return (
+    file.name.toLowerCase().endsWith(".webm") ||
+    file.type === "audio/webm" ||
+    file.type === "video/webm"
+  );
+}
+
+function formatClock(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
 }
 
 function IconButton({

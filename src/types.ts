@@ -203,6 +203,78 @@ export interface AppSettings {
   model_bundles: ModelBundle[];
   /** The bundle the user last activated. */
   active_bundle_id: string;
+  /** Curated whisper.cpp model id used for local voice input. */
+  whisper_model: string;
+  /** whisper-cli -l value: "auto" or a language code such as "en". */
+  whisper_language: string;
+  /** Show the microphone button in the chat composer. */
+  voice_input_enabled: boolean;
+  /** "toggle" (click to start/stop) or "hold" (push-to-talk). */
+  voice_activation: "toggle" | "hold" | string;
+  /** Send a finished transcript immediately instead of inserting it. */
+  voice_auto_send: boolean;
+  /** Drop annotations such as [BLANK_AUDIO] or (music). */
+  voice_strip_non_speech: boolean;
+}
+
+export interface WhisperModelStatus {
+  id: string;
+  file_name: string;
+  label: string;
+  size_bytes: number;
+  ram_mb: number;
+  multilingual: boolean;
+  note: string;
+  installed: boolean;
+  path: string;
+}
+
+export interface WhisperStatus {
+  installed: boolean;
+  binary_path: string;
+  library_path: string;
+  version: string | null;
+  models_dir: string;
+  models: WhisperModelStatus[];
+  selected_model: string;
+  active_model: string | null;
+  language: string;
+  voice_enabled: boolean;
+  message: string;
+}
+
+export interface WhisperInstallResult {
+  installed_path: string;
+  version: string | null;
+  release_tag: string;
+  asset_name: string;
+  message: string;
+}
+
+export interface WhisperModelDownload {
+  model_id: string;
+  path: string;
+  size_bytes: number;
+  sha256: string;
+  message: string;
+}
+
+export interface WhisperProgress {
+  phase: string;
+  model: string | null;
+  downloaded: number;
+  total: number | null;
+  percent: number | null;
+  message: string;
+}
+
+export interface TranscriptionResult {
+  text: string;
+  /** Wall-clock time spent decoding and running whisper-cli. */
+  duration_ms: number;
+  model_used: string;
+  /** Approximate duration of the normalised audio, when known. */
+  audio_ms: number;
 }
 
 export interface BinaryProbe {

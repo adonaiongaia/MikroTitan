@@ -15,7 +15,7 @@ use std::{
 };
 
 use serde::Serialize;
-use tauri::State;
+use tauri::{AppHandle, State};
 
 use crate::{
     error::{AppError, AppResult},
@@ -1242,63 +1242,55 @@ fn format_bytes(bytes: u64) -> String {
 // Audio transcription (uses the engine's speech model when one is loaded)
 // ---------------------------------------------------------------------------
 
+/// Transcribe a recording entirely on this machine with whisper.cpp.
+///
+/// `audio_base64` is normally the 16 kHz mono 16-bit WAV produced by the
+/// Composer's Web Audio recorder. Raw 16-bit PCM and the compressed formats
+/// whisper.cpp decodes itself (MP3, OGG, FLAC) are accepted too. The managed
+/// floating text is passed through without envelope wrapping so each caller can
+/// hand it to the frontend exactly as spoken.
 #[tauri::command]
 pub async fn transcribe_audio(
+    app: AppHandle,
     store: State<'_, std::sync::Arc<SettingsStore>>,
     audio_base64: String,
     mime: Option<String>,
-) -> AppResult<String> {
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    let settings = store.get();
-    let bytes = STANDARD
-        .decode(audio_base64.trim())
-        .map_err(|err| AppError::message(format!("The recording could not be decoded: {err}")))?;
-    if bytes.is_empty() {
-        return Err(AppError::message("The recording is empty."));
-    }
+    file_name: Option<String>,
+    model: Option<String>,
+    language: Option<String>,
+    strip_non_speech: Option<bool>,
+) -> AppResult<crate::whisper::TranscriptionResult> {
+    crate::whisper::transcribe_audio_payload(
+        &app,
+        &store.get(),
+        &audio_base64,
+        mime.as_deref(),
+        file_name.as_deref(),
+        model.as_deref(),
+        language.as_deref(),
+        strip_non_speech,
+    )
+    .await
+}
 
-    let mime = mime
-        .filter(|value| value.starts_with("audio/"))
-        .unwrap_or_else(|| "audio/webm".into());
-    let part = reqwest::multipart::Part::bytes(bytes)
-        .file_name("recording.webm")
-        .mime_str(&mime)
-        .map_err(|err| AppError::message(format!("Invalid audio type: {err}")))?;
-    let form = reqwest::multipart::Form::new()
-        .part("file", part)
-        .text("model", "whisper-1");
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-    let mut builder = client
-        .post(format!("{}/v1/audio/transcriptions", settings.base_url()))
-        .multipart(form);
-    if !settings.api_key.trim().is_empty() {
-        builder = builder.bearer_auth(settings.api_key.trim());
-    }
-    let response = builder
-        .send()
-        .await
-        .map_err(|err| AppError::message(format!("The engine could not transcribe audio: {err}")))?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(AppError::message(format!(
-            "Janas returned HTTP {status} for transcription. Start janas-server with --speech-model to enable speech-to-text. {body}"
-        )));
-    }
-    let value: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|err| AppError::message(format!("Unexpected transcription response: {err}")))?;
-    value
-        .get("text")
-        .and_then(|text| text.as_str())
-        .map(str::to_string)
-        .filter(|text| !text.trim().is_empty())
-        .ok_or_else(|| AppError::message("The engine returned an empty transcript."))
+/// Transcribe a dropped or attached audio file directly, without base64
+/// crossing the IPC boundary.
+#[tauri::command]
+pub async fn transcribe_audio_file(
+    app: AppHandle,
+    store: State<'_, std::sync::Arc<SettingsStore>>,
+    path: String,
+    model: Option<String>,
+    language: Option<String>,
+) -> AppResult<crate::whisper::TranscriptionResult> {
+    crate::whisper::transcribe_audio_path(
+        &app,
+        &store.get(),
+        &path,
+        model.as_deref(),
+        language.as_deref(),
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
