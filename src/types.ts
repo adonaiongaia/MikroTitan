@@ -3,6 +3,7 @@ export type ViewId =
   | "models"
   | "library"
   | "compiler"
+  | "benchmark"
   | "knowledge"
   | "mcp"
   | "settings";

@@ -4,6 +4,7 @@ import {
   Compass,
   Cpu,
   Database,
+  Gauge,
   Loader2,
   MessageSquare,
   Play,
@@ -37,6 +38,12 @@ const NAV: Array<{
   { id: "models", label: "Models", hint: "Hugging Face explorer", icon: Compass },
   { id: "library", label: "Library", hint: "Local model shelf", icon: Boxes },
   { id: "compiler", label: "Compiler", hint: "GGUF to JNS", icon: Binary },
+  {
+    id: "benchmark",
+    label: "Bench",
+    hint: "Side-by-side runs",
+    icon: Gauge,
+  },
   {
     id: "knowledge",
     label: "Knowledge",

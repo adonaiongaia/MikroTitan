@@ -130,6 +130,11 @@ pub struct AppSettings {
     pub voice_auto_send: bool,
     /// Drop Whisper annotations such as [BLANK_AUDIO] or (music).
     pub voice_strip_non_speech: bool,
+    /// Per-launch environment overrides. This is deliberately not serialized:
+    /// the benchmark runner puts `JANAS_ATTN=float` and similar target flags on
+    /// a cloned AppSettings so a measurement never rewrites saved settings.
+    #[serde(skip)]
+    pub launch_env: Vec<(String, String)>,
 }
 
 impl Default for AppSettings {
@@ -186,6 +191,7 @@ impl Default for AppSettings {
             voice_activation: "toggle".into(),
             voice_auto_send: false,
             voice_strip_non_speech: true,
+            launch_env: Vec::new(),
         }
     }
 }

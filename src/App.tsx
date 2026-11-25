@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { Loader2, Play, Square, X } from "lucide-react";
 
+import { BenchmarkView } from "./components/benchmark/BenchmarkView";
+import { useBenchmark } from "./components/benchmark/useBenchmark";
 import { ChatView } from "./components/chat/ChatView";
 import { ConverterView } from "./components/converter/ConverterView";
 import { KnowledgeVaultView } from "./components/knowledge/KnowledgeVaultView";
@@ -38,6 +40,10 @@ const HEADINGS: Record<ViewId, { title: string; subtitle: string }> = {
     title: "GGUF → JNS Compiler",
     subtitle: "Rewrite GGUF weights into Janas's native format",
   },
+  benchmark: {
+    title: "Side-by-Side Bench",
+    subtitle: "Engine and quantization trade-offs on this exact machine",
+  },
   knowledge: {
     title: "Knowledge Vault",
     subtitle: "Persistent local document collections for retrieval",
@@ -59,6 +65,7 @@ export default function App() {
   const chat = useChat();
   const converter = useConverter();
   const downloads = useDownloads();
+  const benchmark = useBenchmark();
   const [view, setView] = useState<ViewId>("chat");
   const [toast, setToast] = useState<string | null>(null);
   const closing = useRef(false);
@@ -262,6 +269,9 @@ export default function App() {
           ) : null}
           {view === "compiler" ? (
             <ConverterView converter={converter} onUseModel={useModel} />
+          ) : null}
+          {view === "benchmark" ? (
+            <BenchmarkView benchmark={benchmark} />
           ) : null}
           {view === "knowledge" ? <KnowledgeVaultView /> : null}
           {view === "mcp" ? <McpView /> : null}

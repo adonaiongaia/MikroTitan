@@ -190,6 +190,9 @@ impl<R: Runtime> EngineRunner<R> for LlamaRunner {
             .stderr(Stdio::piped())
             .kill_on_drop(false);
         apply_library_path(&mut command, Some(&bin));
+        for (name, value) in &settings.launch_env {
+            command.env(name, value);
+        }
         #[cfg(unix)]
         command.process_group(0);
 

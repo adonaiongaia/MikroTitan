@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 
 use crate::{
@@ -86,13 +86,56 @@ pub fn save_artifact_file(path: &str, contents: &str, base64: bool) -> AppResult
 // Telemetry
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DeviceMetrics {
     pub present: bool,
     pub name: String,
     pub utilization: Option<f32>,
     pub memory_used: Option<u64>,
     pub memory_total: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HardwareSummary {
+    pub os: String,
+    pub arch: String,
+    pub cpu: String,
+    pub cores: u32,
+    pub mem_total_bytes: u64,
+    pub gpu: DeviceMetrics,
+    pub npu: DeviceMetrics,
+}
+
+/// A snapshot of the machine a benchmark ran on. It is stored with every
+/// suite so a report copied months later still says which hardware produced it.
+pub fn hardware_summary() -> HardwareSummary {
+    let cpu = fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|text| {
+            text.lines().find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                if key.trim().eq_ignore_ascii_case("model name") {
+                    let value = value.trim();
+                    (!value.is_empty()).then(|| value.to_string())
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or_else(|| "Unknown CPU".into());
+    let meminfo = fs::read_to_string("/proc/meminfo").unwrap_or_default();
+
+    HardwareSummary {
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        cpu,
+        cores: std::thread::available_parallelism()
+            .map(|value| value.get() as u32)
+            .unwrap_or(1),
+        mem_total_bytes: parse_kib_field(&meminfo, "MemTotal:").unwrap_or(0),
+        gpu: gpu_metrics(),
+        npu: npu_metrics(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

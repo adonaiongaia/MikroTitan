@@ -2,6 +2,7 @@
 
 mod agent;
 mod artifact_frame;
+mod benchmark_runner;
 mod chat_store;
 mod companions;
 mod converter;
@@ -29,6 +30,7 @@ use std::sync::Arc;
 
 use tauri::{AppHandle, Emitter, Manager, State};
 
+use benchmark_runner::BenchmarkRunner;
 use chat_store::{
     ChatBackupInfo, ChatImportSummary, ChatStore, ChatStoreStats, StoredSession,
 };
@@ -551,11 +553,12 @@ fn main() {
             // The vault lives beside the chats in the *local* data directory, so
             // a roaming profile or a synced home never copies an index of the
             // user's documents to another machine.
-            let knowledge = KnowledgeStore::load(
-                app.path()
-                    .app_local_data_dir()?
-                    .join("knowledge"),
-            );
+            let local_data_dir = app.path().app_local_data_dir()?;
+            let knowledge = KnowledgeStore::load(local_data_dir.join("knowledge"));
+            // Benchmark suites live beside the chats in the local data dir so
+            // a roaming profile never copies hardware measurements between
+            // machines with different drives.
+            let benchmarks = BenchmarkRunner::load(local_data_dir.join("benchmarks"))?;
 
             engines::cleanup_stale_processes(app.handle())?;
             let engine = Arc::new(EngineManager::new(port));
@@ -564,6 +567,7 @@ fn main() {
             let provisioner = Arc::new(Provisioner::new());
 
             app.manage(store);
+            app.manage(Arc::new(benchmarks));
             app.manage(Arc::new(chat_store));
             app.manage(Arc::new(knowledge));
             app.manage(Arc::new(memory));
@@ -669,6 +673,12 @@ fn main() {
             whisper::install_whisper_binary,
             whisper::download_whisper_model,
             whisper::cancel_whisper_download,
+            benchmark_runner::benchmark_workload_presets,
+            benchmark_runner::start_benchmark_suite,
+            benchmark_runner::cancel_benchmark,
+            benchmark_runner::list_benchmark_suites,
+            benchmark_runner::delete_benchmark_suite,
+            benchmark_runner::export_benchmark_markdown,
             system::library_models,
             system::library_disk,
             system::verify_local_model,

@@ -1211,6 +1211,12 @@ fn apply_engine_settings(command: &mut Command, settings: &AppSettings) {
         }
         _ => {}
     }
+
+    // A benchmark target can carry `KEY=value` extra flags. They are applied
+    // last so an explicit target override wins over the saved settings above.
+    for (name, value) in &settings.launch_env {
+        command.env(name, value);
+    }
 }
 
 fn rank(status: EngineStatus) -> u8 {
@@ -2228,7 +2234,6 @@ mod tests {
         );
     }
 
-    #[test]
     #[test]
     fn chat_approvals_resolve_and_cancel() {
         let manager = EngineManager::new(8080);
