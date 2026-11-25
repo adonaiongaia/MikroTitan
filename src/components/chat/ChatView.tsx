@@ -31,6 +31,7 @@ import {
 import { cn } from "../../lib/cn";
 import { errorMessage, basename } from "../../lib/format";
 import {
+  ragFileLabel,
   ragScopeLabel,
   ragSettingsFor,
   reconcileCollectionScope,
@@ -41,8 +42,18 @@ import {
   buildWebContext,
   CORE_SYSTEM_PROMPT,
 } from "../../lib/prompts";
-import { siblingsFor } from "../../lib/chatSessions";
-import { mcpServerInputs, mcpServersInScope } from "../../lib/mcpScope";
+import {
+  evictedContextIds,
+  messageContextId,
+  pinnedContextIds,
+  siblingsFor,
+} from "../../lib/chatSessions";
+import { estimateTokens, selectProjectContext } from "../../lib/contextBudget";
+import {
+  mcpServerInputs,
+  mcpServersInScope,
+  toggleServerInScope,
+} from "../../lib/mcpScope";
 import type {
   AppSettings,
   Citation,
@@ -64,6 +75,10 @@ import { Logo } from "../Logo";
 import { Button } from "../ui/Button";
 import type { AgentActions } from "./AgentTrace";
 import { Composer, type ComposerImage } from "./Composer";
+import type {
+  ContextBreakdownCategory,
+  ContextBreakdownItem,
+} from "./ContextBreakdownPopover";
 import { EnginePanel } from "./EnginePanel";
 import { McpLogDrawer } from "./McpLogDrawer";
 import { MessageBoundary } from "../MessageBoundary";
@@ -310,6 +325,41 @@ export function ChatView({
   );
   const ragSettings = ragSettingsFor(chat.ragTopK, chat.ragMaxTokens);
   const docsScopeLabel = ragScopeLabel(attachedCollectionIds, collections);
+
+  // Pins and evictions live on the chat session, so they survive reloads and
+  // are shared by the composer ring, the transcript and the send path.
+  const pinnedIds = useMemo(
+    () => pinnedContextIds(chat.activeSession),
+    [chat.activeSession],
+  );
+  const evictedIds = useMemo(
+    () => evictedContextIds(chat.activeSession),
+    [chat.activeSession],
+  );
+  const projectSelection = useMemo(
+    () => selectProjectContext(project?.bundle ?? "", pinnedIds, evictedIds),
+    [evictedIds, pinnedIds, project?.bundle],
+  );
+  // MCP pins are stored by server id but the engine matches display names, so
+  // resolve the current name instead of trusting a label captured at pin time.
+  const pinnedMcpServers = useMemo(() => {
+    // Only servers that are actually in scope are connected for the turn, so
+    // sending a pin for a disabled or out-of-scope server would be noise.
+    const activeIds = new Set(activeMcpServers.map((server) => server.id));
+    return (chat.activeSession?.pinned_context ?? [])
+      .filter((item) => item.kind === "mcp")
+      .map((item) => {
+        const id = item.id.startsWith("mcp:")
+          ? item.id.slice("mcp:".length)
+          : "";
+        return activeIds.has(id)
+          ? activeMcpServers.find((server) => server.id === id)
+          : undefined;
+      })
+      .filter((server): server is McpServerConfig => Boolean(server))
+      .map((server) => server.name.trim())
+      .filter(Boolean);
+  }, [activeMcpServers, chat.activeSession]);
 
   const refreshCollections = useCallback(async () => {
     setCollectionsLoading(true);
@@ -727,6 +777,95 @@ export function ChatView({
     0,
   );
 
+  /**
+   * Split the attached context into the pinned block (never trimmed) and the
+   * unpinned block (trimmed first). Memory facts are context items too, so they
+   * can be pinned or evicted like a file.
+   */
+  const buildContextParts = useCallback(
+    (text: string, webContext = "") => {
+      const recalled = recallFacts(memory.facts, text).filter(
+        (fact) => !evictedIds.has(`memory:${fact.id}`),
+      );
+      const memoryItems = recalled.map((fact) => ({
+        id: `memory:${fact.id}`,
+        label: fact.text.slice(0, 72),
+        line: `- ${fact.text}`,
+        tokens: estimateTokens(fact.text),
+        pinned: pinnedIds.has(`memory:${fact.id}`),
+      }));
+      const pinnedMemory = memoryItems.filter((item) => item.pinned);
+      const unpinnedMemory = memoryItems.filter((item) => !item.pinned);
+      const memoryHeader =
+        "Facts you remember about this project. Use them when relevant, and ignore any that no longer apply:";
+      const memoryBlock = (items: typeof memoryItems) =>
+        items.length
+          ? `${memoryHeader}\n${items.map((item) => item.line).join("\n")}`
+          : "";
+      // A pinned [D#] chunk is re-sent verbatim. Retrieval happens per turn in
+      // Rust, so this is what keeps the exact snippet in the prompt.
+      const pinnedChunks = new Map<string, RagChunk>();
+      for (const message of chat.messages) {
+        for (const chunk of message.rag_sources ?? []) {
+          if (pinnedIds.has(`rag:${chunk.chunk_id}`)) {
+            pinnedChunks.set(chunk.chunk_id, chunk);
+          }
+        }
+      }
+      const pinnedChunkList = [...pinnedChunks.values()];
+      const pinnedRagText = pinnedChunkList.length
+        ? `Pinned document snippets. Cite their [D#] labels when you use them:\n${pinnedChunkList
+            .map(
+              (chunk) =>
+                `[${chunk.citation}] ${chunk.relative_path} (lines ${chunk.start_line}–${chunk.end_line})\n${chunk.content}`,
+            )
+            .join("\n\n")}`
+        : "";
+      return {
+        systemPrompt: [
+          CORE_SYSTEM_PROMPT,
+          systemPrompt,
+          explicitArtifactTags ? ARTIFACT_TAGS_INSTRUCTION : "",
+        ]
+          .filter(Boolean)
+          .join("\n\n"),
+        pinnedContext: [
+          projectSelection.pinnedText,
+          pinnedRagText,
+          memoryBlock(pinnedMemory),
+        ]
+          .filter(Boolean)
+          .join("\n\n"),
+        extraContext: [
+          projectSelection.unpinnedText,
+          webContext,
+          memoryBlock(unpinnedMemory),
+        ]
+          .filter(Boolean)
+          .join("\n\n"),
+        pinnedLabels: [
+          ...projectSelection.fragments
+            .filter((fragment) => pinnedIds.has(fragment.id))
+            .map((fragment) => fragment.label),
+          ...pinnedChunkList.map(
+            (chunk) => `[${chunk.citation}] ${chunk.relative_path}`,
+          ),
+          ...pinnedMemory.map((item) => `memory: ${item.label}`),
+        ],
+        memoryItems,
+      };
+    },
+    [
+      chat.messages,
+      evictedIds,
+      explicitArtifactTags,
+      memory.facts,
+      pinnedIds,
+      projectSelection,
+      systemPrompt,
+    ],
+  );
+
   const buildOptions = useCallback(
     (
       text: string,
@@ -737,23 +876,10 @@ export function ChatView({
         extraContext?: string;
       } = {},
     ) => {
-      const recalled = recallFacts(memory.facts, text);
-      const memoryBlock = recalled.length
-        ? `Facts you remember about this project. Use them when relevant, and ignore any that no longer apply:\n${recalled
-            .map((fact) => `- ${fact.text}`)
-            .join("\n")}`
-        : "";
-      const combinedSystemPrompt = [
-        CORE_SYSTEM_PROMPT,
-        systemPrompt,
-        explicitArtifactTags ? ARTIFACT_TAGS_INSTRUCTION : "",
-        memoryBlock,
-      ]
-        .filter(Boolean)
-        .join("\n\n");
+      const parts = buildContextParts(text, extras.extraContext ?? "");
       const mcpInputs = mcpServerInputs(mcpServers, chat.mcpServerIds);
       return {
-        systemPrompt: combinedSystemPrompt,
+        systemPrompt: parts.systemPrompt,
         temperature: preferences.temperature,
         topP: preferences.topP,
         topK: preferences.topK ?? 40,
@@ -766,20 +892,21 @@ export function ChatView({
         contextWindow: contextMax,
         images: extras.images,
         imageTokens: extras.imageTokens,
-        extraContext: extras.extraContext ?? (project?.bundle ?? ""),
+        extraContext: parts.extraContext,
+        pinnedContext: parts.pinnedContext,
+        pinnedLabels: parts.pinnedLabels,
+        pinnedMcpServers,
         citations: extras.citations,
         mcpServers: mcpInputs,
       };
     },
     [
+      buildContextParts,
       chat.mcpServerIds,
       contextMax,
-      explicitArtifactTags,
       mcpServers,
-      memory.facts,
+      pinnedMcpServers,
       preferences,
-      project,
-      systemPrompt,
     ],
   );
 
@@ -794,7 +921,9 @@ export function ChatView({
     }
 
     let citations: Citation[] | undefined;
-    let extraContext = project?.bundle ?? "";
+    // Only web evidence travels here; the attached project is split into
+    // pinned and unpinned blocks inside buildOptions.
+    let extraContext = "";
 
     // In Agent Mode the agent decides when to search; pre-fetching here would
     // hide the tool call from the trace.
@@ -817,9 +946,7 @@ export function ChatView({
           url: result.url,
           snippet: result.snippet,
         }));
-        extraContext = [extraContext, buildWebContext(text, search.results)]
-          .filter(Boolean)
-          .join("\n\n");
+        extraContext = buildWebContext(text, search.results);
       } catch (err) {
         setActivity(null);
         chat.setError(errorMessage(err));
@@ -867,7 +994,6 @@ export function ChatView({
     imageTokens,
     input,
     preferences.internet,
-    project,
     ready,
     visionGuard,
     workspaceRoot,
@@ -950,21 +1076,272 @@ export function ChatView({
     [buildOptions, chat, ready],
   );
 
-  const messageChars = chat.messages.reduce(
-    (total, message) =>
-      total + message.content.length + message.reasoning.length,
-    0,
+  // Everything the breakdown popover can pin or evict, grouped the way the
+  // prompt is assembled. Items are sorted by token cost inside the popover.
+  const contextCategories = useMemo<ContextBreakdownCategory[]>(() => {
+    const flags = (id: string) => ({
+      pinned: pinnedIds.has(id),
+      evicted: evictedIds.has(id),
+    });
+    const projectItems: ContextBreakdownItem[] =
+      projectSelection.fragments.map((fragment) => ({
+        id: fragment.id,
+        kind: "file",
+        label: fragment.label,
+        tokens: fragment.tokens,
+        ...flags(fragment.id),
+      }));
+    const messageItems: ContextBreakdownItem[] = chat.messages
+      .filter((message) => message.content.trim().length > 0)
+      .map((message) => {
+        const id = messageContextId(message.id);
+        return {
+          id,
+          kind: "message",
+          label: `${message.role === "user" ? "You" : "Janas"} · ${message.content.trim().slice(0, 64)}`,
+          tokens: estimateTokens(message.content) + 8,
+          detail: new Date(message.created_at).toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+          }),
+          ...flags(id),
+        };
+      });
+    const ragChunks = new Map<string, RagChunk>();
+    for (const message of chat.messages) {
+      for (const chunk of message.rag_sources ?? []) {
+        if (!ragChunks.has(chunk.chunk_id)) ragChunks.set(chunk.chunk_id, chunk);
+      }
+    }
+    const ragItems: ContextBreakdownItem[] = [...ragChunks.values()].map(
+      (chunk) => {
+        const id = `rag:${chunk.chunk_id}`;
+        return {
+          id,
+          kind: "rag",
+          label: `[${chunk.citation}] ${ragFileLabel(chunk)}`,
+          tokens: chunk.token_estimate,
+          detail: `lines ${chunk.start_line}–${chunk.end_line}`,
+          ...flags(id),
+        };
+      },
+    );
+    const memoryItems: ContextBreakdownItem[] = memory.facts.map((fact) => {
+      const id = `memory:${fact.id}`;
+      return {
+        id,
+        kind: "memory",
+        label: fact.text.slice(0, 72),
+        tokens: estimateTokens(fact.text),
+        detail: "recalled when relevant",
+        ...flags(id),
+      };
+    });
+    // Every enabled server that is either in this chat's scope or explicitly
+    // evicted. Evicting removes it from the scope (a real prompt change) and
+    // keeps the row so it can be restored from here.
+    const mcpItems: ContextBreakdownItem[] = availableMcpServers
+      .filter((server) => {
+        const inScope =
+          chat.mcpServerIds === undefined ||
+          chat.mcpServerIds.includes(server.id);
+        return inScope || evictedIds.has(`mcp:${server.id}`);
+      })
+      .map((server) => {
+        const id = `mcp:${server.id}`;
+        const evicted = evictedIds.has(id);
+        const toolCount = server.toolCount;
+        const toolLabel =
+          toolCount === undefined
+            ? "tool count unknown"
+            : `${toolCount} tool${toolCount === 1 ? "" : "s"}`;
+        return {
+          id,
+          kind: "mcp",
+          label: server.name,
+          // An evicted server is out of scope, so its schemas are not sent.
+          tokens: evicted ? 0 : (server.toolSchemaTokens ?? 0),
+          detail: evicted
+            ? "evicted: tool schemas are not sent"
+            : toolCount === undefined
+              ? "not probed yet — probe it in MCP Hub to price its schemas"
+              : pinnedIds.has(id)
+                ? `${toolLabel} · pinned: schemas survive a tight budget`
+                : `${toolLabel} · schemas are sent with every turn`,
+          ...flags(id),
+        };
+      });
+    const unprobedMcp = mcpItems.filter((item) => {
+      const server = availableMcpServers.find(
+        (candidate) => `mcp:${candidate.id}` === item.id,
+      );
+      return !item.evicted && server?.toolCount === undefined;
+    }).length;
+    return [
+      { key: "file", label: "Attached project", items: projectItems },
+      { key: "message", label: "Chat history", items: messageItems },
+      { key: "rag", label: "Docs / RAG", items: ragItems },
+      { key: "memory", label: "Memory", items: memoryItems },
+      {
+        key: "mcp",
+        label: "MCP tools",
+        note: `${mcpItems.length} server${mcpItems.length === 1 ? "" : "s"}${
+          unprobedMcp ? ` · ${unprobedMcp} not probed` : ""
+        }`,
+        items: mcpItems,
+      },
+    ].filter((category) => category.items.length > 0);
+  }, [
+    availableMcpServers,
+    chat.mcpServerIds,
+    chat.messages,
+    evictedIds,
+    memory.facts,
+    pinnedIds,
+    projectSelection.fragments,
+  ]);
+
+  const pinnedTokens = useMemo(
+    () =>
+      contextCategories.reduce(
+        (total, category) =>
+          total +
+          category.items
+            .filter((item) => item.pinned)
+            .reduce((sum, item) => sum + item.tokens, 0),
+        0,
+      ),
+    [contextCategories],
   );
-  const estimatedTokens =
-    Math.ceil(
-      (messageChars +
-        systemPrompt.length +
-        (explicitArtifactTags ? ARTIFACT_TAGS_INSTRUCTION.length : 0) +
-        input.length +
-        (project?.bundle.length ?? 0)) /
-        4,
-    ) + images.reduce((total, image) => total + image.tokens, 0);
-  const contextUsed = chat.usage?.total_tokens ?? estimatedTokens;
+
+  // The ring follows pin/evict immediately. It mirrors the send budget instead
+  // of waiting for the engine's usage report, which only arrives after a turn.
+  const previewText =
+    input.trim() ||
+    [...chat.messages].reverse().find((message) => message.role === "user")
+      ?.content ||
+    "";
+  const liveContextTokens = useMemo(() => {
+    const parts = buildContextParts(previewText);
+    const history = chat.messages
+      .filter(
+        (message) =>
+          !evictedIds.has(messageContextId(message.id)) &&
+          message.content.trim().length > 0,
+      )
+      .slice(-(Math.max(1, preferences.contextPrefetch) * 2))
+      .reduce(
+        (total, message) => total + estimateTokens(message.content) + 8,
+        0,
+      );
+    const prompt = [
+      parts.systemPrompt,
+      parts.pinnedContext,
+      parts.extraContext,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+    // In-scope MCP servers send their tool schemas with every request. Evicted
+    // servers are out of scope, so they are not counted here.
+    const mcpTokens = activeMcpServers.reduce(
+      (total, server) => total + (server.toolSchemaTokens ?? 0),
+      0,
+    );
+    return (
+      estimateTokens(prompt) +
+      history +
+      estimateTokens(input) +
+      images.reduce((total, image) => total + image.tokens, 0) +
+      mcpTokens
+    );
+  }, [
+    activeMcpServers,
+    buildContextParts,
+    chat.messages,
+    evictedIds,
+    imageTokens,
+    images,
+    input,
+    preferences.contextPrefetch,
+    previewText,
+  ]);
+  const contextUsed = chat.streaming
+    ? (chat.usage?.total_tokens ?? liveContextTokens)
+    : liveContextTokens;
+
+  const handleToggleContextPin = useCallback(
+    (item: ContextBreakdownItem) => {
+      chat.toggleContextPin({
+        id: item.id,
+        kind: item.kind,
+        label: item.label,
+        tokens: item.tokens,
+        added_at: Date.now(),
+      });
+    },
+    [chat],
+  );
+
+  const handleToggleContextEvict = useCallback(
+    (item: ContextBreakdownItem) => {
+      if (item.kind !== "mcp") {
+        chat.toggleContextEvict(item.id);
+        return;
+      }
+      const serverId = item.id.startsWith("mcp:")
+        ? item.id.slice("mcp:".length)
+        : "";
+      if (!serverId) return;
+      const scope = chat.mcpServerIds;
+      if (item.evicted) {
+        // Restore. Decide from the marker, not from scope membership: a stale
+        // marker must not turn a restore click into an eviction. An undefined
+        // scope already includes every enabled server.
+        const known = availableMcpServers.some(
+          (server) => server.id === serverId,
+        );
+        if (scope !== undefined && known && !scope.includes(serverId)) {
+          chat.setSessionMcpServerIds([...scope, serverId], mcpServers);
+        }
+        chat.toggleContextEvict(item.id);
+        return;
+      }
+      // Evict: remove the server from this chat's scope and keep a marker so
+      // the row can be restored. An undefined scope means "all enabled
+      // servers", so this has to materialise the list first.
+      chat.setSessionMcpServerIds(
+        toggleServerInScope(
+          scope,
+          serverId,
+          availableMcpServers.map((server) => server.id),
+        ),
+        mcpServers,
+      );
+      chat.toggleContextEvict(item.id);
+    },
+    [availableMcpServers, chat, mcpServers],
+  );
+
+  const handleRestoreEvictedContext = useCallback(() => {
+    // A deleted server's marker is retired by reconciliation; restoring must
+    // not re-add its id to the scope on the way out.
+    const availableIds = new Set(
+      availableMcpServers.map((server) => server.id),
+    );
+    const evictedMcp = (chat.activeSession?.evicted_context_ids ?? [])
+      .filter((id) => id.startsWith("mcp:"))
+      .map((id) => id.slice("mcp:".length))
+      .filter((id) => availableIds.has(id));
+    chat.restoreEvictedContext();
+    if (!evictedMcp.length) return;
+    const scope = chat.mcpServerIds;
+    // An undefined scope already includes every enabled server.
+    if (scope === undefined) return;
+    chat.setSessionMcpServerIds(
+      [...new Set([...scope, ...evictedMcp])],
+      mcpServers,
+    );
+  }, [availableMcpServers, chat, mcpServers]);
 
   return (
     <div className="flex h-full min-h-0">
@@ -1201,6 +1578,10 @@ export function ChatView({
                       artifacts={artifactIndex.byMessage[message.id]}
                       onOpenArtifact={openArtifact}
                       activeArtifactRootId={selectedArtifactRootId}
+                      pinned={pinnedIds.has(messageContextId(message.id))}
+                      evicted={evictedIds.has(messageContextId(message.id))}
+                      onTogglePin={() => chat.toggleMessagePin(message.id)}
+                      onToggleEvict={() => chat.toggleMessageEvict(message.id)}
                     />
                     </MessageBoundary>
                   );
@@ -1231,6 +1612,11 @@ export function ChatView({
           ready={ready}
           contextUsed={contextUsed}
           contextMax={contextMax}
+          pinnedTokens={pinnedTokens}
+          contextCategories={contextCategories}
+          onToggleContextPin={handleToggleContextPin}
+          onToggleContextEvict={handleToggleContextEvict}
+          onRestoreEvictedContext={handleRestoreEvictedContext}
           internet={preferences.internet}
           onInternetChange={(value) => update("internet", value)}
           agentMode={agent.preferences.enabled}

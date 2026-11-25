@@ -122,12 +122,32 @@ export function McpView() {
       autoApprove,
     };
     const id = editingId ?? uid();
+    const existing = editingId
+      ? servers.find((server) => server.id === editingId)
+      : undefined;
+    const saved: McpServerConfig = {
+      id,
+      ...next,
+      enabled: existing?.enabled ?? true,
+    };
+    // Only a different launch definition invalidates the cached schema cost;
+    // renaming a server must not spawn it again.
+    const launchChanged =
+      !existing ||
+      existing.command !== saved.command ||
+      existing.args.join("\u0000") !== saved.args.join("\u0000") ||
+      (existing.env ?? "") !== saved.env ||
+      (existing.cwd ?? "") !== saved.cwd;
+    if (existing && !launchChanged) {
+      saved.toolCount = existing.toolCount;
+      saved.toolSchemaTokens = existing.toolSchemaTokens;
+    }
     setServers((previous) =>
       editingId
         ? previous.map((server) =>
-            server.id === editingId ? { ...server, ...next } : server,
+            server.id === editingId ? saved : server,
           )
-        : [...previous, { id, ...next, enabled: true }],
+        : [...previous, saved],
     );
     appendMcpLog({
       server: next.name,
@@ -139,6 +159,9 @@ export function McpView() {
       delete updated[id];
       return updated;
     });
+    // Probe once now so the context breakdown can price the tool schemas
+    // without a separate manual step.
+    if (launchChanged || saved.toolCount === undefined) void probe(saved);
     resetEditor();
   };
 
@@ -155,6 +178,20 @@ export function McpView() {
         auto_approve: Boolean(server.autoApprove),
       });
       setProbes((previous) => ({ ...previous, [server.id]: result }));
+      // Cache the schema cost with the server so the chat breakdown can show
+      // it without spawning the server again. A failed probe has no usable
+      // tools, so it clears any stale count.
+      setServers((previous) =>
+        previous.map((candidate) =>
+          candidate.id === server.id
+            ? {
+                ...candidate,
+                toolCount: result.ok ? result.tools.length : 0,
+                toolSchemaTokens: result.ok ? result.tool_schema_tokens : 0,
+              }
+            : candidate,
+        ),
+      );
       appendMcpLog({
         server: server.name,
         kind: result.ok ? "probe" : "error",

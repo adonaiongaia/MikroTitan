@@ -47,6 +47,14 @@ pub struct StoredSession {
     /// active path stays in `messages`; this is the rest of the tree.
     #[serde(default)]
     pub archived_messages: Vec<Value>,
+    /// Context items the user pinned, kept as the frontend's JSON objects so a
+    /// new item kind needs no Rust change. Absent in schema-v2 files written
+    /// before pins existed, which is the same as an empty list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_context: Vec<Value>,
+    /// Items dropped from the prompt but kept visible in the transcript.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evicted_context_ids: Vec<String>,
     /// UI-owned fields such as draft text, attached project and per-chat
     /// workspace/tool scope. Flattening them here means the backend preserves
     /// future session fields without requiring a Rust change for each one.
@@ -348,6 +356,30 @@ impl ChatStore {
         source.messages.truncate(index + 1);
         source.archived_messages.clear();
         source.extra.remove("draft");
+        // A branch inherits the source chat's pins and evictions. Message
+        // entries whose turn is not in the branch prefix would point at a
+        // message the branch does not have, so those are dropped.
+        let surviving: HashSet<String> = source
+            .messages
+            .iter()
+            .filter_map(|message| message.get("id").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect();
+        source.pinned_context.retain(|item| {
+            item.get("id")
+                .and_then(Value::as_str)
+                .map(|id| match id.strip_prefix("message:") {
+                    Some(message_id) => surviving.contains(message_id),
+                    None => true,
+                })
+                .unwrap_or(false)
+        });
+        source.evicted_context_ids.retain(|id| {
+            match id.strip_prefix("message:") {
+                Some(message_id) => surviving.contains(message_id),
+                None => true,
+            }
+        });
         let new_id = uuid::Uuid::new_v4().simple().to_string();
         let old_id = source.id.clone();
         source.id = new_id.clone();
@@ -979,6 +1011,65 @@ mod tests {
         assert!(copied.starts_with(&format!("{}/", branch.id)));
         assert!(store.asset_data_url(copied).is_ok());
         assert!(store.asset_data_url(&asset).is_ok());
+        let _ = fs::remove_dir_all(&store.root);
+    }
+
+    #[test]
+    fn legacy_session_files_without_pins_still_load() {
+        let store = store("legacy-pins");
+        let path = store.root.join("legacy.json");
+        fs::write(
+            &path,
+            r#"{"id":"legacy","schema_version":2,"title":"Legacy","created_at":1,"updated_at":2,"messages":[{"id":"m1","role":"user","content":"hi"}]}"#,
+        )
+        .expect("write legacy session");
+        let sessions = store.list();
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0].pinned_context.is_empty());
+        assert!(sessions[0].evicted_context_ids.is_empty());
+        let saved = store.save(sessions.into_iter().next().expect("session"))
+            .expect("resave legacy session");
+        assert!(saved.pinned_context.is_empty());
+        assert_eq!(saved.schema_version, CURRENT_SCHEMA_VERSION);
+        let _ = fs::remove_dir_all(&store.root);
+    }
+
+    #[test]
+    fn pinned_context_round_trips_and_branches_inherit_it() {
+        let store = store("pins");
+        let mut session = session_with_image("pinned-chat");
+        session.messages.push(json!({
+            "id": "m2",
+            "role": "assistant",
+            "content": "answer",
+            "reasoning": "",
+            "created_at": 2
+        }));
+        session.pinned_context = vec![
+            json!({"id":"file:src/main.rs","kind":"file","label":"src/main.rs","tokens":42,"added_at":1}),
+            json!({"id":"message:m2","kind":"message","label":"answer","tokens":9,"added_at":1}),
+        ];
+        session.evicted_context_ids = vec!["file:src/old.rs".into(), "message:m2".into()];
+        store.save(session).expect("save pinned chat");
+
+        let loaded = store
+            .list()
+            .into_iter()
+            .find(|candidate| candidate.id == "pinned-chat")
+            .expect("saved pinned chat");
+        assert_eq!(loaded.pinned_context.len(), 2);
+        assert_eq!(loaded.evicted_context_ids.len(), 2);
+
+        let branch = store
+            .branch_session("pinned-chat", "m1")
+            .expect("branch from first message");
+        // m2 is outside the branch prefix, so its pin and eviction are gone.
+        assert_eq!(branch.pinned_context.len(), 1);
+        assert_eq!(branch.pinned_context[0]["id"], "file:src/main.rs");
+        assert_eq!(
+            branch.evicted_context_ids,
+            vec!["file:src/old.rs".to_string()]
+        );
         let _ = fs::remove_dir_all(&store.root);
     }
 

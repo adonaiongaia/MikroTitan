@@ -6,6 +6,7 @@ import {
   mcpServerInputs,
   mcpServersInScope,
   reconcileMcpScope,
+  toggleServerInScope,
 } from "./mcpScope";
 
 const servers = [
@@ -151,5 +152,26 @@ describe("reconcileMcpScope", () => {
     expect(result.ids).toBeUndefined();
     expect(result.names).toBeUndefined();
     expect(result.changed).toBe(false);
+  });
+});
+
+describe("toggleServerInScope", () => {
+  const available = ["mcp-1", "mcp-2"];
+
+  it("materialises the all-servers scope when one server is evicted", () => {
+    expect(toggleServerInScope(undefined, "mcp-1", available)).toEqual([
+      "mcp-2",
+    ]);
+  });
+
+  it("evicts the last scoped server as an explicit empty scope", () => {
+    expect(toggleServerInScope(["mcp-1"], "mcp-1", available)).toEqual([]);
+  });
+
+  it("restores an evicted server", () => {
+    expect(toggleServerInScope(["mcp-2"], "mcp-1", available)).toEqual([
+      "mcp-2",
+      "mcp-1",
+    ]);
   });
 });

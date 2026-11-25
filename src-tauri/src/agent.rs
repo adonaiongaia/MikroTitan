@@ -2005,14 +2005,22 @@ async fn execute(context: &RunContext<'_>) -> Result<AgentFinish, AgentFailure> 
         if message.content.trim().is_empty() {
             continue;
         }
-        messages.push(json!({ "role": message.role, "content": message.content }));
+        let mut value = json!({ "role": message.role, "content": message.content });
+        if message.pinned {
+            // Internal marker: stripped before the request reaches the engine.
+            value["_pinned"] = json!(true);
+        }
+        messages.push(value);
     }
     messages.push(json!({ "role": "user", "content": request.goal.trim() }));
     // A cheap preflight: drop the oldest prior turns if the first request would
-    // already exceed the engine window. The current goal and system prompt stay.
+    // already exceed the engine window. The current goal and system prompt stay,
+    // and pinned history is never dropped.
     let history_budget = (context.config.context_window as f32 * 0.85) as usize;
     while messages.len() > 2 && account_tokens(&messages, &tools) > history_budget {
-        messages.remove(1);
+        if !drop_oldest_unpinned(&mut messages) {
+            break;
+        }
     }
 
     let max_iterations = effective_max_iterations(request.max_iterations);
@@ -2565,7 +2573,7 @@ async fn complete(
     let request = context.request;
     let mut body = json!({
         "model": context.config.model,
-        "messages": messages,
+        "messages": wire_messages(messages),
         "temperature": request.temperature.clamp(0.0, 2.0),
         "top_p": request.top_p.clamp(0.001, 1.0),
         "stream": true,
@@ -2742,6 +2750,60 @@ fn estimate_tokens(text: &str) -> usize {
     retry_text_tokens(text)
 }
 
+/// Pinned history carries an internal `_pinned` marker so the budget and the
+/// compactor can recognise it. The engine must never see that key.
+fn is_pinned(message: &Value) -> bool {
+    message
+        .get("_pinned")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn wire_messages(messages: &[Value]) -> Vec<Value> {
+    messages
+        .iter()
+        .map(|message| {
+            let mut value = message.clone();
+            if let Some(object) = value.as_object_mut() {
+                object.remove("_pinned");
+            }
+            value
+        })
+        .collect()
+}
+
+/// Remove the oldest unpinned prior turn, leaving the system prompt and the
+/// current goal in place. Returns false when only pinned turns remain.
+fn drop_oldest_unpinned(messages: &mut Vec<Value>) -> bool {
+    let Some(index) = (1..messages.len().saturating_sub(1))
+        .find(|index| !is_pinned(&messages[*index]))
+    else {
+        return false;
+    };
+    messages.remove(index);
+    true
+}
+
+/// The exclusive end of the compaction range. A pinned turn must stay intact,
+/// so the range stops before the first pinned message; a trailing `tool`
+/// observation is kept with its assistant tool call.
+fn compaction_cut(messages: &[Value], anchor: usize, end: usize) -> usize {
+    let mut cut = end.min(messages.len());
+    if let Some(pinned) = (anchor..cut).find(|index| is_pinned(&messages[*index])) {
+        cut = pinned;
+    }
+    while cut > anchor + 2
+        && messages
+            .get(cut)
+            .and_then(|message| message.get("role"))
+            .and_then(Value::as_str)
+            == Some("tool")
+    {
+        cut -= 1;
+    }
+    cut
+}
+
 fn account_tokens(messages: &[Value], tools: &[Value]) -> usize {
     let message_cost: usize = messages
         .iter()
@@ -2813,11 +2875,17 @@ async fn maybe_compact(context: &RunContext<'_>, messages: &mut Vec<Value>, tool
     if end <= anchor + 1 {
         return;
     }
+    // Pinned turns are not part of the compacted range: their exact text is
+    // what the user asked to keep. The range is contiguous, so it stops before
+    // the first pinned turn.
+    let cut = compaction_cut(messages, anchor, end);
+    if cut < anchor + 2 {
+        return;
+    }
 
     let (max_tokens, input_chars) = compaction_budget(context_window);
     let mut transcript = String::new();
-    let mut consumed = 0usize;
-    for message in &messages[anchor..end] {
+    for message in &messages[anchor..cut] {
         let role = message
             .get("role")
             .and_then(Value::as_str)
@@ -2862,26 +2930,14 @@ async fn maybe_compact(context: &RunContext<'_>, messages: &mut Vec<Value>, tool
         } else {
             transcript.push_str(&line);
         }
-        consumed += 1;
     }
-    if consumed == 0 {
+    if transcript.trim().is_empty() {
         return;
     }
 
     context.notice("Compacting older agent steps into <agent_memory>…");
-    // A tool result without its assistant tool_calls message is invalid chat
-    // history. Move the boundary back until the preserved tail starts on a
-    // user/assistant turn instead of a `tool` observation.
-    let mut cut = anchor + consumed;
-    while cut > anchor + 2
-        && messages
-            .get(cut)
-            .and_then(|message| message.get("role"))
-            .and_then(Value::as_str)
-            == Some("tool")
-    {
-        cut -= 1;
-    }
+    // `consumed` is bounded by the compacted range, which already stops before
+    // a pinned turn and never splits an assistant/tool pair.
     let consumed = cut.saturating_sub(anchor);
     if consumed < 2 {
         return;
@@ -6141,6 +6197,87 @@ mod tests {
         assert_eq!(end, 10);
         assert_eq!(messages[goal_index]["content"], "the goal");
         assert!(messages.len() - end == PRESERVED_TAIL_MESSAGES);
+    }
+
+    #[test]
+    fn compaction_cut_stops_before_a_pinned_turn() {
+        let mut messages = vec![
+            json!({"role":"system","content":"system"}),
+            json!({"role":"user","content":"the goal"}),
+        ];
+        for index in 0..8 {
+            messages.push(json!({
+                "role":"assistant",
+                "content": format!("step {index}")
+            }));
+        }
+        messages[4]["_pinned"] = json!(true);
+        let cut = compaction_cut(&messages, 2, 10);
+        assert_eq!(cut, 4, "compaction must stop before the pinned turn");
+        assert!(is_pinned(&messages[4]));
+    }
+
+    #[test]
+    fn pinned_turn_survives_a_second_compaction_cycle() {
+        let mut messages = vec![
+            json!({"role":"system","content":"system"}),
+            json!({"role":"user","content":"the goal"}),
+        ];
+        for index in 0..10 {
+            messages.push(json!({
+                "role":"assistant",
+                "content": format!("step {index}")
+            }));
+        }
+        messages[6]["_pinned"] = json!(true);
+        let first = compaction_cut(&messages, 2, 10);
+        assert_eq!(first, 6);
+        // Simulate the drain and summary insert the compactor performs.
+        messages.drain(2..first);
+        messages.insert(
+            2,
+            json!({"role":"system","content":"<agent_memory>\nsummary\n</agent_memory>"}),
+        );
+        let pinned_index = messages
+            .iter()
+            .position(is_pinned)
+            .expect("pinned turn survived the first cycle");
+        let end = messages.len().saturating_sub(PRESERVED_TAIL_MESSAGES);
+        let second = compaction_cut(&messages, 2, end);
+        assert!(
+            second <= pinned_index,
+            "second compaction range reached a pinned turn: {second} > {pinned_index}"
+        );
+        assert!(is_pinned(&messages[pinned_index]));
+    }
+
+    #[test]
+    fn pinned_history_survives_the_preflight_trim() {
+        let mut messages = vec![
+            json!({"role":"system","content":"system"}),
+            json!({"role":"user","content":"old unpinned"}),
+            json!({"role":"assistant","content":"pinned answer"}),
+            json!({"role":"user","content":"goal"}),
+        ];
+        messages[2]["_pinned"] = json!(true);
+        assert!(drop_oldest_unpinned(&mut messages));
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["content"], "pinned answer");
+        // Only the pinned turn and the goal are left, so nothing else can go.
+        assert!(!drop_oldest_unpinned(&mut messages));
+        assert_eq!(messages.len(), 3);
+    }
+
+    #[test]
+    fn pinned_markers_never_reach_the_engine() {
+        let messages = vec![json!({
+            "role":"user",
+            "content":"keep me",
+            "_pinned": true
+        })];
+        let wire = wire_messages(&messages);
+        assert!(wire[0].get("_pinned").is_none());
+        assert_eq!(wire[0]["content"], "keep me");
     }
 
     #[test]

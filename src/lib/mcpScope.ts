@@ -53,6 +53,22 @@ export function mcpServerInputs(
   }));
 }
 
+/**
+ * Add or remove one server in a chat's scope. An undefined scope means "every
+ * enabled server", so removing one has to materialise the full list first.
+ * Returns the next scope; an empty array means "no tools", not "all".
+ */
+export function toggleServerInScope(
+  scope: string[] | undefined,
+  serverId: string,
+  availableIds: string[],
+): string[] {
+  const inScope = scope === undefined || scope.includes(serverId);
+  return inScope
+    ? (scope ?? availableIds).filter((id) => id !== serverId)
+    : [...(scope ?? []), serverId];
+}
+
 /** Names captured with a scope, used to remap servers re-created under a new id. */
 export function mcpScopeNames(
   ids: string[] | undefined,

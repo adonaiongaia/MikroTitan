@@ -11,9 +11,79 @@ import type {
   ChatMessage,
   ChatSession,
   Citation,
+  ContextItemKind,
+  PinnedContextItem,
   ProjectIngest,
   RagChunk,
 } from "../types";
+
+const CONTEXT_ITEM_KINDS: ContextItemKind[] = [
+  "file",
+  "rag",
+  "web",
+  "memory",
+  "message",
+  "mcp",
+];
+
+/** `message:<id>` is the id a chat turn uses in the pin/evict lists. */
+export function messageContextId(messageId: string): string {
+  return `message:${messageId}`;
+}
+
+/** Fall back to the id prefix for items saved before `kind` existed. */
+export function contextKindForId(id: string): ContextItemKind {
+  const prefix = id.split(":", 1)[0];
+  return CONTEXT_ITEM_KINDS.includes(prefix as ContextItemKind)
+    ? (prefix as ContextItemKind)
+    : "file";
+}
+
+/**
+ * Normalize persisted pins. Chats written before this feature have no
+ * `pinned_context` key at all, which is a valid, empty state.
+ */
+export function normalizePinnedContext(
+  value: unknown,
+): PinnedContextItem[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const seen = new Set<string>();
+  const items: PinnedContextItem[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object") continue;
+    const item = entry as Partial<PinnedContextItem>;
+    if (typeof item.id !== "string" || !item.id.trim()) continue;
+    if (seen.has(item.id)) continue;
+    seen.add(item.id);
+    items.push({
+      id: item.id,
+      kind: CONTEXT_ITEM_KINDS.includes(item.kind as ContextItemKind)
+        ? (item.kind as ContextItemKind)
+        : contextKindForId(item.id),
+      label:
+        typeof item.label === "string" && item.label.trim()
+          ? item.label.trim()
+          : item.id,
+      tokens:
+        typeof item.tokens === "number" && Number.isFinite(item.tokens)
+          ? Math.max(0, Math.round(item.tokens))
+          : 0,
+      added_at:
+        typeof item.added_at === "number" ? item.added_at : Date.now(),
+    });
+  }
+  return items.length ? items : undefined;
+}
+
+export function normalizeEvictedContextIds(
+  value: unknown,
+): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const ids = value.filter(
+    (id): id is string => typeof id === "string" && id.trim().length > 0,
+  );
+  return ids.length ? [...new Set(ids)] : undefined;
+}
 
 const UNDO_STATES: AgentUndoState[] = [
   "pending",
@@ -466,6 +536,10 @@ export function normalizeSession(value: unknown): ChatSession | null {
       Number.isFinite(session.rag_max_tokens)
         ? session.rag_max_tokens
         : undefined,
+    pinned_context: normalizePinnedContext(session.pinned_context),
+    evicted_context_ids: normalizeEvictedContextIds(
+      session.evicted_context_ids,
+    ),
   };
 }
 
@@ -492,6 +566,152 @@ export function createSession(): ChatSession {
     updated_at: now,
     messages: [],
     archived_messages: [],
+  };
+}
+
+/** Ids of every item pinned for this chat. */
+export function pinnedContextIds(
+  session: ChatSession | null | undefined,
+): Set<string> {
+  return new Set((session?.pinned_context ?? []).map((item) => item.id));
+}
+
+/** Ids of every item currently evicted from this chat's prompt. */
+export function evictedContextIds(
+  session: ChatSession | null | undefined,
+): Set<string> {
+  return new Set(session?.evicted_context_ids ?? []);
+}
+
+export function isMessagePinned(
+  session: ChatSession | null | undefined,
+  messageId: string,
+): boolean {
+  const id = messageContextId(messageId);
+  return (session?.pinned_context ?? []).some((item) => item.id === id);
+}
+
+export function isMessageEvicted(
+  session: ChatSession | null | undefined,
+  messageId: string,
+): boolean {
+  return (session?.evicted_context_ids ?? []).includes(
+    messageContextId(messageId),
+  );
+}
+
+/**
+ * Pin or unpin one context item. Pinning also restores an item that was
+ * evicted, so the two actions cannot contradict each other on disk.
+ */
+export function togglePinnedContextItem(
+  session: ChatSession,
+  item: PinnedContextItem,
+): ChatSession {
+  const pinned = session.pinned_context ?? [];
+  const exists = pinned.some((candidate) => candidate.id === item.id);
+  const nextPinned = exists
+    ? pinned.filter((candidate) => candidate.id !== item.id)
+    : [...pinned, { ...item, added_at: item.added_at || Date.now() }];
+  const nextEvicted = exists
+    ? session.evicted_context_ids
+    : (session.evicted_context_ids ?? []).filter((id) => id !== item.id);
+  return {
+    ...session,
+    pinned_context: nextPinned.length ? nextPinned : undefined,
+    evicted_context_ids: nextEvicted?.length ? nextEvicted : undefined,
+    updated_at: Date.now(),
+  };
+}
+
+/** Evict an item from the prompt, or restore it when it is already evicted. */
+export function toggleEvictedContextItem(
+  session: ChatSession,
+  id: string,
+): ChatSession {
+  const evicted = session.evicted_context_ids ?? [];
+  const exists = evicted.includes(id);
+  const nextEvicted = exists
+    ? evicted.filter((candidate) => candidate !== id)
+    : [...evicted, id];
+  // An evicted item cannot stay pinned: it is not in the prompt any more.
+  const nextPinned = exists
+    ? session.pinned_context
+    : (session.pinned_context ?? []).filter((item) => item.id !== id);
+  return {
+    ...session,
+    pinned_context: nextPinned?.length ? nextPinned : undefined,
+    evicted_context_ids: nextEvicted.length ? nextEvicted : undefined,
+    updated_at: Date.now(),
+  };
+}
+
+/**
+ * Drop MCP pins and evictions whose server no longer exists. Without this a
+ * deleted server leaves a ghost entry: it cannot be rendered (the popover only
+ * lists known servers) but it still inflates the evicted count and is sent as
+ * a pinned server name.
+ */
+export function pruneMcpContextMarkers(
+  session: ChatSession,
+  servers: Array<{ id: string }>,
+): ChatSession {
+  const known = new Set(servers.map((server) => server.id));
+  const alive = (id: string): boolean => {
+    if (!id.startsWith("mcp:")) return true;
+    return known.has(id.slice("mcp:".length));
+  };
+  const pinned = (session.pinned_context ?? []).filter((item) => alive(item.id));
+  const evicted = (session.evicted_context_ids ?? []).filter(alive);
+  if (
+    pinned.length === (session.pinned_context ?? []).length &&
+    evicted.length === (session.evicted_context_ids ?? []).length
+  ) {
+    return session;
+  }
+  return {
+    ...session,
+    pinned_context: pinned.length ? pinned : undefined,
+    evicted_context_ids: evicted.length ? evicted : undefined,
+    updated_at: Date.now(),
+  };
+}
+
+/** One-click restore for every item evicted from this chat. */
+export function restoreEvictedContext(session: ChatSession): ChatSession {
+  if (!session.evicted_context_ids?.length) return session;
+  return {
+    ...session,
+    evicted_context_ids: undefined,
+    updated_at: Date.now(),
+  };
+}
+
+/**
+ * Give a freshly branched chat the source chat's pins and evictions, keeping
+ * only the ones whose messages survived the branch cut. Rust does this when it
+ * writes the branch file; applying it here keeps imports from older builds in
+ * sync with what the UI shows.
+ */
+export function inheritPinnedContext(
+  source: ChatSession,
+  branch: ChatSession,
+): ChatSession {
+  const surviving = new Set(allSessionMessages(branch).map((item) => item.id));
+  const keeps = (id: string): boolean => {
+    const messageId = id.startsWith("message:")
+      ? id.slice("message:".length)
+      : null;
+    return messageId === null || surviving.has(messageId);
+  };
+  const pinned = (source.pinned_context ?? []).filter((item) =>
+    keeps(item.id),
+  );
+  const evicted = (source.evicted_context_ids ?? []).filter(keeps);
+  return {
+    ...branch,
+    pinned_context: pinned.length ? pinned : undefined,
+    evicted_context_ids: evicted.length ? evicted : undefined,
   };
 }
 

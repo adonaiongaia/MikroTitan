@@ -3,14 +3,23 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import { api, Events } from "../lib/api";
 import {
+  allSessionMessages,
   appendTurn,
+  evictedContextIds,
   forkAssistantTurn,
   forkUserTurn,
+  inheritPinnedContext,
+  messageContextId,
   normalizeSession as normalizeStoredSession,
+  pinnedContextIds,
+  pruneMcpContextMarkers,
+  restoreEvictedContext as restoreEvictedContextState,
   switchMessageVersion,
+  toggleEvictedContextItem,
+  togglePinnedContextItem,
   updateStep,
 } from "../lib/chatSessions";
-import { fitContext } from "../lib/contextBudget";
+import { estimateTokens, fitContext } from "../lib/contextBudget";
 import { mcpScopeNames, reconcileMcpScope } from "../lib/mcpScope";
 import { errorMessage, uid } from "../lib/format";
 import { appendMcpLog } from "../lib/mcpLog";
@@ -43,6 +52,7 @@ import type {
   McpActivityEvent,
   McpServerConfig,
   McpServerInput,
+  PinnedContextItem,
   ProjectIngest,
   RagSourcesEvent,
 } from "../types";
@@ -67,6 +77,12 @@ export interface SendOptions {
   imageTokens?: number;
   images?: string[];
   extraContext?: string;
+  /** Pinned project/memory context; never trimmed by the budget. */
+  pinnedContext?: string;
+  /** Human labels for the pinned items, used in an oversized-context error. */
+  pinnedLabels?: string[];
+  /** MCP server names whose tool schemas must survive a tight budget. */
+  pinnedMcpServers?: string[];
   citations?: Citation[];
   mcpServers?: McpServerInput[];
   /** Called once the token budget accepts the turn and adds it to the session. */
@@ -873,12 +889,19 @@ export function useChat() {
       const { sessionId, nextSession, requestMessages, assistantId, options } =
         input;
       const turnWindow = Math.max(1, options.contextPrefetch) * 2 + 1;
-      const windowed = requestMessages.slice(-turnWindow).filter(
-        (message) =>
-          message.role === "user" ||
-          message.content.trim().length > 0 ||
-          message.reasoning.trim().length > 0,
-      );
+      const pinnedIds = pinnedContextIds(nextSession);
+      const evictedIds = evictedContextIds(nextSession);
+      // Evicted turns stay in the transcript but never reach the prompt, so
+      // filter before the prefetch window picks the turns to send.
+      const windowed = requestMessages
+        .filter((message) => !evictedIds.has(messageContextId(message.id)))
+        .slice(-turnWindow)
+        .filter(
+          (message) =>
+            message.role === "user" ||
+            message.content.trim().length > 0 ||
+            message.reasoning.trim().length > 0,
+        );
       const current = requestMessages[requestMessages.length - 1];
       const imageTokens =
         options.imageTokens ??
@@ -892,9 +915,13 @@ export function useChat() {
         maxTokens: options.maxTokens,
         systemPrompt: options.systemPrompt,
         extraContext: options.extraContext,
+        pinnedContext: options.pinnedContext,
+        pinnedLabels: options.pinnedLabels,
         messages: windowed.map((message) => ({
           role: message.role,
           content: message.content,
+          id: message.id,
+          pinned: pinnedIds.has(messageContextId(message.id)),
         })),
         imageTokens,
       });
@@ -945,12 +972,21 @@ export function useChat() {
           thinking: options.thinking,
           images: input.images ?? options.images ?? [],
           max_tokens: options.maxTokens,
+          // The budget already sized this block; Rust appends it after the
+          // instructions so it can protect it during a context retry.
+          pinned_context: fitted.pinnedContext || null,
           mcp_servers: options.mcpServers ?? [],
           rag_collections: Array.isArray(nextSession.attached_collection_ids)
             ? nextSession.attached_collection_ids
             : [],
           rag_top_k: rag.topK,
           rag_max_tokens: rag.maxTokens,
+          // Chunks the user evicted are still ranked by retrieval, then
+          // removed here so the turn is not sent with them.
+          rag_excluded_chunks: [...evictedIds]
+            .filter((id) => id.startsWith("rag:"))
+            .map((id) => id.slice("rag:".length)),
+          pinned_mcp_servers: options.pinnedMcpServers ?? [],
         });
       } catch (err) {
         setError(errorMessage(err));
@@ -1200,7 +1236,10 @@ export function useChat() {
           : nextSession;
 
       // The Rust loop appends the goal itself; only prior turns are history.
+      const pinnedIds = pinnedContextIds(titled);
+      const evictedIds = evictedContextIds(titled);
       const history = session.messages
+        .filter((message) => !evictedIds.has(messageContextId(message.id)))
         .slice(-Math.max(1, options.contextPrefetch) * 2)
         .filter(
           (message) =>
@@ -1210,6 +1249,7 @@ export function useChat() {
         .map((message) => ({
           role: message.role,
           content: message.content,
+          pinned: pinnedIds.has(messageContextId(message.id)),
         }));
 
       setSessions((previous) =>
@@ -1363,7 +1403,14 @@ export function useChat() {
     setSessions((previous) =>
       previous.map((session) =>
         session.id === activeIdRef.current
-          ? { ...session, messages: [], title: "New chat" }
+          ? {
+              ...session,
+              messages: [],
+              title: "New chat",
+              // Pins and evictions only make sense for turns that exist.
+              pinned_context: undefined,
+              evicted_context_ids: undefined,
+            }
           : session,
       ),
     );
@@ -1422,18 +1469,26 @@ export function useChat() {
   }, []);
 
   const deleteMessage = useCallback((messageId: string) => {
+    const id = messageContextId(messageId);
     setSessions((previous) =>
-      previous.map((session) =>
-        session.id === activeIdRef.current
-          ? {
-              ...session,
-              messages: session.messages.filter(
-                (message) => message.id !== messageId,
-              ),
-              updated_at: Date.now(),
-            }
-          : session,
-      ),
+      previous.map((session) => {
+        if (session.id !== activeIdRef.current) return session;
+        const pinned = (session.pinned_context ?? []).filter(
+          (item) => item.id !== id,
+        );
+        const evicted = (session.evicted_context_ids ?? []).filter(
+          (candidate) => candidate !== id,
+        );
+        return {
+          ...session,
+          messages: session.messages.filter(
+            (message) => message.id !== messageId,
+          ),
+          pinned_context: pinned.length ? pinned : undefined,
+          evicted_context_ids: evicted.length ? evicted : undefined,
+          updated_at: Date.now(),
+        };
+      }),
     );
   }, []);
 
@@ -1597,6 +1652,59 @@ export function useChat() {
     [updateActiveSession],
   );
 
+  /** Pin or unpin one file, chunk, memory or turn in the active chat. */
+  const toggleContextPin = useCallback(
+    (item: PinnedContextItem) => {
+      updateActiveSession((session) => togglePinnedContextItem(session, item));
+    },
+    [updateActiveSession],
+  );
+
+  /** Drop an item from the prompt immediately, or restore it when evicted. */
+  const toggleContextEvict = useCallback(
+    (id: string) => {
+      updateActiveSession((session) => toggleEvictedContextItem(session, id));
+    },
+    [updateActiveSession],
+  );
+
+  const restoreEvictedContext = useCallback(() => {
+    updateActiveSession((session) => restoreEvictedContextState(session));
+  }, [updateActiveSession]);
+
+  const toggleMessagePin = useCallback(
+    (messageId: string) => {
+      updateActiveSession((session) => {
+        const message = allSessionMessages(session).find(
+          (candidate) => candidate.id === messageId,
+        );
+        if (!message) return session;
+        const text = message.content.trim();
+        return togglePinnedContextItem(session, {
+          id: messageContextId(messageId),
+          kind: "message",
+          label: text
+            ? text.slice(0, 72)
+            : message.role === "user"
+              ? "User turn"
+              : "Assistant reply",
+          tokens: estimateTokens(message.content) + 8,
+          added_at: Date.now(),
+        });
+      });
+    },
+    [updateActiveSession],
+  );
+
+  const toggleMessageEvict = useCallback(
+    (messageId: string) => {
+      updateActiveSession((session) =>
+        toggleEvictedContextItem(session, messageContextId(messageId)),
+      );
+    },
+    [updateActiveSession],
+  );
+
   const reconcileMcpScopes = useCallback((servers: McpServerConfig[]) => {
     setSessions((previous) => {
       let changed = false;
@@ -1606,13 +1714,19 @@ export function useChat() {
           session.mcp_server_names,
           servers,
         );
-        if (!reconciled.changed) return session;
+        const scoped = reconciled.changed
+          ? {
+              ...session,
+              mcp_server_ids: reconciled.ids,
+              mcp_server_names: reconciled.names,
+            }
+          : session;
+        // Deleting a server must also retire its pins and eviction markers,
+        // not just its scope entry.
+        const pruned = pruneMcpContextMarkers(scoped, servers);
+        if (pruned === session) return session;
         changed = true;
-        return {
-          ...session,
-          mcp_server_ids: reconciled.ids,
-          mcp_server_names: reconciled.names,
-        };
+        return pruned;
       });
       return changed ? next : previous;
     });
@@ -1631,10 +1745,16 @@ export function useChat() {
   const branchFromMessage = useCallback(async (messageId: string) => {
     const sessionId = activeIdRef.current;
     if (!sessionId) return null;
-    const branch = normalizeStoredSession(
+    const stored = normalizeStoredSession(
       await api.chatBranchSession(sessionId, messageId),
     );
-    if (!branch) throw new Error("That branch could not be read.");
+    if (!stored) throw new Error("That branch could not be read.");
+    const source = sessionsRef.current.find(
+      (candidate) => candidate.id === sessionId,
+    );
+    // The backend copies pins when it writes the branch file; applying the
+    // same inheritance here also covers branches produced by older builds.
+    const branch = source ? inheritPinnedContext(source, stored) : stored;
     savedRef.current.set(branch.id, branch);
     deletedRef.current.delete(branch.id);
     setSessions((previous) => [branch, ...previous]);
@@ -1820,6 +1940,11 @@ export function useChat() {
     setSessionMcpServerIds,
     setSessionCollectionIds,
     setSessionRagTuning,
+    toggleContextPin,
+    toggleContextEvict,
+    restoreEvictedContext,
+    toggleMessagePin,
+    toggleMessageEvict,
     reconcileMcpScopes,
     switchVersion,
     branchFromMessage,

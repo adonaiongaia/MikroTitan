@@ -413,6 +413,34 @@ export interface MemoryFact {
   source: string;
 }
 
+/**
+ * Where a pinned/evicted context item came from. The id carries the same
+ * prefix (`file:`, `rag:`, `message:`, …) so a session can be normalized
+ * without a lookup table.
+ */
+export type ContextItemKind =
+  | "file"
+  | "rag"
+  | "web"
+  | "memory"
+  | "message"
+  | "mcp";
+
+/**
+ * One context item the user explicitly pinned. Pinned items are never dropped
+ * or truncated by the context budget, and are preserved intact by agent
+ * auto-compaction.
+ */
+export interface PinnedContextItem {
+  /** Stable id: `file:src/main.rs`, `rag:<chunk>`, `message:<id>`, `memory:<id>`. */
+  id: string;
+  kind: ContextItemKind;
+  label: string;
+  /** Conservative token estimate captured when the item was pinned. */
+  tokens: number;
+  added_at: number;
+}
+
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
@@ -479,11 +507,21 @@ export interface ChatSession {
   /** Per-chat retrieval tuning. */
   rag_top_k?: number;
   rag_max_tokens?: number;
+  /** Context items the user pinned for this chat. */
+  pinned_context?: PinnedContextItem[];
+  /**
+   * Context items dropped from the prompt but kept in the transcript. Message
+   * entries use `message:<id>`; files, RAG chunks and memories use their own
+   * prefixed ids.
+   */
+  evicted_context_ids?: string[];
 }
 
 export interface ChatOutboundMessage {
   role: "user" | "assistant";
   content: string;
+  /** The user pinned this turn; budget trimming must not drop it. */
+  pinned?: boolean;
 }
 
 export interface ChatRequestPayload {
@@ -499,10 +537,16 @@ export interface ChatRequestPayload {
   thinking: boolean | null;
   images: string[];
   max_tokens: number | null;
+  /** Pinned project/memory context, appended to the system prompt. */
+  pinned_context?: string | null;
   mcp_servers: McpServerInput[];
   rag_collections: string[];
   rag_top_k: number;
   rag_max_tokens: number;
+  /** Chunk ids the user evicted; retrieval drops them before the prompt. */
+  rag_excluded_chunks?: string[];
+  /** MCP server names whose tool schemas must survive a tight budget. */
+  pinned_mcp_servers?: string[];
 }
 
 export interface ChatDelta {
@@ -909,6 +953,10 @@ export interface McpServerConfig {
   cwd: string;
   /** Chat runs this server's tools without an approval card. Default false. */
   autoApprove?: boolean;
+  /** Tools the last successful probe exposed. Absent until the server is probed. */
+  toolCount?: number;
+  /** Estimated tokens for this server's tool schemas, from the last probe. */
+  toolSchemaTokens?: number;
 }
 
 export interface McpServerInput {
@@ -930,6 +978,8 @@ export interface McpProbe {
   server_name: string;
   server_version: string;
   tools: McpTool[];
+  /** Estimated tokens these tool schemas add to every request. */
+  tool_schema_tokens: number;
   log: string[];
   message: string;
   elapsed_ms: number;

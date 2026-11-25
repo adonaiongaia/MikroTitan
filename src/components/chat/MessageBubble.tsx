@@ -5,9 +5,13 @@ import {
   ChevronRight,
   Copy,
   ExternalLink,
+  Eye,
+  EyeOff,
   FileText,
   GitBranch,
   Pencil,
+  Pin,
+  PinOff,
   RefreshCw,
   Trash2,
 } from "lucide-react";
@@ -52,6 +56,12 @@ interface MessageBubbleProps {
   artifacts?: Artifact[];
   onOpenArtifact?: (artifact: Artifact) => void;
   activeArtifactRootId?: string | null;
+  /** This turn is pinned and must survive budget trimming. */
+  pinned?: boolean;
+  /** This turn is excluded from the prompt but stays in the transcript. */
+  evicted?: boolean;
+  onTogglePin?: () => void;
+  onToggleEvict?: () => void;
 }
 
 function safeCitations(citations: Citation[] | undefined): Citation[] {
@@ -98,6 +108,10 @@ export function MessageBubble({
   artifacts,
   onOpenArtifact,
   activeArtifactRootId,
+  pinned = false,
+  evicted = false,
+  onTogglePin,
+  onToggleEvict,
 }: MessageBubbleProps) {
   const [copied, setCopied] = useState(false);
   const [linkError, setLinkError] = useState<string | null>(null);
@@ -199,6 +213,28 @@ export function MessageBubble({
     </ReactMarkdown>
   );
 
+  const contextBadge = evicted ? (
+    <div className="mb-2 flex items-center gap-1.5 rounded-lg border border-slate-500/25 bg-slate-500/5 px-2 py-1 text-[9.5px] text-slate-400">
+      <EyeOff className="h-3 w-3 shrink-0 text-slate-500" />
+      <span className="min-w-0 flex-1">Evicted from context</span>
+      {onToggleEvict ? (
+        <button
+          type="button"
+          onClick={onToggleEvict}
+          className="inline-flex shrink-0 items-center gap-1 rounded border border-acid-400/25 bg-acid-400/10 px-1.5 py-0.5 text-[9px] text-acid-200 transition hover:bg-acid-400/20"
+        >
+          <Eye className="h-2.5 w-2.5" />
+          Restore
+        </button>
+      ) : null}
+    </div>
+  ) : pinned ? (
+    <div className="mb-2 inline-flex items-center gap-1 rounded-full border border-acid-400/25 bg-acid-400/10 px-1.5 py-0.5 text-[9px] text-acid-200/90">
+      <Pin className="h-2.5 w-2.5" />
+      Pinned in context
+    </div>
+  ) : null;
+
   const actions = (
     <div className="flex items-center gap-0.5 opacity-0 transition group-hover:opacity-100 focus-within:opacity-100">
       {onEdit && editable && !editing ? (
@@ -232,6 +268,50 @@ export function MessageBubble({
         >
           <RefreshCw className="h-3 w-3" />
           Regenerate
+        </button>
+      ) : null}
+      {onTogglePin ? (
+        <button
+          type="button"
+          onClick={onTogglePin}
+          aria-pressed={pinned}
+          className={cnAction(pinned)}
+          title={
+            pinned
+              ? "Unpin: allow the context budget to trim this turn again"
+              : "Pin: keep this turn in context, even when the window is tight"
+          }
+        >
+          {pinned ? (
+            <PinOff className="h-3 w-3" />
+          ) : (
+            <Pin className="h-3 w-3" />
+          )}
+          {pinned ? "Pinned" : "Pin"}
+        </button>
+      ) : null}
+      {onToggleEvict ? (
+        <button
+          type="button"
+          onClick={onToggleEvict}
+          aria-pressed={evicted}
+          className={
+            evicted
+              ? "inline-flex items-center gap-1 rounded-md bg-acid-400/10 px-1.5 py-1 text-[10px] text-acid-200 transition hover:bg-acid-400/20"
+              : "inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-[10px] text-slate-600 transition hover:bg-rose-500/10 hover:text-rose-300"
+          }
+          title={
+            evicted
+              ? "Restore this turn to the prompt"
+              : "Evict: drop this turn from the next prompt now"
+          }
+        >
+          {evicted ? (
+            <Eye className="h-3 w-3" />
+          ) : (
+            <EyeOff className="h-3 w-3" />
+          )}
+          {evicted ? "Restore" : "Evict"}
         </button>
       ) : null}
       <button
@@ -274,7 +354,14 @@ export function MessageBubble({
             }}
           />
         ) : null}
-        <div className="max-w-[82%] rounded-2xl rounded-br-md border border-acid-400/20 bg-acid-400/10 px-4 py-3">
+        <div
+          className={
+            pinned
+              ? "max-w-[82%] rounded-2xl rounded-br-md border border-acid-400/45 bg-acid-400/15 px-4 py-3 shadow-glow"
+              : "max-w-[82%] rounded-2xl rounded-br-md border border-acid-400/20 bg-acid-400/10 px-4 py-3"
+          }
+        >
+          {contextBadge}
           {message.images?.length ? (
             <div className="mb-2 flex flex-wrap gap-1.5">
               {message.images.map((image, index) => (
@@ -358,6 +445,8 @@ export function MessageBubble({
             />
           ) : null}
         </div>
+
+        {contextBadge}
 
         {trace && agentActions ? (
           <AgentTraceView
@@ -476,6 +565,12 @@ export function MessageBubble({
       </div>
     </div>
   );
+}
+
+function cnAction(pinned: boolean): string {
+  return pinned
+    ? "inline-flex items-center gap-1 rounded-md bg-acid-400/10 px-1.5 py-1 text-[10px] text-acid-200 transition hover:bg-acid-400/20"
+    : "inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-[10px] text-slate-600 transition hover:bg-white/5 hover:text-slate-300";
 }
 
 function timeLabel(timestamp: number): string {

@@ -26,6 +26,11 @@ import { errorMessage, formatCount } from "../../lib/format";
 import type { WhisperStatus } from "../../types";
 import { Button } from "../ui/Button";
 import { ProgressBar } from "../ui/ProgressBar";
+import {
+  ContextBreakdownPopover,
+  type ContextBreakdownCategory,
+  type ContextBreakdownItem,
+} from "./ContextBreakdownPopover";
 
 export interface ComposerImage {
   name: string;
@@ -70,6 +75,12 @@ interface ComposerProps {
   ready: boolean;
   contextUsed: number;
   contextMax: number;
+  /** Token cost of the items the user pinned, for the breakdown warning. */
+  pinnedTokens: number;
+  contextCategories: ContextBreakdownCategory[];
+  onToggleContextPin: (item: ContextBreakdownItem) => void;
+  onToggleContextEvict: (item: ContextBreakdownItem) => void;
+  onRestoreEvictedContext: () => void;
   internet: boolean;
   onInternetChange: (value: boolean) => void;
   agentMode: boolean;
@@ -125,6 +136,11 @@ export function Composer({
   ready,
   contextUsed,
   contextMax,
+  pinnedTokens,
+  contextCategories,
+  onToggleContextPin,
+  onToggleContextEvict,
+  onRestoreEvictedContext,
   internet,
   onInternetChange,
   agentMode,
@@ -153,6 +169,7 @@ export function Composer({
   const fileRef = useRef<HTMLInputElement>(null);
 
   const [localError, setLocalError] = useState<string | null>(null);
+  const [breakdownOpen, setBreakdownOpen] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [voiceBusy, setVoiceBusy] = useState(false);
   const recorder = useVoiceRecorder();
@@ -724,12 +741,34 @@ export function Composer({
             </div>
 
             <div className="flex items-center gap-2">
-              <ContextRing
-                used={contextUsed}
-                max={contextMax}
-                percent={contextPercent}
-                color={ringColor}
-              />
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={() => setBreakdownOpen((value) => !value)}
+                  aria-expanded={breakdownOpen}
+                  aria-label="Show context usage breakdown"
+                  title="Show the context breakdown: pin what stays, evict what goes"
+                  className="rounded-lg transition hover:bg-white/5"
+                >
+                  <ContextRing
+                    used={contextUsed}
+                    max={contextMax}
+                    percent={contextPercent}
+                    color={ringColor}
+                  />
+                </button>
+                <ContextBreakdownPopover
+                  open={breakdownOpen}
+                  onClose={() => setBreakdownOpen(false)}
+                  categories={contextCategories}
+                  contextUsed={contextUsed}
+                  contextMax={contextMax}
+                  pinnedTokens={pinnedTokens}
+                  onTogglePin={onToggleContextPin}
+                  onToggleEvict={onToggleContextEvict}
+                  onRestoreEvicted={onRestoreEvictedContext}
+                />
+              </div>
 
               {voice.enabled ? (
                 <button

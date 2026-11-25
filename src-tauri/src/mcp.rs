@@ -79,6 +79,9 @@ pub struct McpProbe {
     pub server_name: String,
     pub server_version: String,
     pub tools: Vec<McpTool>,
+    /// Estimated tokens these schemas add to every request, using the same
+    /// estimator as the chat budget.
+    pub tool_schema_tokens: usize,
     pub log: Vec<String>,
     pub message: String,
     pub elapsed_ms: u64,
@@ -527,16 +530,6 @@ impl McpRuntime {
         for (session_index, session) in sessions.iter().enumerate() {
             for tool in &session.tools {
                 let exposed = unique_tool_name(&mut used_names, session_index, &tool.name);
-                let schema = normalized_schema(&tool.input_schema);
-                let description = if tool.description.trim().is_empty() {
-                    format!("{} from the MCP server {}.", tool.name, session.display_name)
-                } else {
-                    format!(
-                        "{} (MCP server: {})",
-                        tool.description.trim(),
-                        session.display_name
-                    )
-                };
                 routes.insert(
                     exposed.clone(),
                     RuntimeRoute {
@@ -545,14 +538,7 @@ impl McpRuntime {
                         tool: tool.name.clone(),
                     },
                 );
-                tools.push(json!({
-                    "type": "function",
-                    "function": {
-                        "name": exposed,
-                        "description": description,
-                        "parameters": schema
-                    }
-                }));
+                tools.push(tool_definition(&exposed, tool, &session.display_name));
             }
         }
 
@@ -572,6 +558,15 @@ impl McpRuntime {
 
     pub fn tool_definitions(&self) -> Vec<Value> {
         self.tools.clone()
+    }
+
+    /// Exposed tool name → the server that provides it. The chat budget uses
+    /// this to keep a pinned server's schemas when the rest must be dropped.
+    pub fn tool_owners(&self) -> HashMap<String, String> {
+        self.routes
+            .iter()
+            .map(|(name, route)| (name.clone(), route.server.clone()))
+            .collect()
     }
 
     pub fn warnings(&self) -> &[String] {
@@ -598,6 +593,43 @@ impl McpRuntime {
     }
 }
 
+/// Build one OpenAI-style function schema exactly as the chat runtime does.
+fn tool_definition(exposed: &str, tool: &McpTool, server_name: &str) -> Value {
+    let description = if tool.description.trim().is_empty() {
+        format!("{} from the MCP server {}.", tool.name, server_name)
+    } else {
+        format!("{} (MCP server: {})", tool.description.trim(), server_name)
+    };
+    json!({
+        "type": "function",
+        "function": {
+            "name": exposed,
+            "description": description,
+            "parameters": normalized_schema(&tool.input_schema)
+        }
+    })
+}
+
+/// The definitions a single-server runtime would send. Probe estimates price
+/// the same JSON the engine budget counts.
+fn tool_definitions_for(tools: &[McpTool], server_name: &str) -> Vec<Value> {
+    let mut used = HashSet::new();
+    tools
+        .iter()
+        .map(|tool| {
+            let exposed = unique_tool_name(&mut used, 0, &tool.name);
+            tool_definition(&exposed, tool, server_name)
+        })
+        .collect()
+}
+
+fn schema_tokens(definitions: &[Value]) -> usize {
+    if definitions.is_empty() {
+        return 0;
+    }
+    crate::engine::retry_text_tokens(&Value::Array(definitions.to_vec()).to_string())
+}
+
 pub fn probe_server(spec: &McpServerSpec) -> McpProbe {
     let started = Instant::now();
     match McpSession::start(spec) {
@@ -610,6 +642,8 @@ pub fn probe_server(spec: &McpServerSpec) -> McpProbe {
             } else {
                 session.server_name.clone()
             };
+            let tool_schema_tokens =
+                schema_tokens(&tool_definitions_for(&tools, &server_name));
             let server_version = session.server_version.clone();
             session.stop();
             McpProbe {
@@ -622,6 +656,7 @@ pub fn probe_server(spec: &McpServerSpec) -> McpProbe {
                     if tools.len() == 1 { "" } else { "s" }
                 ),
                 tools,
+                tool_schema_tokens,
                 log,
                 elapsed_ms: started.elapsed().as_millis() as u64,
             }
@@ -631,6 +666,7 @@ pub fn probe_server(spec: &McpServerSpec) -> McpProbe {
             server_name: spec.display_name(),
             server_version: String::new(),
             tools: Vec::new(),
+            tool_schema_tokens: 0,
             message: err.message,
             log: err.log,
             elapsed_ms: started.elapsed().as_millis() as u64,
@@ -813,6 +849,23 @@ mod tests {
         assert!(second.len() <= MAX_TOOL_NAME);
         let long = unique_tool_name(&mut used, 2, &"x".repeat(200));
         assert!(long.len() <= MAX_TOOL_NAME);
+    }
+
+    #[test]
+    fn probe_estimates_tool_schema_tokens() {
+        let tools = vec![McpTool {
+            name: "echo".into(),
+            description: "Echo text".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "text": { "type": "string" } }
+            }),
+        }];
+        let definitions = tool_definitions_for(&tools, "fake");
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0]["function"]["name"], "mcp_1_echo");
+        assert!(schema_tokens(&definitions) > 0);
+        assert_eq!(schema_tokens(&[]), 0);
     }
 
     #[test]

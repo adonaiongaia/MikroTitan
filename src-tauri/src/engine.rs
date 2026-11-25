@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{BufRead, BufReader, Read},
     net::TcpListener,
     path::Path,
@@ -103,6 +103,9 @@ enum ChatApproval {
 pub struct WireMessage {
     pub role: String,
     pub content: String,
+    /// The user pinned this turn. Budget trimming must never drop it.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -127,6 +130,10 @@ pub struct ChatRequest {
     pub images: Vec<String>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// Attached project/memory context the user pinned. Appended to the system
+    /// prompt and never trimmed while it fits the window.
+    #[serde(default)]
+    pub pinned_context: Option<String>,
     #[serde(default)]
     pub mcp_servers: Vec<McpServerSpec>,
     /// Knowledge collections attached to this chat. Retrieval happens here,
@@ -137,6 +144,14 @@ pub struct ChatRequest {
     pub rag_top_k: Option<usize>,
     #[serde(default)]
     pub rag_max_tokens: Option<usize>,
+    /// Retrieved chunks the user evicted for this turn. They are removed before
+    /// the prompt is assembled, so a noisy snippet can be dropped immediately.
+    #[serde(default)]
+    pub rag_excluded_chunks: Vec<String>,
+    /// MCP servers whose tool schemas the user pinned. When the tool schemas
+    /// do not fit the prompt budget, unpinned servers are dropped first.
+    #[serde(default)]
+    pub pinned_mcp_servers: Vec<String>,
 }
 
 pub struct EngineManager {
@@ -497,6 +512,10 @@ impl EngineManager {
         request: ChatRequest,
     ) -> AppResult<()> {
         let mut messages = Vec::with_capacity(request.messages.len() + 1);
+        // `pinned[i]` mirrors `messages[i]` for the budget checks below. The
+        // system prompt is never a pinned *turn*; pinned attached context is
+        // carried separately and appended after the instructions.
+        let mut pinned: Vec<bool> = Vec::with_capacity(request.messages.len() + 1);
         if let Some(system) = request
             .system_prompt
             .as_deref()
@@ -504,12 +523,39 @@ impl EngineManager {
             .filter(|text| !text.is_empty())
         {
             messages.push(serde_json::json!({ "role": "system", "content": system }));
+            pinned.push(false);
+        }
+        let pinned_context = request
+            .pinned_context
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty());
+        if let Some(context) = pinned_context {
+            // Keep the pinned block at the end of the system message so the
+            // retry path can preserve it without knowing where it starts.
+            match messages
+                .iter_mut()
+                .find(|message| message["role"] == "system")
+            {
+                Some(system) => {
+                    let base = system["content"].as_str().unwrap_or_default().to_string();
+                    system["content"] =
+                        serde_json::Value::String(format!("{base}\n\n{context}"));
+                }
+                None => {
+                    messages.push(
+                        serde_json::json!({ "role": "system", "content": context }),
+                    );
+                    pinned.push(false);
+                }
+            }
         }
         for message in &request.messages {
             messages.push(serde_json::json!({
                 "role": message.role,
                 "content": message.content,
             }));
+            pinned.push(message.pinned);
         }
         // Vision input rides on the final user turn as OpenAI-style content
         // parts. Engines without a vision projector reject it, which surfaces
@@ -593,18 +639,31 @@ impl EngineManager {
         // rather than waiting for the engine to reject the turn.
         let context_window = settings.ctx_size.max(512) as usize;
         let prompt_budget = request_prompt_budget(context_window, request.max_tokens);
+        // Pinned context is the one thing this turn cannot silently lose. If
+        // it does not fit even before tool schemas and retrieval, refuse the
+        // send with the names of the items instead of dropping them.
+        if let Some(error) = pinned_budget_error(
+            &messages,
+            &pinned,
+            prompt_budget,
+            context_window,
+            request.max_tokens,
+            pinned_context.is_some(),
+        ) {
+            emit_chat_error(app, &request.request_id, error);
+            self.clear_cancelled(&request.request_id);
+            return Ok(());
+        }
         let message_cost: usize = messages.iter().map(retry_message_cost).sum();
-        let tools_cost = tool_schema_tokens(&mcp_tools);
-        if !mcp_tools.is_empty() && message_cost + tools_cost > prompt_budget {
-            let omitted = mcp_tools.len();
-            mcp_tools.clear();
-            emit_chat_notice(
-                app,
-                &request.request_id,
-                format!(
-                    "The enabled MCP server advertises {omitted} tools whose definitions need about {tools_cost} tokens. They do not fit in this {context_window}-token context, so this turn is running without MCP tools. Disable the server in MCP Hub or use a smaller MCP server."
-                ),
-            );
+        if let Some(notice) = fit_mcp_tools(
+            mcp_runtime.as_ref(),
+            &mut mcp_tools,
+            &request.pinned_mcp_servers,
+            message_cost,
+            prompt_budget,
+            context_window,
+        ) {
+            emit_chat_notice(app, &request.request_id, notice);
         }
 
         // Local document vault retrieval. It runs before the first request and
@@ -657,6 +716,27 @@ impl EngineManager {
                         store.query(&ids, &search, top_k, budget)
                     })
                     .await;
+                    // Retrieval still ranks evicted chunks (they may be the best
+                    // match), but they never reach the prompt.
+                    let outcome = match outcome {
+                        Ok(Ok(mut result)) => {
+                            if !request.rag_excluded_chunks.is_empty() {
+                                result.chunks.retain(|chunk| {
+                                    !request
+                                        .rag_excluded_chunks
+                                        .iter()
+                                        .any(|id| id == &chunk.chunk_id)
+                                });
+                                result.tokens_used = result
+                                    .chunks
+                                    .iter()
+                                    .map(|chunk| chunk.token_estimate)
+                                    .sum();
+                            }
+                            Ok(Ok(result))
+                        }
+                        other => other,
+                    };
                     match outcome {
                         Ok(Ok(result)) if !result.chunks.is_empty() => {
                             let system_index = messages
@@ -673,10 +753,15 @@ impl EngineManager {
                                     messages[index]["content"] =
                                         serde_json::Value::String(combined);
                                 }
-                                None => messages.insert(
-                                    0,
-                                    serde_json::json!({ "role": "system", "content": combined }),
-                                ),
+                                None => {
+                                    messages.insert(
+                                        0,
+                                        serde_json::json!({ "role": "system", "content": combined }),
+                                    );
+                                    // Keep the pin flags aligned with the
+                                    // messages after the inserted system turn.
+                                    pinned.insert(0, false);
+                                }
                             }
                             let sources = result.chunks.clone();
                             let _ = app.emit(
@@ -798,27 +883,29 @@ impl EngineManager {
                 if status == reqwest::StatusCode::BAD_REQUEST && !context_retry_done {
                     if let Some(limit) = context_limit_from_error(&body) {
                         let mut changed = false;
-                        if let Some(trimmed) =
-                            trim_messages_to_context(&messages, limit, request.max_tokens)
-                        {
+                        if let Some(trimmed) = trim_messages_to_context(
+                            &messages,
+                            &pinned,
+                            pinned_context.is_some(),
+                            limit,
+                            request.max_tokens,
+                        ) {
                             messages = trimmed;
                             changed = true;
                         }
                         let budget = request_prompt_budget(limit as usize, request.max_tokens);
                         let message_cost: usize =
                             messages.iter().map(retry_message_cost).sum();
-                        let tools_cost = tool_schema_tokens(&mcp_tools);
-                        if !mcp_tools.is_empty() && message_cost + tools_cost > budget {
-                            let omitted = mcp_tools.len();
-                            mcp_tools.clear();
+                        if let Some(notice) = fit_mcp_tools(
+                            mcp_runtime.as_ref(),
+                            &mut mcp_tools,
+                            &request.pinned_mcp_servers,
+                            message_cost,
+                            budget,
+                            limit as usize,
+                        ) {
                             changed = true;
-                            emit_chat_notice(
-                                app,
-                                &request.request_id,
-                                format!(
-                                    "The engine rejected the request because the {omitted} MCP tool definitions need about {tools_cost} tokens. MCP tools are omitted for this retry so the conversation can continue."
-                                ),
-                            );
+                            emit_chat_notice(app, &request.request_id, notice);
                         }
                         if changed {
                             context_retry_done = true;
@@ -1598,6 +1685,79 @@ fn tool_schema_tokens(tools: &[serde_json::Value]) -> usize {
     retry_text_tokens(&tools_schema(tools).to_string())
 }
 
+/// Keep only the tool schemas owned by pinned MCP servers.
+fn tools_for_pinned_servers(
+    tools: &[serde_json::Value],
+    owners: &HashMap<String, String>,
+    pinned: &HashSet<String>,
+) -> Vec<serde_json::Value> {
+    tools
+        .iter()
+        .filter(|tool| {
+            let name = tool
+                .pointer("/function/name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            owners
+                .get(name)
+                .map(|server| pinned.contains(server))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Make the MCP tool schemas fit the prompt budget. Pinned servers keep their
+/// tools while unpinned servers are dropped first; if even the pinned set does
+/// not fit, every tool is omitted. Returns the notice to show, if any.
+fn fit_mcp_tools(
+    runtime: Option<&McpRuntime>,
+    tools: &mut Vec<serde_json::Value>,
+    pinned_servers: &[String],
+    message_cost: usize,
+    budget: usize,
+    context_window: usize,
+) -> Option<String> {
+    if tools.is_empty() {
+        return None;
+    }
+    let tools_cost = tool_schema_tokens(tools);
+    if message_cost + tools_cost <= budget {
+        return None;
+    }
+    let pinned: HashSet<String> = pinned_servers
+        .iter()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect();
+    if !pinned.is_empty() {
+        if let Some(runtime) = runtime {
+            let kept = tools_for_pinned_servers(tools, &runtime.tool_owners(), &pinned);
+            if !kept.is_empty() && message_cost + tool_schema_tokens(&kept) <= budget {
+                let omitted = tools.len() - kept.len();
+                let names = pinned_servers.join(", ");
+                *tools = kept;
+                return Some(format!(
+                    "The MCP tool schemas did not fit the remaining prompt budget, so {omitted} tool(s) from unpinned servers were omitted. Pinned server(s) {names} kept their tools."
+                ));
+            }
+        }
+    }
+    let omitted = tools.len();
+    tools.clear();
+    let pinned_note = if pinned_servers.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Pinned server(s) {} could not be kept either; unpin them or raise the Context window.",
+            pinned_servers.join(", ")
+        )
+    };
+    Some(format!(
+        "The enabled MCP server advertises {omitted} tools whose definitions need about {tools_cost} tokens. They do not fit in this {context_window}-token context, so this turn is running without MCP tools.{pinned_note} Disable the server in MCP Hub or use a smaller MCP server."
+    ))
+}
+
 /// Conservative token count for the retry path. ASCII text is treated as three
 /// characters per token; non-ASCII text is counted per character so CJK prompts
 /// are not underestimated.
@@ -1677,8 +1837,70 @@ fn context_limit_from_error(body: &str) -> Option<u32> {
 /// message keeps its opening instructions; older conversation and oversized
 /// attached context are dropped. Tool-call fragments are omitted because a
 /// partial assistant/tool pair is not valid chat history.
+/// A pre-send error when the system prompt, pinned attached context and pinned
+/// turns alone exceed the prompt budget. Naming the pinned items is deliberate:
+/// the turn must not be sent with them silently dropped.
+fn message_role(message: &serde_json::Value) -> &str {
+    message
+        .get("role")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+}
+
+fn pinned_budget_error(
+    messages: &[serde_json::Value],
+    pinned: &[bool],
+    budget: usize,
+    context_window: usize,
+    requested_max: Option<u32>,
+    has_pinned_context: bool,
+) -> Option<String> {
+    let system_cost = messages
+        .iter()
+        .find(|message| message_role(message) == "system")
+        .map(retry_message_cost)
+        .unwrap_or(0);
+    let pinned_turns: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(index, message)| {
+            message_role(message) != "system" && pinned.get(*index).copied().unwrap_or(false)
+        })
+        .map(|(_, message)| retry_message_cost(message))
+        .collect();
+    let current_cost = messages
+        .iter()
+        .rposition(|message| message_role(message) == "user")
+        .map(|index| retry_message_cost(&messages[index]))
+        .unwrap_or(0);
+    let pinned_total: usize = pinned_turns.iter().sum();
+    let total = system_cost + pinned_total + current_cost;
+    if total <= budget {
+        return None;
+    }
+    let reserve = request_output_reserve(context_window, requested_max);
+    let detail = match (has_pinned_context, pinned_turns.len()) {
+        (true, 0) => "The pinned attached context needs".to_string(),
+        (true, turns) => format!(
+            "The pinned attached context and {turns} pinned turn(s) need"
+        ),
+        (false, turns) => format!("The {turns} pinned turn(s) need"),
+    };
+    Some(format!(
+        "{detail} about {pinned_total} tokens, and the system prompt plus this message bring the request to {total} tokens. This {context_window}-token context leaves {budget} for input after reserving {reserve} tokens for the reply. Unpin or evict some pinned items, shorten the message, or raise the active Context window in Engine Settings."
+    ))
+}
+
+/// Rebuild a prompt around the current user turn when the server reports that
+/// it allocates a smaller context than the one we budgeted for. The system
+/// message keeps its opening instructions; older conversation and oversized
+/// attached context are dropped. Pinned turns are counted as essentials and
+/// are never dropped. Tool-call fragments are omitted because a partial
+/// assistant/tool pair is not valid chat history.
 fn trim_messages_to_context(
     messages: &[serde_json::Value],
+    pinned: &[bool],
+    pinned_system: bool,
     context_window: u32,
     requested_max: Option<u32>,
 ) -> Option<Vec<serde_json::Value>> {
@@ -1695,30 +1917,33 @@ fn trim_messages_to_context(
         return None;
     }
 
-    let current_index = messages.iter().rposition(|message| {
-        message.get("role").and_then(serde_json::Value::as_str) == Some("user")
-    })?;
+    let is_pinned = |index: usize| pinned.get(index).copied().unwrap_or(false);
+
+    let current_index = messages
+        .iter()
+        .rposition(|message| message_role(message) == "user")?;
     let current = messages[current_index].clone();
     let current_cost = retry_message_cost(&current);
     if current_cost > budget {
         return None;
     }
 
-    let system_index = messages.iter().position(|message| {
-        message.get("role").and_then(serde_json::Value::as_str) == Some("system")
-    });
+    let system_index = messages
+        .iter()
+        .position(|message| message_role(message) == "system");
     let mut system_message = None;
     let mut system_cost = 0usize;
     if let Some(index) = system_index {
         let mut message = messages[index].clone();
-        if let Some(text) = message
-            .get("content")
-            .and_then(serde_json::Value::as_str)
-        {
+        if let Some(text) = message.get("content").and_then(serde_json::Value::as_str) {
             let allowance = (budget / 2)
                 .min(budget.saturating_sub(current_cost))
                 .max(256);
-            if retry_message_cost(&message) > allowance {
+            // Pinned attached context sits at the end of the system message,
+            // so clipping the prefix would cut it off. Keep the message whole
+            // when it carries pinned context; the essentials check below is
+            // what decides whether the turn can be sent at all.
+            if !pinned_system && retry_message_cost(&message) > allowance {
                 message["content"] = serde_json::Value::String(clip_retry_text(
                     text,
                     allowance.saturating_sub(RETRY_MESSAGE_OVERHEAD),
@@ -1729,38 +1954,48 @@ fn trim_messages_to_context(
         system_message = Some(message);
     }
 
-    if system_cost + current_cost > budget {
+    // Pinned turns are essentials: keep every one of them, then fill the rest
+    // of the budget with the newest unpinned turns.
+    let pinned_prior: Vec<usize> = (0..current_index)
+        .filter(|index| Some(*index) != system_index && is_pinned(*index))
+        .collect();
+    let pinned_cost: usize = pinned_prior
+        .iter()
+        .map(|index| retry_message_cost(&messages[*index]))
+        .sum();
+    if system_cost + pinned_cost + current_cost > budget {
         return None;
     }
 
-    let mut remaining = budget - system_cost - current_cost;
-    let mut kept_reversed = Vec::new();
-    for (index, message) in messages.iter().enumerate().rev() {
-        if Some(index) == system_index || index == current_index || index > current_index {
+    let mut remaining = budget - system_cost - pinned_cost - current_cost;
+    let mut kept: Vec<(usize, serde_json::Value)> = pinned_prior
+        .iter()
+        .map(|index| (*index, messages[*index].clone()))
+        .collect();
+    for index in (0..current_index).rev() {
+        if Some(index) == system_index || is_pinned(index) {
             continue;
         }
-        let role = message
-            .get("role")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
+        let message = &messages[index];
+        let role = message_role(message);
         if role == "tool" || message.get("tool_calls").is_some() {
             continue;
         }
         let cost = retry_message_cost(message);
         if cost <= remaining {
-            kept_reversed.push(message.clone());
+            kept.push((index, message.clone()));
             remaining -= cost;
         } else {
             break;
         }
     }
-    kept_reversed.reverse();
+    kept.sort_by_key(|(index, _)| *index);
 
     let mut result = Vec::new();
     if let Some(system) = system_message {
         result.push(system);
     }
-    result.extend(kept_reversed);
+    result.extend(kept.into_iter().map(|(_, message)| message));
     result.push(current);
     Some(result)
 }
@@ -2219,7 +2454,8 @@ mod tests {
             "content": "What should I do next?"
         }));
 
-        let trimmed = trim_messages_to_context(&messages, 16_384, None)
+        let pinned = vec![false; messages.len()];
+        let trimmed = trim_messages_to_context(&messages, &pinned, false, 16_384, None)
             .expect("trimmed prompt");
         assert!(trimmed.len() < messages.len());
         assert_eq!(trimmed.last().unwrap()["content"], "What should I do next?");
@@ -2232,6 +2468,147 @@ mod tests {
             estimated <= 11_776,
             "retry prompt still too large: {estimated}"
         );
+    }
+
+    #[test]
+    fn pinned_context_and_turns_survive_budget_trimming() {
+        // A pinned attached project file lives at the end of the system
+        // prompt; clipping the prefix would cut it off, so the whole system
+        // message must survive.
+        let mut messages = vec![serde_json::json!({
+            "role": "system",
+            "content": format!(
+                "Core instructions.\n\n=== src/lib.rs ===\n{}",
+                "pinned project file ".repeat(160)
+            )
+        })];
+        let mut pinned = vec![false];
+        for index in 0..20 {
+            messages.push(serde_json::json!({
+                "role": if index % 2 == 0 { "user" } else { "assistant" },
+                "content": format!("Historical turn {index}. {}", "detail ".repeat(500))
+            }));
+            // One early turn is pinned; it is older than everything the
+            // budget would normally keep.
+            pinned.push(index == 2);
+        }
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": "What should I do next?"
+        }));
+        pinned.push(false);
+
+        let trimmed = trim_messages_to_context(&messages, &pinned, true, 16_384, None)
+            .expect("trimmed prompt");
+        assert!(trimmed.len() < messages.len());
+        assert!(
+            trimmed[0]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("=== src/lib.rs ==="),
+            "pinned project file was truncated"
+        );
+        assert!(
+            trimmed.iter().any(|message| message["content"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("Historical turn 2.")),
+            "pinned turn was dropped"
+        );
+        assert_eq!(trimmed.last().unwrap()["content"], "What should I do next?");
+        let estimated: usize = trimmed.iter().map(retry_message_cost).sum();
+        assert!(
+            estimated <= 11_776,
+            "retry prompt still too large: {estimated}"
+        );
+    }
+
+    #[test]
+    fn oversized_pinned_turns_are_refused_before_sending() {
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": "You are Janas."}),
+            serde_json::json!({"role": "user", "content": "x".repeat(60_000)}),
+            serde_json::json!({"role": "user", "content": "and now?"}),
+        ];
+        let pinned = vec![false, true, false];
+        let budget = request_prompt_budget(8_192, Some(2_048));
+        let error = pinned_budget_error(&messages, &pinned, budget, 8_192, Some(2_048), false)
+            .expect("oversized pins must be refused");
+        assert!(error.contains("1 pinned turn"), "unclear error: {error}");
+        assert!(error.contains("Unpin or evict"), "unclear error: {error}");
+
+        // The same shape fits comfortably when the pinned turn is small.
+        let small = vec![
+            serde_json::json!({"role": "system", "content": "You are Janas."}),
+            serde_json::json!({"role": "user", "content": "short pinned turn"}),
+            serde_json::json!({"role": "user", "content": "and now?"}),
+        ];
+        assert!(
+            pinned_budget_error(&small, &pinned, budget, 8_192, Some(2_048), false).is_none()
+        );
+    }
+
+    #[test]
+    fn pinned_mcp_servers_keep_their_tools() {
+        let tool = |name: &str| {
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": "x".repeat(2_000),
+                    "parameters": { "type": "object", "properties": {} }
+                }
+            })
+        };
+        let tools = vec![tool("mcp_1_search"), tool("mcp_2_write")];
+        let owners: HashMap<String, String> = [
+            ("mcp_1_search".to_string(), "Docs".to_string()),
+            ("mcp_2_write".to_string(), "Files".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let pinned: HashSet<String> = ["Files".to_string()].into_iter().collect();
+        let kept = tools_for_pinned_servers(&tools, &owners, &pinned);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].pointer("/function/name").unwrap(), "mcp_2_write");
+    }
+
+    #[test]
+    fn fit_mcp_tools_reports_why_pinned_tools_were_dropped() {
+        let mut tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "mcp_1_search",
+                "description": "x".repeat(4_000),
+                "parameters": { "type": "object", "properties": {} }
+            }
+        })];
+        let notice = fit_mcp_tools(None, &mut tools, &["Docs".to_string()], 0, 256, 8_192)
+            .expect("oversized tools are reported");
+        assert!(tools.is_empty());
+        assert!(notice.contains("Pinned server(s) Docs could not be kept"));
+
+        let mut small = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "mcp_1_search",
+                "description": "short",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        })];
+        assert!(fit_mcp_tools(None, &mut small, &[], 0, 8_192, 8_192).is_none());
+    }
+
+    #[test]
+    fn wire_messages_default_pinned_to_false() {
+        let message: WireMessage =
+            serde_json::from_str(r#"{"role":"user","content":"hi"}"#).expect("legacy message");
+        assert!(!message.pinned);
+        let message: WireMessage = serde_json::from_str(
+            r#"{"role":"user","content":"hi","pinned":true}"#,
+        )
+        .expect("pinned message");
+        assert!(message.pinned);
     }
 
     #[test]

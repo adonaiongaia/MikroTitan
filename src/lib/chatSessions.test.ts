@@ -4,12 +4,21 @@ import {
   appendTurn,
   backfillTree,
   branchPrefix,
+  evictedContextIds,
   forkAssistantTurn,
   forkUserTurn,
+  inheritPinnedContext,
+  isMessageEvicted,
+  isMessagePinned,
   normalizeRagChunk,
   normalizeSession,
+  pinnedContextIds,
+  pruneMcpContextMarkers,
+  restoreEvictedContext,
   siblingsFor,
   switchMessageVersion,
+  toggleEvictedContextItem,
+  togglePinnedContextItem,
 } from "./chatSessions";
 import type { ChatMessage, ChatSession } from "../types";
 
@@ -201,6 +210,163 @@ describe("branching turns", () => {
     const prefix = branchPrefix(linearSession(), "a1");
     expect(prefix.map((item) => item.id)).toEqual(["u1", "a1"]);
     expect(prefix[1].active_child_id).toBeNull();
+  });
+});
+
+describe("pinned and evicted context", () => {
+  it("treats a chat without pinned_context as having no pins", () => {
+    const normalized = normalizeSession({
+      id: "legacy-pins",
+      title: "Legacy",
+      created_at: 1,
+      updated_at: 2,
+      messages: [
+        { id: "u1", role: "user", content: "hi", created_at: 1 },
+        { id: "a1", role: "assistant", content: "hello", created_at: 2 },
+      ],
+    });
+    expect(normalized).not.toBeNull();
+    expect(normalized?.pinned_context).toBeUndefined();
+    expect(normalized?.evicted_context_ids).toBeUndefined();
+    expect(pinnedContextIds(normalized).size).toBe(0);
+    expect(evictedContextIds(normalized).size).toBe(0);
+    expect(isMessagePinned(normalized, "a1")).toBe(false);
+    expect(isMessageEvicted(normalized, "a1")).toBe(false);
+  });
+
+  it("normalizes valid items and drops duplicates and malformed entries", () => {
+    const normalized = normalizeSession({
+      ...session([]),
+      pinned_context: [
+        {
+          id: "file:src/main.rs",
+          kind: "file",
+          label: "src/main.rs",
+          tokens: 12,
+          added_at: 5,
+        },
+        {
+          id: "file:src/main.rs",
+          kind: "file",
+          label: "duplicate",
+          tokens: 12,
+          added_at: 5,
+        },
+        { id: "rag:chunk-1" },
+        { id: "", kind: "file" },
+      ],
+      evicted_context_ids: ["message:m1", "message:m1", 7],
+    });
+    expect(normalized?.pinned_context?.map((item) => item.id)).toEqual([
+      "file:src/main.rs",
+      "rag:chunk-1",
+    ]);
+    // A missing kind is recovered from the id prefix.
+    expect(normalized?.pinned_context?.[1].kind).toBe("rag");
+    expect(normalized?.evicted_context_ids).toEqual(["message:m1"]);
+  });
+
+  it("pinning restores an evicted item and evicting unpins it", () => {
+    let value = linearSession();
+    value = toggleEvictedContextItem(value, "message:a1");
+    expect(isMessageEvicted(value, "a1")).toBe(true);
+
+    value = togglePinnedContextItem(value, {
+      id: "message:a1",
+      kind: "message",
+      label: "first answer",
+      tokens: 9,
+      added_at: 1,
+    });
+    expect(isMessagePinned(value, "a1")).toBe(true);
+    expect(isMessageEvicted(value, "a1")).toBe(false);
+
+    value = toggleEvictedContextItem(value, "message:a1");
+    expect(isMessagePinned(value, "a1")).toBe(false);
+    expect(isMessageEvicted(value, "a1")).toBe(true);
+
+    value = restoreEvictedContext(value);
+    expect(value.evicted_context_ids).toBeUndefined();
+  });
+
+  it("branches inherit file pins and only surviving message pins", () => {
+    const source = {
+      ...linearSession(),
+      pinned_context: [
+        {
+          id: "file:src/main.rs",
+          kind: "file" as const,
+          label: "src/main.rs",
+          tokens: 4,
+          added_at: 1,
+        },
+        {
+          id: "message:a2",
+          kind: "message" as const,
+          label: "second answer",
+          tokens: 4,
+          added_at: 1,
+        },
+      ],
+      evicted_context_ids: ["message:u2", "file:src/old.rs"],
+    };
+    const branch = session([
+      message("u1", "user", "first", 1),
+      message("a1", "assistant", "first answer", 2),
+    ]);
+    const inherited = inheritPinnedContext(source, branch);
+    expect(inherited.pinned_context?.map((item) => item.id)).toEqual([
+      "file:src/main.rs",
+    ]);
+    expect(inherited.evicted_context_ids).toEqual(["file:src/old.rs"]);
+  });
+});
+
+describe("pruneMcpContextMarkers", () => {
+  it("drops pins and evictions for a deleted server", () => {
+    const base = session([message("m1", "user", "hi", 1)]);
+    const withMarkers: ChatSession = {
+      ...base,
+      pinned_context: [
+        {
+          id: "mcp:gone",
+          kind: "mcp",
+          label: "Gone",
+          tokens: 12,
+          added_at: 1,
+        },
+        {
+          id: "mcp:kept",
+          kind: "mcp",
+          label: "Kept",
+          tokens: 7,
+          added_at: 1,
+        },
+        {
+          id: "message:m1",
+          kind: "message",
+          label: "hi",
+          tokens: 3,
+          added_at: 1,
+        },
+      ],
+      evicted_context_ids: ["mcp:gone", "mcp:kept", "message:m1"],
+    };
+    const pruned = pruneMcpContextMarkers(withMarkers, [{ id: "kept" }]);
+    expect(pruned.pinned_context?.map((item) => item.id)).toEqual([
+      "mcp:kept",
+      "message:m1",
+    ]);
+    expect(pruned.evicted_context_ids).toEqual(["mcp:kept", "message:m1"]);
+  });
+
+  it("returns the same session when every marker is still valid", () => {
+    const base = session([message("m1", "user", "hi", 1)]);
+    const scoped: ChatSession = {
+      ...base,
+      evicted_context_ids: ["mcp:kept"],
+    };
+    expect(pruneMcpContextMarkers(scoped, [{ id: "kept" }])).toBe(scoped);
   });
 });
 
