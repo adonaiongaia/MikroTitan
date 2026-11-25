@@ -46,8 +46,8 @@ if [[ -d "$GTK_LIBDIR/gtk-3.0" ]]; then
 fi
 
 BUNDLE_DIR="$ROOT/src-tauri/target/release/bundle/appimage"
-APPDIR="$BUNDLE_DIR/Studio for Janas.AppDir"
-ARTIFACT="$BUNDLE_DIR/Studio for Janas_0.1.1_amd64.AppImage"
+APPDIR="$BUNDLE_DIR/MikroTitan.AppDir"
+ARTIFACT="$BUNDLE_DIR/MikroTitan_0.2.0_amd64.AppImage"
 
 # The fake server is a test-only binary. Remove stale Cargo/bundle copies left
 # by older builds so Tauri cannot mistake one for a production binary.

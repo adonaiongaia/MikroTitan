@@ -1004,11 +1004,11 @@ export function SettingsView({ engine }: SettingsViewProps) {
 
         <section className="panel p-5">
           <h3 className="text-[12px] font-semibold text-white">
-            About Studio for Janas
+            About MikroTitan
           </h3>
           <div className="mt-3 space-y-2 text-[10.5px] leading-5 text-slate-500">
             <p>
-              Studio for Janas is an independent, unofficial front end for{" "}
+              MikroTitan is an independent, unofficial front end for{" "}
               <span className="text-slate-300">janas-server</span>, the
               OpenAI-compatible HTTP API of the Janas C inference engine. Chat
               requests stream from{" "}

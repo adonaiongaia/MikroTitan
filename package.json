@@ -1,9 +1,9 @@
 {
   "name": "janas-studio",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.2.0",
   "type": "module",
-  "description": "An independent, unofficial desktop studio for the Janas inference engine",
+  "description": "A dual-inference local AI desktop studio for Janas-LLM and llama.cpp",
   "license": "GPL-3.0-only",
   "scripts": {
     "dev": "vite --port 1420 --strictPort",

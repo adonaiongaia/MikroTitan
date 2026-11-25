@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Generate the Studio for Janas app icon without external image libraries.
+"""Generate the legacy gate mark without external image libraries.
 
 Draws a rounded dark tile with two acid-green gate pillars on it. The output is
-a 1024x1024 RGBA PNG that `tauri icon` expands into every platform size.
+a 1024x1024 RGBA PNG that `tauri icon` expands into every platform size. The
+current MikroTitan icon is generated from docs/logo/mikrotitan-lockup.png.
 """
 
 import math

@@ -1175,7 +1175,7 @@ impl KnowledgeStore {
         // build instead of silently misreading its chunks.
         if file.schema_version > SCHEMA_VERSION {
             return Err(AppError::message(format!(
-                "That collection index was written by a newer version of Studio for Janas (schema {}).",
+                "That collection index was written by a newer version of MikroTitan (schema {}).",
                 file.schema_version
             )));
         }

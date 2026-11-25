@@ -76,7 +76,7 @@ pub fn enable_media_capture<R: tauri::Runtime>(webview: &tauri::Webview<R>) {
     });
 
     if let Err(error) = result {
-        eprintln!("Studio for Janas: could not enable WebKitGTK microphone capture: {error}");
+        eprintln!("MikroTitan: could not enable WebKitGTK microphone capture: {error}");
     }
 }
 

@@ -368,7 +368,7 @@ fn migrate_legacy_install(bin: &Path, runtime: &Path) {
             let _ = fs::remove_dir_all(&legacy_libs);
         }
         Err(err) => {
-            eprintln!("Studio for Janas: could not migrate the existing Whisper install: {err}");
+            eprintln!("MikroTitan: could not migrate the existing Whisper install: {err}");
             let _ = fs::remove_dir_all(&staging);
         }
     }

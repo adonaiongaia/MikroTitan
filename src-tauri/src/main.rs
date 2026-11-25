@@ -711,7 +711,7 @@ fn main() {
             agent::agent_undo_state,
         ])
         .build(tauri::generate_context!())
-        .expect("failed to build Studio for Janas");
+        .expect("failed to build MikroTitan");
 
     app.run(|app_handle, event| {
         if let tauri::RunEvent::Exit = event {

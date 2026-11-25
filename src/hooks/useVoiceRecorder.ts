@@ -171,7 +171,7 @@ function microphoneError(error: unknown): string {
     case "NotAllowedError":
     case "PermissionDeniedError":
     case "SecurityError":
-      return "Microphone permission was denied. Allow microphone access for Studio for Janas in your desktop privacy settings, then try again.";
+      return "Microphone permission was denied. Allow microphone access for MikroTitan in your desktop privacy settings, then try again.";
     case "NotFoundError":
     case "DevicesNotFoundError":
       return "No microphone was found. Connect an input device and retry.";

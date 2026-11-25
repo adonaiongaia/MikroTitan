@@ -653,7 +653,7 @@ export function Composer({
                   : internet
                     ? "Ask the model, and it will read the web first…"
                     : "Message your local model…"
-                : "Start the Janas engine to begin chatting"
+                : "Start an engine to begin chatting"
             }
             className="max-h-[220px] min-h-[52px] w-full resize-none bg-transparent px-3 py-2.5 text-[13.5px] leading-6 text-slate-100 outline-none placeholder:text-slate-600 disabled:cursor-not-allowed"
           />

@@ -89,7 +89,7 @@ export function EngineLogsPanel({ engine }: { engine: EngineController }) {
         }
       : null;
     const text = [
-      "Studio for Janas diagnostics",
+      "MikroTitan diagnostics",
       `app_version: ${appVersion}`,
       `snapshot: ${JSON.stringify(engine.snapshot, null, 2)}`,
       `active_engine: ${JSON.stringify(engine.active, null, 2)}`,

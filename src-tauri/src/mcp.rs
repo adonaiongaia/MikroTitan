@@ -268,7 +268,7 @@ impl McpSession {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
                 "clientInfo": {
-                    "name": "Studio for Janas",
+                    "name": "MikroTitan",
                     "version": env!("CARGO_PKG_VERSION")
                 }
             }),

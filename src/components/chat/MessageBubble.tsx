@@ -424,7 +424,9 @@ export function MessageBubble({
       <Logo className="mt-0.5 h-7 w-7 shrink-0" />
       <div className="min-w-0 flex-1">
         <div className="mb-1.5 flex items-center gap-2">
-          <span className="text-[11px] font-semibold text-slate-300">Janas</span>
+          <span className="text-[11px] font-semibold text-slate-300">
+            MikroTitan
+          </span>
           <span className="text-[10px] text-slate-600">
             {timeLabel(message.created_at)}
           </span>

@@ -1,10 +1,10 @@
 # Changelog
 
-All notable changes to Studio for Janas are documented in this file.
+All notable changes to MikroTitan are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning. Release tags use the `janas-studio-vX.Y.Z` form; the early unversioned `janas-studio` tag predates that convention.
 
-## [Unreleased]
+## [0.2.0] - 2026-11-25
 
 ### Added
 
@@ -44,7 +44,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **The editable system prompt is now per chat.** A saved default seeds new chats and chats without an override; editing the prompt in Engine Settings no longer silently changes every conversation. Reset clears the active chat's prompt and the saved default.
 - **Agent approval copy names remembered commands.** The policy descriptions now state that a remembered shell command can skip its prompt, and the approval checkbox explains the extra-argument match.
 - **Settings and approval-rule files are owner-only on Unix, including their temporary copies.** `settings.json` (local API key and Hugging Face token) and `agent-approvals.json` are written with mode `0600`; the `.json.tmp` file is created with that mode from the outset, and a failed rename falls back to a direct write followed by the owner-only restriction.
-- Renamed the app to **Studio for Janas** and added an explicit independent, unofficial disclaimer in the README and the About panel. The engine attribution now reads **Janas-LLM by Maurizio Cammalleri** with a link to the upstream project.
+- Rebranded the app from **Studio for Janas** to **MikroTitan** and bumped the version to 0.2.0. The AppImage artifact is now `MikroTitan_0.2.0_amd64.AppImage`, the bundled licence and third-party notice live under `usr/share/licenses/mikrotitan/` and `usr/share/doc/mikrotitan/`, and the window title, app icons and in-app mark use the new branding. Janas-LLM, llama.cpp, their CLI names and their environment variables keep their upstream names.
+- Kept the explicit independent, unofficial disclaimer in the README and the About panel. The engine attribution remains **Janas-LLM by Maurizio Cammalleri** with a link to the upstream project.
 - Removed the pinned Janas binaries from the repository and the AppImage. Startup setup now downloads `janas-server`, `janas-chat`, `gguf2jns` and `janas-mcp` from the current `prabanta-dev/janas` release, and bare tool names such as `gguf2jns` and `janas-mcp` resolve from the managed `bin` folder.
 - Manifest license metadata now reports `GPL-3.0-only`, matching the repository's GPL-3.0 `LICENSE`.
 - AppImage builds now bundle the full GPL-3.0 text at `usr/share/licenses/studio-for-janas/LICENSE`; `bundle.licenseFile` also points at the repository `LICENSE`. A `THIRD_PARTY_NOTICES.md` with the Janas-LLM copyright, licence and source link ships at `usr/share/doc/studio-for-janas/`.

@@ -72,7 +72,7 @@ export function Sidebar({
         <Logo className="h-9 w-9" />
         <div className="min-w-0">
           <p className="text-sm font-semibold tracking-tight text-white">
-            Studio for Janas
+            MikroTitan
           </p>
           <p className="text-[10px] uppercase tracking-[0.18em] text-slate-600">
             local inference
