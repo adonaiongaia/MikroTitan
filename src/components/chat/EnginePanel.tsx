@@ -23,6 +23,7 @@ import {
 import { api } from "../../lib/api";
 import { cn } from "../../lib/cn";
 import { basename, errorMessage, formatBytes } from "../../lib/format";
+import { shortcutLabel } from "../../lib/shortcuts";
 import { useBackendCapabilities } from "../../hooks/useBackendCapabilities";
 import { SAMPLING_PARAMETERS } from "../../lib/backendCapabilities";
 import type {
@@ -236,6 +237,7 @@ export function EnginePanel({
           type="button"
           onClick={onToggle}
           className="rounded-lg p-1.5 text-slate-500 transition hover:bg-white/5 hover:text-slate-200"
+          title={`Expand engine settings (${shortcutLabel("toggle-engine")})`}
           aria-label="Expand engine settings"
         >
           <ChevronLeft className="h-4 w-4" />
@@ -300,6 +302,7 @@ export function EnginePanel({
           type="button"
           onClick={onToggle}
           className="rounded-lg p-1 text-slate-500 transition hover:bg-white/5 hover:text-slate-200"
+          title={`Collapse engine settings (${shortcutLabel("toggle-engine")})`}
           aria-label="Collapse engine settings"
         >
           <ChevronRight className="h-3.5 w-3.5" />

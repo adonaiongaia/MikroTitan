@@ -9,6 +9,7 @@ import {
   X,
 } from "lucide-react";
 
+import { useKeyboardShortcuts } from "../../hooks/useKeyboardShortcuts";
 import { api } from "../../lib/api";
 import { cn } from "../../lib/cn";
 import { errorMessage, formatBytes, formatParameters } from "../../lib/format";
@@ -50,6 +51,18 @@ export function CompanionDrawer({
   const [testing, setTesting] = useState(false);
   const [using, setUsing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Escape closes this drawer before the global shortcut fallback can cancel
+  // a background chat stream. Activation is not interrupted.
+  useKeyboardShortcuts(
+    {
+      dismiss: () => {
+        if (!using) onClose();
+        return true;
+      },
+    },
+    { priority: 90 },
+  );
 
   const visionCandidates = useMemo(() => {
     const map = new Map<string, CompanionCandidate>();

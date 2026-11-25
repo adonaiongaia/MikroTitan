@@ -171,6 +171,13 @@ export function KnowledgeVaultView() {
         await loadCollections();
         setRefreshToken((value) => value + 1);
       } catch (err) {
+        // A rejected invoke might not have emitted a progress event; clear the
+        // optimistic job so the vault cannot stay stuck on "Collecting files…".
+        setJobs((previous) => {
+          const next = { ...previous };
+          delete next[collectionId];
+          return next;
+        });
         setError(errorMessage(err));
       } finally {
         setBusy(null);

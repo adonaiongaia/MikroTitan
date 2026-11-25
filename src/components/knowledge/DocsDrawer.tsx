@@ -1,4 +1,3 @@
-import { useEffect } from "react";
 import {
   CheckSquare,
   Database,
@@ -63,15 +62,6 @@ export function DocsDrawer({
   onOpenVault,
   onRefresh,
 }: DocsDrawerProps) {
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [open, onClose]);
-
   if (!open) return null;
 
   const selected = new Set(selectedIds);

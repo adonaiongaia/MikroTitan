@@ -23,6 +23,7 @@ import {
 import { api } from "../../lib/api";
 import { cn } from "../../lib/cn";
 import { errorMessage, formatCount } from "../../lib/format";
+import { shortcutLabel } from "../../lib/shortcuts";
 import type { WhisperStatus } from "../../types";
 import { Button } from "../ui/Button";
 import { ProgressBar } from "../ui/ProgressBar";
@@ -635,6 +636,11 @@ export function Composer({
             disabled={!ready || streaming}
             onChange={(event) => onChange(event.target.value)}
             onKeyDown={(event) => {
+              // Mod+Enter belongs to the global shortcut manager so it works
+              // from anywhere; plain Enter still sends from the textarea.
+              if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+                return;
+              }
               if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();
                 if (ready && !streaming) onSend();
@@ -693,7 +699,7 @@ export function Composer({
                     : "border-white/10 bg-white/5 text-slate-500 hover:text-slate-300",
                 )}
                 aria-pressed={agentMode}
-                title="Let the local agent plan, call tools and report each step"
+                title={`Let the local agent plan, call tools and report each step (${shortcutLabel("toggle-agent")})`}
               >
                 <Bot className="h-3 w-3" />
                 {agentMode ? "Agent on" : "Agent"}
@@ -708,7 +714,7 @@ export function Composer({
                     : "border-white/10 bg-white/5 text-slate-500 hover:text-slate-300",
                 )}
                 aria-pressed={internet}
-                title="Search the web and bundle the top pages into the prompt"
+                title={`Search the web and bundle the top pages into the prompt (${shortcutLabel("toggle-internet")})`}
               >
                 <Globe className="h-3 w-3" />
                 {internet ? "Web on" : "Web off"}
@@ -865,6 +871,7 @@ export function Composer({
                   size="sm"
                   variant="danger"
                   onClick={onStop}
+                  title="Stop generating (Esc)"
                   icon={<Square className="h-3 w-3" />}
                 >
                   Stop
@@ -875,6 +882,7 @@ export function Composer({
                   variant="primary"
                   disabled={!ready || !value.trim()}
                   onClick={onSend}
+                  title={`Send (${shortcutLabel("send")})`}
                   icon={<ArrowUp className="h-3.5 w-3.5" />}
                 >
                   Send

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Loader2, Play, Square, X } from "lucide-react";
 
 import { BenchmarkView } from "./components/benchmark/BenchmarkView";
@@ -11,6 +11,7 @@ import { DownloadsTray } from "./components/models/DownloadsTray";
 import { ModelLibraryView } from "./components/models/ModelLibraryView";
 import { ModelsView } from "./components/models/ModelsView";
 import { SettingsView } from "./components/settings/SettingsView";
+import { ShortcutsModal } from "./components/ShortcutsModal";
 import { Sidebar } from "./components/Sidebar";
 import { Button } from "./components/ui/Button";
 import { StatusPill } from "./components/ui/StatusPill";
@@ -18,6 +19,7 @@ import { useChat } from "./hooks/useChat";
 import { useConverter } from "./hooks/useConverter";
 import { useDownloads } from "./hooks/useDownloads";
 import { useEngine } from "./hooks/useEngine";
+import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { api } from "./lib/api";
 import { engineLabel } from "./lib/engine-controller";
 import { errorMessage } from "./lib/format";
@@ -68,7 +70,41 @@ export default function App() {
   const benchmark = useBenchmark();
   const [view, setView] = useState<ViewId>("chat");
   const [toast, setToast] = useState<string | null>(null);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  // Mod+K from another view has to switch to chat and then hand focus down to
+  // the rail. The rail consumes this token after focusing, so a remount cannot
+  // replay an old request and steal focus.
+  const [focusSearchSignal, setFocusSearchSignal] = useState(0);
+  // The rail clears the request after focusing so remounting Chat cannot
+  // replay an old Mod+K and steal focus.
+  const consumeSearchFocus = useCallback(() => setFocusSearchSignal(0), []);
   const closing = useRef(false);
+
+  // App-wide shortcuts. ChatView owns the rail, panel and composer bindings;
+  // these also work from every other view.
+  useKeyboardShortcuts(
+    {
+      "new-chat": () => {
+        // createSession leaves system_prompt unset, which makes the new chat
+        // follow the saved default prompt in ChatView.
+        chat.newChat();
+        setView("chat");
+      },
+      "search-chats": () => {
+        setView("chat");
+        setFocusSearchSignal((value) => value + 1);
+      },
+      "open-knowledge": () => setView("knowledge"),
+      "open-models": () => setView("models"),
+      "open-settings": () => setView("settings"),
+      "open-shortcuts": () => setShortcutsOpen(true),
+      dismiss: () => {
+        if (!chat.busy) return false;
+        void chat.stop();
+      },
+    },
+    { priority: 50 },
+  );
 
   // A debounced save can still be waiting when the window closes. Flush the
   // dirty sessions on blur/visibility and, for Tauri, wait for the write before
@@ -190,7 +226,12 @@ export default function App() {
 
   return (
     <div className="flex h-screen overflow-hidden bg-ink-950 text-slate-200">
-      <Sidebar view={view} onNavigate={setView} engine={engine} />
+      <Sidebar
+        view={view}
+        onNavigate={setView}
+        engine={engine}
+        onOpenShortcuts={() => setShortcutsOpen(true)}
+      />
 
       <main className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-[68px] shrink-0 items-center justify-between gap-4 border-b border-white/5 bg-ink-900/30 px-6 backdrop-blur">
@@ -251,6 +292,8 @@ export default function App() {
             <ChatView
               engine={engine}
               chat={chat}
+              focusSearchSignal={focusSearchSignal}
+              onFocusSearchHandled={consumeSearchFocus}
               onOpenKnowledge={() => setView("knowledge")}
               onOpenSettings={() => setView("settings")}
             />
@@ -285,6 +328,11 @@ export default function App() {
         onPause={(id) => void downloads.pause(id)}
         onResume={(id) => void downloads.resume(id)}
         onClearFinished={downloads.clearFinished}
+      />
+
+      <ShortcutsModal
+        open={shortcutsOpen}
+        onClose={() => setShortcutsOpen(false)}
       />
 
       {toast ? (

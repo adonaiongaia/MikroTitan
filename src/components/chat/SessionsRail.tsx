@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import {
   Brain,
@@ -19,6 +19,7 @@ import {
 
 import { cn } from "../../lib/cn";
 import { errorMessage } from "../../lib/format";
+import { shortcutLabel } from "../../lib/shortcuts";
 import type { MemoryController } from "../../lib/memory";
 import type { ChatSession } from "../../types";
 
@@ -27,6 +28,10 @@ interface SessionsRailProps {
   activeId: string;
   streamingSessionId: string | null;
   collapsed: boolean;
+  /** Mod+K requests a search focus; each new value is handled once. */
+  focusSearchSignal: number;
+  /** Acknowledges the request so it is not replayed on the next mount. */
+  onFocusSearchHandled: () => void;
   onToggle: () => void;
   onSelect: (id: string) => void;
   onNew: () => void;
@@ -55,6 +60,8 @@ export function SessionsRail({
   activeId,
   streamingSessionId,
   collapsed,
+  focusSearchSignal,
+  onFocusSearchHandled,
   onToggle,
   onSelect,
   onNew,
@@ -73,6 +80,26 @@ export function SessionsRail({
   const [railError, setRailError] = useState<string | null>(null);
   const [importing, setImporting] = useState(false);
   const [exportingId, setExportingId] = useState<string | null>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+
+  // A focus request can arrive while the memory tab is active or the rail is
+  // collapsed. Switch or expand first; the effect re-runs when the search input
+  // is on screen and only then spends the request.
+  useEffect(() => {
+    if (!focusSearchSignal) return;
+    if (tab !== "chats") {
+      setTab("chats");
+      return;
+    }
+    if (collapsed) return;
+    const input = searchRef.current;
+    if (!input) return;
+    input.focus();
+    input.select();
+    // Clearing the request is what stops a later Chat remount from replaying
+    // it and pulling focus from the composer.
+    onFocusSearchHandled();
+  }, [collapsed, focusSearchSignal, onFocusSearchHandled, tab]);
 
   const visible = useMemo(() => {
     const query = search.trim().toLowerCase();
@@ -149,6 +176,7 @@ export function SessionsRail({
           type="button"
           onClick={onToggle}
           className="rounded-lg p-1.5 text-slate-500 transition hover:bg-white/5 hover:text-slate-200"
+          title={`Expand chats (${shortcutLabel("toggle-sessions")})`}
           aria-label="Expand chats"
         >
           <ChevronRight className="h-4 w-4" />
@@ -158,6 +186,7 @@ export function SessionsRail({
           onClick={onNew}
           disabled={loading}
           className="rounded-lg p-1.5 text-slate-500 transition hover:bg-white/5 hover:text-acid-300 disabled:opacity-40"
+          title={`New chat (${shortcutLabel("new-chat")})`}
           aria-label="New chat"
         >
           <Plus className="h-4 w-4" />
@@ -205,6 +234,7 @@ export function SessionsRail({
           type="button"
           onClick={onToggle}
           className="rounded-lg p-1 text-slate-500 transition hover:bg-white/5 hover:text-slate-200"
+          title={`Collapse chats (${shortcutLabel("toggle-sessions")})`}
           aria-label="Collapse chats"
         >
           <ChevronLeft className="h-3.5 w-3.5" />
@@ -217,9 +247,12 @@ export function SessionsRail({
             <div className="relative">
               <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3 w-3 -translate-y-1/2 text-slate-600" />
               <input
+                ref={searchRef}
                 value={search}
                 onChange={(event) => setSearch(event.target.value)}
                 placeholder="Search chats…"
+                title={`Search chats (${shortcutLabel("search-chats")})`}
+                aria-label="Search chats"
                 className="field !py-1.5 pl-7 text-[10.5px]"
               />
             </div>
@@ -228,6 +261,7 @@ export function SessionsRail({
                 type="button"
                 onClick={onNew}
                 disabled={loading}
+                title={`New chat (${shortcutLabel("new-chat")})`}
                 className="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-dashed border-white/10 px-2 py-1.5 text-[10.5px] text-slate-400 transition hover:border-acid-400/30 hover:text-acid-200 disabled:opacity-40"
               >
                 <Plus className="h-3.5 w-3.5" />

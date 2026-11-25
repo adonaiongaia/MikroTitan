@@ -562,16 +562,48 @@ impl KnowledgeStore {
         collection_id: &str,
         paths: &[String],
     ) -> AppResult<RagIndexSummary> {
+        let emit = |payload: &RagIndexProgress| {
+            if let Some(app) = app {
+                let _ = tauri::Emitter::emit(app, "rag://index-progress", payload);
+            }
+        };
+        self.index_paths_with_progress(&emit, collection_id, paths)
+    }
+
+    /// The same job, with every progress event routed through `emit`. Tests use
+    /// this to observe the terminal error without constructing a Tauri runtime.
+    fn index_paths_with_progress(
+        &self,
+        emit: &dyn Fn(&RagIndexProgress),
+        collection_id: &str,
+        paths: &[String],
+    ) -> AppResult<RagIndexSummary> {
         let mut collection = self.collection(collection_id)?;
         let cancel = self.begin_job(collection_id)?;
-        let result = self.index_inner(app, &mut collection, paths, cancel);
+        let result = self.index_inner(emit, &mut collection, paths, cancel);
+        if let Err(error) = &result {
+            // Every job ends with a terminal phase. Without this, an early error
+            // (for example a folder with no supported files) leaves the vault
+            // showing an active "Collecting files…" job forever, which disables
+            // its Add and Re-index buttons.
+            emit(&RagIndexProgress {
+                collection_id: collection_id.to_string(),
+                phase: "error".into(),
+                files_total: 0,
+                files_done: 0,
+                chunks_done: 0,
+                current_file: String::new(),
+                percent: 0.0,
+                message: error.to_string(),
+            });
+        }
         self.finish_job(collection_id);
         result
     }
 
     fn index_inner(
         &self,
-        app: Option<&tauri::AppHandle>,
+        emit: &dyn Fn(&RagIndexProgress),
         collection: &mut KnowledgeCollection,
         paths: &[String],
         cancel: Arc<AtomicBool>,
@@ -592,8 +624,7 @@ impl KnowledgeStore {
             ));
         }
 
-        emit_progress(
-            app,
+        emit(
             &RagIndexProgress {
                 collection_id: collection_id.clone(),
                 phase: "scanning".into(),
@@ -667,8 +698,7 @@ impl KnowledgeStore {
             }
             let display = path.to_string_lossy().to_string();
             let relative = relative_for(path, &requested, &collection.source_paths);
-            emit_progress(
-                app,
+            emit(
                 &RagIndexProgress {
                     collection_id: collection_id.clone(),
                     phase: "indexing".into(),
@@ -794,8 +824,7 @@ impl KnowledgeStore {
                 .count(),
         );
 
-        emit_progress(
-            app,
+        emit(
             &RagIndexProgress {
                 collection_id: collection_id.clone(),
                 phase: "writing".into(),
@@ -841,8 +870,7 @@ impl KnowledgeStore {
             cancelled: cancelled || cancel.load(Ordering::SeqCst),
             warnings,
         };
-        emit_progress(
-            app,
+        emit(
             &RagIndexProgress {
                 collection_id,
                 phase: if summary.cancelled { "cancelled".into() } else { "done".into() },
@@ -2504,12 +2532,6 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> AppResult<()> {
     }
 }
 
-fn emit_progress(app: Option<&tauri::AppHandle>, payload: &RagIndexProgress) {
-    if let Some(app) = app {
-        let _ = tauri::Emitter::emit(app, "rag://index-progress", payload);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2860,6 +2882,32 @@ mod tests {
     }
 
     #[test]
+    fn index_error_emits_a_terminal_error_event() {
+        let (store, root) = store("index-error");
+        let collection = store.create("Empty", "", &[]).expect("create");
+        let dir = root.join("empty");
+        fs::create_dir_all(&dir).expect("empty directory");
+        let events = std::cell::RefCell::new(Vec::new());
+
+        let error = store
+            .index_paths_with_progress(
+                &|payload: &RagIndexProgress| events.borrow_mut().push(payload.clone()),
+                &collection.id,
+                &[dir.to_string_lossy().to_string()],
+            )
+            .expect_err("an empty folder must fail the job");
+
+        let events = events.borrow();
+        assert_eq!(events.len(), 2, "scanning then one terminal event");
+        assert_eq!(events[0].phase, "scanning");
+        let terminal = events.last().expect("terminal event");
+        assert_eq!(terminal.phase, "error");
+        assert_eq!(terminal.collection_id, collection.id);
+        assert_eq!(terminal.message, error.to_string());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn pdf_text_is_extracted_and_scans_are_reported() {
         // A tiny uncompressed PDF with one text object.
         let pdf = b"%PDF-1.4\n1 0 obj\n<< /Length 44 >>\nstream\nBT /F1 12 Tf (Hello vault) Tj ET\nendstream\nendobj\n%%EOF";
@@ -2893,7 +2941,7 @@ mod tests {
         flag.store(true, Ordering::SeqCst);
         let mut owned = collection.clone();
         let summary = store
-            .index_inner(None, &mut owned, &[dir.to_string_lossy().to_string()], flag)
+            .index_inner(&|_: &RagIndexProgress| {}, &mut owned, &[dir.to_string_lossy().to_string()], flag)
             .expect("index");
         assert!(summary.cancelled);
         assert_eq!(summary.files_indexed, 0);

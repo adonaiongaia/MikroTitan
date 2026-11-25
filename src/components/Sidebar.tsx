@@ -5,6 +5,7 @@ import {
   Cpu,
   Database,
   Gauge,
+  Keyboard,
   Loader2,
   MessageSquare,
   Play,
@@ -16,6 +17,7 @@ import {
 import { cn } from "../lib/cn";
 import { engineLabel } from "../lib/engine-controller";
 import { basename } from "../lib/format";
+import { shortcutKeys, shortcutLabel } from "../lib/shortcuts";
 import type { EngineController } from "../hooks/useEngine";
 import type { ViewId } from "../types";
 import { Logo } from "./Logo";
@@ -26,6 +28,7 @@ interface SidebarProps {
   view: ViewId;
   onNavigate: (view: ViewId) => void;
   engine: EngineController;
+  onOpenShortcuts: () => void;
 }
 
 const NAV: Array<{
@@ -54,7 +57,12 @@ const NAV: Array<{
   { id: "settings", label: "Settings", hint: "Runtime and paths", icon: Settings },
 ];
 
-export function Sidebar({ view, onNavigate, engine }: SidebarProps) {
+export function Sidebar({
+  view,
+  onNavigate,
+  engine,
+  onOpenShortcuts,
+}: SidebarProps) {
   const { snapshot, busy } = engine;
   const running = snapshot.status !== "disconnected";
 
@@ -168,6 +176,21 @@ export function Sidebar({ view, onNavigate, engine }: SidebarProps) {
             {running ? "Stop engine" : "Start engine"}
           </Button>
         </div>
+
+        <button
+          type="button"
+          onClick={onOpenShortcuts}
+          title={`Keyboard shortcuts (${shortcutLabel("open-shortcuts")})`}
+          className="flex w-full items-center justify-between rounded-xl border border-white/5 bg-white/[0.02] px-3 py-2 text-[10.5px] text-slate-500 transition hover:border-white/10 hover:text-slate-200"
+        >
+          <span className="flex items-center gap-2">
+            <Keyboard className="h-3.5 w-3.5" />
+            Keyboard shortcuts
+          </span>
+          <span className="font-mono text-[9px] text-slate-600">
+            {shortcutKeys("open-shortcuts")[0]}
+          </span>
+        </button>
 
         <p className="px-1 text-[10px] leading-4 text-slate-600">
           {engine.active?.kind === "llama"

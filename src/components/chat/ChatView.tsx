@@ -18,6 +18,7 @@ import {
   DEFAULT_ENGINE_PREFERENCES,
   useEnginePreferences,
 } from "../../hooks/useEnginePreferences";
+import { useKeyboardShortcuts } from "../../hooks/useKeyboardShortcuts";
 import { usePersistentState } from "../../hooks/usePersistentState";
 import { usePersonas } from "../../hooks/usePersonas";
 import { useSettings } from "../../hooks/useSettings";
@@ -90,6 +91,10 @@ import { ToolApprovalCard } from "./ToolApprovalCard";
 interface ChatViewProps {
   engine: EngineController;
   chat: ChatController;
+  /** Bumped by Mod+K so the sessions rail search takes focus. */
+  focusSearchSignal: number;
+  /** Clears the request once the rail has focused its search field. */
+  onFocusSearchHandled: () => void;
   /** Opens the Knowledge Vault view from the Docs drawer. */
   onOpenKnowledge: () => void;
   /** Opens Settings so the mic can install Whisper. */
@@ -117,6 +122,8 @@ const SUGGESTIONS = [
 export function ChatView({
   engine,
   chat,
+  focusSearchSignal,
+  onFocusSearchHandled,
   onOpenKnowledge,
   onOpenSettings,
 }: ChatViewProps) {
@@ -285,6 +292,12 @@ export function ChatView({
   useEffect(() => {
     if (artifactPaneOpen) setEngineCollapsed(true);
   }, [artifactPaneOpen, setEngineCollapsed]);
+
+  // Mod+K may arrive while the rail is collapsed; expanding it lets the rail
+  // itself place focus on the search field.
+  useEffect(() => {
+    if (focusSearchSignal) setSessionsCollapsed(false);
+  }, [focusSearchSignal, setSessionsCollapsed]);
 
   const project = chat.project;
   const [projectBusy, setProjectBusy] = useState(false);
@@ -999,6 +1012,37 @@ export function ChatView({
     workspaceRoot,
   ]);
 
+  // Chat-local shortcuts run before the app-wide handlers. Escape dismisses
+  // the drawers in priority order and declines when none is open, so the
+  // global handler can stop the stream instead.
+  useKeyboardShortcuts(
+    {
+      "toggle-sessions": () => setSessionsCollapsed((value) => !value),
+      "toggle-engine": () => setEngineCollapsed((value) => !value),
+      "toggle-agent": () => agent.update("enabled", !agent.preferences.enabled),
+      "toggle-internet": () => update("internet", !preferences.internet),
+      send: () => {
+        void handleSend();
+      },
+      dismiss: () => {
+        if (docsOpen) {
+          setDocsOpen(false);
+          return true;
+        }
+        if (sourceChunk) {
+          setSourceChunk(null);
+          return true;
+        }
+        if (mcpOpen) {
+          setMcpOpen(false);
+          return true;
+        }
+        return false;
+      },
+    },
+    { priority: 60 },
+  );
+
   const inputRef = useRef(input);
   inputRef.current = input;
 
@@ -1350,6 +1394,8 @@ export function ChatView({
         activeId={chat.activeId}
         streamingSessionId={chat.streamingSessionId}
         collapsed={sessionsCollapsed}
+        focusSearchSignal={focusSearchSignal}
+        onFocusSearchHandled={onFocusSearchHandled}
         onToggle={() => setSessionsCollapsed((value) => !value)}
         onSelect={chat.setActiveId}
         onNew={chat.newChat}

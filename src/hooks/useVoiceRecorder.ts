@@ -5,6 +5,15 @@ import { errorMessage } from "../lib/format";
 
 /** Canonical sample rate whisper.cpp expects. */
 export const VOICE_SAMPLE_RATE = 16_000;
+
+// Global shortcuts defer Enter and Escape to the composer while a capture is
+// live. A set (rather than a boolean) keeps the state correct if a recorder is
+// torn down after another one starts.
+const activeRecorders = new Set<symbol>();
+
+export function isVoiceRecordingActive(): boolean {
+  return activeRecorders.size > 0;
+}
 const LEVEL_BARS = 40;
 const MIN_RECORDING_MS = 250;
 // WebKitGTK opens the first enumerated input instead of the desktop default.
@@ -220,6 +229,19 @@ export function useVoiceRecorder() {
   const generationRef = useRef(0);
   const recordingRef = useRef(false);
   const stateRef = useRef<VoiceRecorderState>("idle");
+  const recorderId = useRef(Symbol("voice-recorder"));
+
+  useEffect(() => {
+    const id = recorderId.current;
+    if (state === "recording" || state === "requesting") {
+      activeRecorders.add(id);
+    } else {
+      activeRecorders.delete(id);
+    }
+    return () => {
+      activeRecorders.delete(id);
+    };
+  }, [state]);
 
   const updateState = useCallback((next: VoiceRecorderState) => {
     stateRef.current = next;

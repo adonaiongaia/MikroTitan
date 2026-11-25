@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Check, Copy, FileCode2, FolderOpen, Hash, X } from "lucide-react";
 
 import { formatCount, formatBytes } from "../../lib/format";
@@ -17,15 +17,6 @@ interface RagSourceDrawerProps {
  */
 export function RagSourceDrawer({ chunk, onClose }: RagSourceDrawerProps) {
   const [copied, setCopied] = useState<"path" | "content" | null>(null);
-
-  useEffect(() => {
-    if (!chunk) return;
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [chunk, onClose]);
 
   if (!chunk) return null;
 
