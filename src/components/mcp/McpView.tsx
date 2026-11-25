@@ -52,6 +52,15 @@ function splitArgs(input: string): string[] {
   return args;
 }
 
+function sameLaunch(left: McpServerConfig, right: McpServerConfig): boolean {
+  return (
+    left.command === right.command &&
+    left.args.join("\u0000") === right.args.join("\u0000") &&
+    (left.env ?? "") === (right.env ?? "") &&
+    (left.cwd ?? "") === (right.cwd ?? "")
+  );
+}
+
 function envNames(input: string | undefined): string[] {
   return (input ?? "")
     .split("\n")
@@ -132,12 +141,7 @@ export function McpView() {
     };
     // Only a different launch definition invalidates the cached schema cost;
     // renaming a server must not spawn it again.
-    const launchChanged =
-      !existing ||
-      existing.command !== saved.command ||
-      existing.args.join("\u0000") !== saved.args.join("\u0000") ||
-      (existing.env ?? "") !== saved.env ||
-      (existing.cwd ?? "") !== saved.cwd;
+    const launchChanged = !existing || !sameLaunch(existing, saved);
     if (existing && !launchChanged) {
       saved.toolCount = existing.toolCount;
       saved.toolSchemaTokens = existing.toolSchemaTokens;
@@ -181,9 +185,11 @@ export function McpView() {
       // Cache the schema cost with the server so the chat breakdown can show
       // it without spawning the server again. A failed probe has no usable
       // tools, so it clears any stale count.
+      // Ignore a result for a launch definition that has since been edited;
+      // its counts belong to the old command line, not the saved server.
       setServers((previous) =>
         previous.map((candidate) =>
-          candidate.id === server.id
+          candidate.id === server.id && sameLaunch(candidate, server)
             ? {
                 ...candidate,
                 toolCount: result.ok ? result.tools.length : 0,

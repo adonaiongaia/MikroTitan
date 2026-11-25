@@ -1,26 +1,17 @@
-import { useEffect, useState } from "react";
+import { useSyncExternalStore } from "react";
+
+import { persistentStore } from "../lib/persistentStore";
 
 /**
  * Persists small UI preferences (system prompt, sliders) locally. These are not
  * secrets and never leave the machine.
+ *
+ * Every hook for the same key shares one store, so a write made after this
+ * component unmounted (an in-flight probe, for example) is still saved and is
+ * seen by the view that is mounted.
  */
 export function usePersistentState<T>(key: string, initial: T) {
-  const [value, setValue] = useState<T>(() => {
-    try {
-      const stored = window.localStorage.getItem(key);
-      return stored ? (JSON.parse(stored) as T) : initial;
-    } catch {
-      return initial;
-    }
-  });
-
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(key, JSON.stringify(value));
-    } catch {
-      // Storage may be disabled; the app still works for this session.
-    }
-  }, [key, value]);
-
-  return [value, setValue] as const;
+  const store = persistentStore(key, initial);
+  const value = useSyncExternalStore(store.subscribe, store.get, store.get);
+  return [value, store.set] as const;
 }

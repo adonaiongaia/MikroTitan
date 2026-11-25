@@ -168,6 +168,9 @@ impl McpSession {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // A Python MCP server must start with its own interpreter's stdlib,
+        // not the launcher's bundled Python layout.
+        scrub_inherited_python_env(&mut command);
         if !env.is_empty() {
             command.envs(env);
         }
@@ -684,6 +687,17 @@ pub async fn mcp_probe(server: McpServerSpec) -> AppResult<McpProbe> {
         .map_err(|err| AppError::message(format!("The MCP probe stopped: {err}")))
 }
 
+/// Remove the interpreter-locating variables an MCP child would inherit from
+/// its launcher. AppImages and Python-enabled launchers export PYTHONHOME and
+/// PYTHONPATH for their own bundled interpreter; a stdio server that runs the
+/// system `python3` then fails with "No module named 'encodings'". The
+/// per-server environment is applied after this, so a server that needs custom
+/// values can still set them explicitly.
+fn scrub_inherited_python_env(command: &mut Command) {
+    command.env_remove("PYTHONHOME");
+    command.env_remove("PYTHONPATH");
+}
+
 fn parse_env(input: &str) -> Result<Vec<(String, String)>, String> {
     let mut values = Vec::new();
     for (index, raw) in input.lines().enumerate() {
@@ -944,5 +958,46 @@ done
             .expect("tool call");
         assert_eq!(result["content"][0]["text"], "echo ok");
         let _ = std::fs::remove_file(script);
+    }
+
+    #[test]
+    fn mcp_children_drop_inherited_python_environment() {
+        let mut command = Command::new("python3");
+        command.env("PYTHONHOME", "/bundle/python");
+        command.env("PYTHONPATH", "/bundle/site-packages");
+        scrub_inherited_python_env(&mut command);
+
+        let envs: Vec<(String, Option<String>)> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(envs.contains(&("PYTHONHOME".to_string(), None)));
+        assert!(envs.contains(&("PYTHONPATH".to_string(), None)));
+    }
+
+    #[test]
+    fn explicit_server_environment_can_restore_python_variables() {
+        let mut command = Command::new("python3");
+        scrub_inherited_python_env(&mut command);
+        command.env("PYTHONPATH", "/srv/tools");
+
+        let envs: Vec<(String, Option<String>)> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(envs.contains(&(
+            "PYTHONPATH".to_string(),
+            Some("/srv/tools".to_string())
+        )));
     }
 }
