@@ -43,19 +43,19 @@ const ROWS: MetricRow[] = [
   {
     key: "ssd_bytes",
     label: "SSD bytes read (generation)",
-    lower: true,
+    lower: false,
     format: (value) => bytes(value),
   },
   {
     key: "ssd_mbps",
     label: "Peak SSD read (generation)",
-    lower: true,
+    lower: false,
     format: (value) => `${value.toFixed(1)} MB/s`,
   },
   {
     key: "iops",
     label: "Peak read calls/s",
-    lower: true,
+    lower: false,
     format: (value) => Math.round(value).toLocaleString(),
   },
 ];
@@ -176,8 +176,8 @@ export function BenchmarkMatrix({
     {
       key: "ssd_mbps" as MetricKey,
       title: "SSD throughput",
-      note: "generation only · lower peak",
-      lower: true,
+      note: "generation only · more streaming",
+      lower: false,
       icon: HardDrive,
       format: (value: number) => `${value.toFixed(1)} MB/s`,
     },
@@ -519,7 +519,9 @@ export function BenchmarkMatrix({
             Thinking is disabled so the token cap normally bounds the whole
             reply; an overrun is reported under warnings. SSD and read-call
             figures cover measured generation only: model loading is excluded,
-            and cached reads count as calls but not SSD bytes.
+            and cached reads count as calls but not SSD bytes. More streaming
+            wins the SSD rows: the engine that reads the most from the drive
+            ranks first there.
           </p>
           <pre className="max-h-56 overflow-y-auto whitespace-pre-wrap rounded-xl border border-white/10 bg-ink-950/70 p-3 font-mono text-[10px] leading-5 text-slate-400">
             {suite.workload.prompt}

@@ -325,48 +325,55 @@ impl<R: Runtime> EngineRunner<R> for LlamaRunner {
     }
 }
 
-/// llama.cpp b12728 added automatic device fitting, which can select Vulkan
-/// even when `--n-gpu-layers 0` is explicit. That defeats the CPU-only target
-/// and, for sliding-window models, hits the scheduler abort below before the
-/// server binds its port. Keep zero-layer launches on the CPU explicitly; an
-/// explicit `--device` in Extra llama arguments still wins.
+/// True when Extra llama arguments already set one of `flags`, in either the
+/// `--flag value` or the `--flag=value` spelling.
+fn sets_extra_flag(raw: &str, flags: &[&str]) -> bool {
+    shell_words::split(raw)
+        .unwrap_or_default()
+        .iter()
+        .any(|argument| {
+            flags.iter().any(|flag| {
+                argument == flag
+                    || argument.strip_prefix(flag).is_some_and(|rest| rest.starts_with('='))
+            })
+        })
+}
+
+/// True when `--list-devices` names an accelerator that automatic fitting
+/// could pick. A build that lists no device can only run on the CPU.
+fn reports_gpu_device(devices: &str) -> bool {
+    devices.lines().any(|line| {
+        let line = line.to_ascii_lowercase();
+        ["vulkan", "cuda", "rocm", "metal", "mtl", "sycl", "opencl", "gpu"]
+            .iter()
+            .any(|backend| line.contains(backend))
+    })
+}
+
+/// llama.cpp b12728's automatic device fitting can put the KV cache of a
+/// zero-GPU-layer model into a Vulkan buffer and abort in the scheduler before
+/// the server binds its port. `--device none` is the launch flag that pins the
+/// process to the CPU, so use it whenever the probe found an accelerator. An
+/// explicit `--device` in Extra llama arguments still wins, and a CPU-only host
+/// gets neither the flag nor the warning.
 fn guard_cpu_only_target(
     args: &mut Vec<String>,
     settings: &AppSettings,
     output: &ProbeOutput,
 ) -> Option<String> {
-    if settings.llama_gpu_layers > 0 {
+    if settings.llama_gpu_layers > 0
+        || !reports_gpu_device(&output.devices)
+        || !advertises(&output.help_text, "--device")
+        || sets_extra_flag(&settings.llama_extra_args, &["-dev", "--device"])
+    {
         return None;
     }
-    let explicit_device = shell_words::split(&settings.llama_extra_args)
-        .unwrap_or_default()
-        .iter()
-        .any(|argument| {
-            matches!(argument.as_str(), "-dev" | "--device")
-                || argument.starts_with("--device=")
-                || argument.starts_with("-dev=")
-        });
-    if explicit_device {
-        return None;
-    }
-
-    if advertises(&output.help_text, "--device") {
-        args.push("--device".into());
-        args.push("none".into());
-        return Some(
-            "This llama.cpp build can auto-select a GPU device even when GPU layers are 0. The launch was forced to the CPU with `--device none`; add an explicit `--device` in Extra llama arguments to override."
-                .into(),
-        );
-    }
-    if advertises(&output.help_text, "--fit") {
-        args.push("--fit".into());
-        args.push("off".into());
-        return Some(
-            "This llama.cpp build can auto-fit onto a GPU even when GPU layers are 0. Device fitting was disabled with `--fit off` so the target stays on the CPU."
-                .into(),
-        );
-    }
-    None
+    args.push("--device".into());
+    args.push("none".into());
+    Some(
+        "This llama.cpp build can auto-select a GPU device even when GPU layers are 0. The launch was forced to the CPU with `--device none`; add an explicit `--device` in Extra llama arguments to override."
+            .into(),
+    )
 }
 
 /// Last llama.cpp build whose Vulkan path scheduled the KV cache of
@@ -409,19 +416,17 @@ fn guard_vulkan_swa_kv_cache(
         return None;
     }
     // The user's own KV-cache or device flags always win over this fallback.
-    let explicit = shell_words::split(&settings.llama_extra_args)
-        .unwrap_or_default()
-        .iter()
-        .any(|argument| {
-            matches!(
-                argument.as_str(),
-                "-kvo" | "--kv-offload" | "-nkvo" | "--no-kv-offload" | "--device" | "-dev"
-            ) || argument.starts_with("--device=")
-                || argument.starts_with("-dev=")
-                || argument.starts_with("--kv-offload=")
-                || argument.starts_with("--no-kv-offload=")
-        });
-    if explicit {
+    if sets_extra_flag(
+        &settings.llama_extra_args,
+        &[
+            "-kvo",
+            "--kv-offload",
+            "-nkvo",
+            "--no-kv-offload",
+            "--device",
+            "-dev",
+        ],
+    ) {
         return None;
     }
     let model = settings::expand_home(settings.llama_model_path.trim());
@@ -1260,11 +1265,21 @@ mod tests {
         );
         assert!(warning.contains("auto-select"));
 
-        // An explicit device in Extra llama arguments wins.
-        settings.llama_extra_args = "--device Vulkan0".into();
-        let mut explicit = vec!["--model".to_string()];
-        assert!(guard_cpu_only_target(&mut explicit, &settings, &output).is_none());
-        assert_eq!(explicit, vec!["--model".to_string()]);
+        // Either spelling of an explicit device in Extra llama arguments wins.
+        for override_args in [
+            "--device Vulkan0",
+            "-dev Vulkan0",
+            "--device=Vulkan0",
+            "-dev=Vulkan0",
+        ] {
+            settings.llama_extra_args = override_args.into();
+            let mut explicit = vec!["--model".to_string()];
+            assert!(
+                guard_cpu_only_target(&mut explicit, &settings, &output).is_none(),
+                "{override_args} should disable the guard"
+            );
+            assert_eq!(explicit, vec!["--model".to_string()]);
+        }
 
         // A GPU target must not be forced back to the CPU.
         settings.llama_extra_args.clear();
@@ -1272,17 +1287,20 @@ mod tests {
         let mut gpu = vec!["--model".to_string()];
         assert!(guard_cpu_only_target(&mut gpu, &settings, &output).is_none());
 
-        // Builds without `--device` still get the narrower fit switch.
-        let mut fit_output = vulkan_probe(12_728);
-        fit_output.help_text = "--fit [on|off]".into();
+        // A CPU-only host gets neither the flag nor the warning.
         settings.llama_gpu_layers = 0;
-        let mut fit_args = vec!["--model".to_string()];
-        let warning = guard_cpu_only_target(&mut fit_args, &settings, &fit_output).expect("fit warning");
-        assert_eq!(
-            fit_args[fit_args.len() - 2..].to_vec(),
-            vec!["--fit".to_string(), "off".to_string()]
-        );
-        assert!(warning.contains("Device fitting"));
+        let mut cpu_output = vulkan_probe(12_728);
+        cpu_output.devices = "Available devices:\n  CPU: AMD Ryzen 7".into();
+        let mut cpu_args = vec!["--model".to_string()];
+        assert!(guard_cpu_only_target(&mut cpu_args, &settings, &cpu_output).is_none());
+        assert_eq!(cpu_args, vec!["--model".to_string()]);
+
+        // A build that cannot pin a device is left alone.
+        let mut legacy_output = vulkan_probe(12_728);
+        legacy_output.help_text = "--model\n--n-gpu-layers N".into();
+        let mut legacy_args = vec!["--model".to_string()];
+        assert!(guard_cpu_only_target(&mut legacy_args, &settings, &legacy_output).is_none());
+        assert_eq!(legacy_args, vec!["--model".to_string()]);
     }
 
     #[test]

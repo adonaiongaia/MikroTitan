@@ -2499,9 +2499,9 @@ pub fn render_markdown(suite: &BenchmarkSuite) -> String {
         ("decode", "Generation", false),
         ("duration", "Total time", true),
         ("rss", "Peak process RSS (RAM)", true),
-        ("ssd_bytes", "SSD bytes read (generation)", true),
-        ("ssd_mbps", "Peak SSD read (generation)", true),
-        ("iops", "Peak read calls/s", true),
+        ("ssd_bytes", "SSD bytes read (generation)", false),
+        ("ssd_mbps", "Peak SSD read (generation)", false),
+        ("iops", "Peak read calls/s", false),
     ];
     for (key, label, lower_is_better) in metrics {
         let values: Vec<Option<f64>> = results
@@ -2539,7 +2539,7 @@ pub fn render_markdown(suite: &BenchmarkSuite) -> String {
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "_Lower is better for latency, RSS, generation-only SSD bytes/throughput and read calls/s; higher is better for token rates._"
+        "_Lower is better for latency and RSS; higher is better for token rates and generation-only SSD/read activity, so the engine that streams the most from the drive wins those rows._"
     );
     let _ = writeln!(out);
     let _ = writeln!(
@@ -2873,6 +2873,22 @@ mod tests {
         assert!(markdown.contains("Thinking is disabled"));
         assert!(markdown.contains("generation-only"));
         assert!(!markdown.contains("## Warnings and failures"));
+    }
+
+    #[test]
+    fn more_ssd_streaming_wins_the_io_rows() {
+        let mut suite = sample_suite(40.0, 25.0);
+        suite.results[0].ssd_bytes_read = 3 * 1024 * 1024 * 1024;
+        suite.results[0].peak_ssd_mbps = 1_250.0;
+        suite.results[0].peak_iops = 9_000.0;
+        suite.results[1].ssd_bytes_read = 1024 * 1024 * 1024;
+        suite.results[1].peak_ssd_mbps = 900.0;
+        suite.results[1].peak_iops = 4_000.0;
+
+        let markdown = render_markdown(&suite);
+        assert!(markdown.contains("**3.00 GiB** (best)"));
+        assert!(markdown.contains("**1250 MB/s** (best)"));
+        assert!(markdown.contains("**9000 read calls/s** (best)"));
     }
 
     #[test]
