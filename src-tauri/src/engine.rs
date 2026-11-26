@@ -24,6 +24,47 @@ use crate::{
     util::{now_ms, truncate_line},
 };
 
+/// How long the engine may take to answer with response headers. Prompt
+/// processing happens before the first byte, so this stays generous.
+const CHAT_RESPONSE_TIMEOUT_SECS: u64 = 180;
+/// How long the stream may take to produce its first byte after the headers.
+const CHAT_FIRST_TOKEN_TIMEOUT_SECS: u64 = 180;
+/// How long an open stream may stay silent before it is treated as stalled.
+const CHAT_IDLE_TIMEOUT_SECS: u64 = 90;
+
+/// Resolves once the user cancels this request. `stream_chat` uses it to abort
+/// waits that the SSE ticker cannot reach, such as the response-header wait.
+async fn wait_for_cancel(cancel: &Arc<AtomicBool>) {
+    while !cancel.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
+enum ChatSendError {
+    Cancelled,
+    TimedOut,
+    Transport(reqwest::Error),
+}
+
+/// Sends one completion request. The wait for response headers races the
+/// cancel flag: without that race, Stop could not interrupt a server that
+/// accepts the connection and then never answers, and the composer would stay
+/// busy until the app was restarted.
+async fn send_chat_request(
+    builder: reqwest::RequestBuilder,
+    cancel: &Arc<AtomicBool>,
+    header_timeout: Duration,
+) -> Result<reqwest::Response, ChatSendError> {
+    tokio::select! {
+        _ = wait_for_cancel(cancel) => Err(ChatSendError::Cancelled),
+        result = tokio::time::timeout(header_timeout, builder.send()) => match result {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(err)) => Err(ChatSendError::Transport(err)),
+            Err(_) => Err(ChatSendError::TimedOut),
+        },
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EngineStatus {
@@ -335,6 +376,14 @@ impl EngineManager {
         {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x0800_0000);
+        }
+
+        // Give the engine its own process group so a stale engine can be
+        // stopped as a tree (and so Stop never signals the app's own group).
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
         }
 
         let mut child = command.spawn().map_err(|err| {
@@ -863,9 +912,30 @@ impl EngineManager {
                 builder = builder.bearer_auth(settings.api_key.trim());
             }
 
-            let response = match builder.send().await {
+            let response = match send_chat_request(
+                builder,
+                &cancel,
+                Duration::from_secs(CHAT_RESPONSE_TIMEOUT_SECS),
+            )
+            .await
+            {
                 Ok(response) => response,
-                Err(err) => {
+                Err(ChatSendError::Cancelled) => {
+                    cancelled = true;
+                    break;
+                }
+                Err(ChatSendError::TimedOut) => {
+                    emit_chat_error(
+                        app,
+                        &request.request_id,
+                        format!(
+                            "The inference engine did not respond within {CHAT_RESPONSE_TIMEOUT_SECS}s, so the turn was stopped. Check the engine log or restart the engine."
+                        ),
+                    );
+                    self.clear_cancelled(&request.request_id);
+                    return Ok(());
+                }
+                Err(ChatSendError::Transport(err)) => {
                     emit_chat_error(
                         app,
                         &request.request_id,
@@ -926,9 +996,36 @@ impl EngineManager {
             let mut decoder = SseDecoder::default();
             let mut round = StreamRound::default();
             let mut stream_done = false;
+            let mut received_bytes = false;
+            // The first wait is longer: prompt processing can be slow on a CPU.
+            // Once bytes arrive, a longer silence means the stream stalled
+            // rather than the model still thinking.
+            let mut stall_at = tokio::time::Instant::now()
+                + Duration::from_secs(CHAT_FIRST_TOKEN_TIMEOUT_SECS);
 
             while !stream_done {
                 let chunk = tokio::select! {
+                    _ = tokio::time::sleep_until(stall_at) => {
+                        if cancel.load(Ordering::Relaxed) {
+                            cancelled = true;
+                            break;
+                        }
+                        emit_chat_error(
+                            app,
+                            &request.request_id,
+                            if received_bytes {
+                                format!(
+                                    "The inference stream went silent for {CHAT_IDLE_TIMEOUT_SECS}s, so the turn was stopped. Try a shorter prompt or restart the engine."
+                                )
+                            } else {
+                                format!(
+                                    "The inference engine did not stream a first token within {CHAT_FIRST_TOKEN_TIMEOUT_SECS}s, so the turn was stopped. The prompt may be too large for this context."
+                                )
+                            },
+                        );
+                        self.clear_cancelled(&request.request_id);
+                        return Ok(());
+                    }
                     _ = ticker.tick() => {
                         if cancel.load(Ordering::Relaxed) {
                             cancelled = true;
@@ -941,6 +1038,9 @@ impl EngineManager {
                         None => break,
                     },
                 };
+                received_bytes = true;
+                stall_at = tokio::time::Instant::now()
+                    + Duration::from_secs(CHAT_IDLE_TIMEOUT_SECS);
                 if cancel.load(Ordering::Relaxed) {
                     cancelled = true;
                     break;
@@ -2755,5 +2855,95 @@ mod tests {
     fn status_order_only_moves_forward() {
         assert!(rank(EngineStatus::LoadingModel) > rank(EngineStatus::Indexing));
         assert!(rank(EngineStatus::Ready) > rank(EngineStatus::LoadingModel));
+    }
+
+    /// A server that accepts the connection but never sends response headers
+    /// used to park the chat turn on the socket. Stop set a flag that only the
+    /// stream loop checked, so the composer stayed busy until the app was
+    /// restarted. The header wait now races the cancel flag and ends promptly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_header_wait_ends_the_turn_promptly() {
+        use std::io::Read as _;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind the fake engine");
+        let port = listener.local_addr().expect("fake engine address").port();
+        std::thread::spawn(move || {
+            if let Ok((mut socket, _)) = listener.accept() {
+                let mut sink = [0u8; 4096];
+                let _ = socket.read(&mut sink);
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .expect("test client");
+        let builder = client
+            .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+            .json(&serde_json::json!({ "model": "test", "stream": true }));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_for_task = cancel.clone();
+        let task = tokio::spawn(async move {
+            send_chat_request(
+                builder,
+                &cancel_for_task,
+                Duration::from_secs(CHAT_RESPONSE_TIMEOUT_SECS),
+            )
+            .await
+        });
+
+        // Let the request reach the server and block on its headers.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        cancel.store(true, Ordering::Relaxed);
+        let outcome = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("a cancelled header wait must return instead of parking on the socket")
+            .expect("the send task must not panic");
+        assert!(
+            matches!(outcome, Err(ChatSendError::Cancelled)),
+            "Stop must abort the response-header wait"
+        );
+    }
+
+    /// A wedged engine must end the turn on its own as well: the header wait
+    /// expires and the error path releases the composer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn header_wait_times_out_without_a_response() {
+        use std::io::Read as _;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind the fake engine");
+        let port = listener.local_addr().expect("fake engine address").port();
+        std::thread::spawn(move || {
+            if let Ok((mut socket, _)) = listener.accept() {
+                let mut sink = [0u8; 4096];
+                let _ = socket.read(&mut sink);
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .expect("test client");
+        let builder = client
+            .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+            .json(&serde_json::json!({ "model": "test", "stream": true }));
+        let cancel = Arc::new(AtomicBool::new(false));
+        // The production timeout is three minutes; the mechanism is the same at
+        // any duration, so the test uses a short one.
+        let task = tokio::spawn(async move {
+            send_chat_request(builder, &cancel, Duration::from_millis(250)).await
+        });
+        let outcome = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the header timeout must finish the request")
+            .expect("the send task must not panic");
+        assert!(
+            matches!(outcome, Err(ChatSendError::TimedOut)),
+            "a silent engine must time out instead of parking the composer"
+        );
     }
 }

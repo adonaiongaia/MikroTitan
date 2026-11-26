@@ -22,7 +22,6 @@ import { useKeyboardShortcuts } from "../../hooks/useKeyboardShortcuts";
 import { usePersistentState } from "../../hooks/usePersistentState";
 import { usePersonas } from "../../hooks/usePersonas";
 import { useSettings } from "../../hooks/useSettings";
-import { useTelemetry } from "../../hooks/useTelemetry";
 import { api } from "../../lib/api";
 import {
   artifactGroupFor,
@@ -148,7 +147,6 @@ export function ChatView({
   const { preferences, update, setPreferences } = useEnginePreferences();
   const agent = useAgentPreferences();
   const memory = useMemory();
-  const telemetry = useTelemetry(engine.snapshot.pid, true);
 
   const [defaultSystemPrompt, setDefaultSystemPrompt] = usePersistentState(
     "janas.systemPrompt",
@@ -450,8 +448,13 @@ export function ChatView({
     void loadModels();
   }, [loadModels, currentModelPath, llamaModelPath]);
 
+  // Streaming replaces the messages array on every delta. Coalesce those into
+  // one scroll per frame instead of forcing a layout per token.
   useEffect(() => {
-    endRef.current?.scrollIntoView({ block: "end" });
+    const frame = window.requestAnimationFrame(() => {
+      endRef.current?.scrollIntoView({ block: "end" });
+    });
+    return () => window.cancelAnimationFrame(frame);
   }, [chat.messages, chat.streaming]);
 
   // Pre-flight image guardrail: a multimodal GGUF only accepts image content
@@ -1725,8 +1728,7 @@ export function ChatView({
         <TelemetryPanel
           collapsed={telemetryCollapsed}
           onToggle={() => setTelemetryCollapsed((value) => !value)}
-          telemetry={telemetry.telemetry}
-          history={telemetry.history}
+          pid={engine.snapshot.pid}
           benchmark={benchmark}
           benchmarkBusy={benchmarkBusy}
           onBenchmark={() => void runBenchmark()}

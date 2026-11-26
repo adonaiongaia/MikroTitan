@@ -1,4 +1,4 @@
-import { Fragment, useState } from "react";
+import { Fragment, memo, useCallback, useMemo, useState } from "react";
 import {
   Check,
   ChevronLeft,
@@ -91,81 +91,23 @@ function isWebUrl(href: string | undefined): href is string {
   return Boolean(href && /^https?:\/\//i.test(href));
 }
 
-export function MessageBubble({
-  message,
-  streaming,
-  onDelete,
-  onRegenerate,
-  onEdit,
-  onBranch,
-  versionIds,
-  versionIndex = 0,
-  onSelectVersion,
-  regenerable,
-  editable,
-  agentActions,
+/**
+ * GFM parsing is the expensive part of a chat render. Keeping it in a memoized
+ * component means a new token in the streaming reply, a telemetry tick or
+ * another message's edit never re-parses every older reply in the transcript.
+ */
+const MarkdownSegment = memo(function MarkdownSegment({
+  content,
+  ragSources,
   onOpenRagSource,
-  artifacts,
-  onOpenArtifact,
-  activeArtifactRootId,
-  pinned = false,
-  evicted = false,
-  onTogglePin,
-  onToggleEvict,
-}: MessageBubbleProps) {
-  const [copied, setCopied] = useState(false);
-  const [linkError, setLinkError] = useState<string | null>(null);
-  const [editing, setEditing] = useState(false);
-  const [editDraft, setEditDraft] = useState("");
-  const isUser = message.role === "user";
-  const content = typeof message.content === "string" ? message.content : "";
-  const reasoning =
-    typeof message.reasoning === "string" ? message.reasoning : "";
-  const citations = safeCitations(message.citations);
-  const ragSources = Array.isArray(message.rag_sources)
-    ? sortByCitation(message.rag_sources)
-    : [];
-  const trace = message.agentTrace ?? null;
-  const segments = splitArtifactSegments(content, artifacts ?? []);
-  const empty = !content && !reasoning && !trace;
-  const versions = versionIds?.length ? versionIds : [message.id];
-  const activeVersion = Math.max(
-    0,
-    Math.min(versions.length - 1, versionIndex),
-  );
-
-  const beginEdit = () => {
-    setEditDraft(content);
-    setEditing(true);
-  };
-
-  const saveEdit = async () => {
-    const trimmed = editDraft.trim();
-    if (!trimmed || !onEdit) return;
-    await onEdit(trimmed);
-    setEditing(false);
-  };
-
-  const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(content);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1_600);
-    } catch {
-      // Clipboard permissions may be unavailable; the text stays selectable.
-    }
-  };
-
-  const openLink = async (url: string) => {
-    setLinkError(null);
-    try {
-      await api.openExternal(url);
-    } catch (err) {
-      setLinkError(errorMessage(err));
-    }
-  };
-
-  const renderMarkdown = (markdown: string) => (
+  onOpenLink,
+}: {
+  content: string;
+  ragSources: RagChunk[];
+  onOpenRagSource?: (chunk: RagChunk) => void;
+  onOpenLink: (url: string) => void;
+}) {
+  return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
       // The default transform blanks non-http schemes, which would turn
@@ -199,7 +141,7 @@ export function MessageBubble({
               onClick={(event) => {
                 if (!isWebUrl(href)) return;
                 event.preventDefault();
-                void openLink(href);
+                onOpenLink(href);
               }}
               rel="noreferrer noopener"
             >
@@ -209,9 +151,91 @@ export function MessageBubble({
         },
       }}
     >
-      {linkifyDocCitations(markdown, ragSources)}
+      {linkifyDocCitations(content, ragSources)}
     </ReactMarkdown>
   );
+});
+
+export function MessageBubble({
+  message,
+  streaming,
+  onDelete,
+  onRegenerate,
+  onEdit,
+  onBranch,
+  versionIds,
+  versionIndex = 0,
+  onSelectVersion,
+  regenerable,
+  editable,
+  agentActions,
+  onOpenRagSource,
+  artifacts,
+  onOpenArtifact,
+  activeArtifactRootId,
+  pinned = false,
+  evicted = false,
+  onTogglePin,
+  onToggleEvict,
+}: MessageBubbleProps) {
+  const [copied, setCopied] = useState(false);
+  const [linkError, setLinkError] = useState<string | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [editDraft, setEditDraft] = useState("");
+  const isUser = message.role === "user";
+  const content = typeof message.content === "string" ? message.content : "";
+  const reasoning =
+    typeof message.reasoning === "string" ? message.reasoning : "";
+  const citations = safeCitations(message.citations);
+  const ragSources = useMemo(
+    () =>
+      Array.isArray(message.rag_sources)
+        ? sortByCitation(message.rag_sources)
+        : [],
+    [message.rag_sources],
+  );
+  const trace = message.agentTrace ?? null;
+  const segments = useMemo(
+    () => splitArtifactSegments(content, artifacts ?? []),
+    [content, artifacts],
+  );
+  const empty = !content && !reasoning && !trace;
+  const versions = versionIds?.length ? versionIds : [message.id];
+  const activeVersion = Math.max(
+    0,
+    Math.min(versions.length - 1, versionIndex),
+  );
+
+  const beginEdit = () => {
+    setEditDraft(content);
+    setEditing(true);
+  };
+
+  const saveEdit = async () => {
+    const trimmed = editDraft.trim();
+    if (!trimmed || !onEdit) return;
+    await onEdit(trimmed);
+    setEditing(false);
+  };
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(content);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1_600);
+    } catch {
+      // Clipboard permissions may be unavailable; the text stays selectable.
+    }
+  };
+
+  const openLink = useCallback(async (url: string) => {
+    setLinkError(null);
+    try {
+      await api.openExternal(url);
+    } catch (err) {
+      setLinkError(errorMessage(err));
+    }
+  }, []);
 
   const contextBadge = evicted ? (
     <div className="mb-2 flex items-center gap-1.5 rounded-lg border border-slate-500/25 bg-slate-500/5 px-2 py-1 text-[9.5px] text-slate-400">
@@ -487,7 +511,12 @@ export function MessageBubble({
                 />
               ) : segment.content.trim() ? (
                 <Fragment key={`markdown-${index}`}>
-                  {renderMarkdown(segment.content)}
+                  <MarkdownSegment
+                    content={segment.content}
+                    ragSources={ragSources}
+                    onOpenRagSource={onOpenRagSource}
+                    onOpenLink={openLink}
+                  />
                 </Fragment>
               ) : null,
             )}

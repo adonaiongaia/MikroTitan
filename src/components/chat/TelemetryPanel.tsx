@@ -14,14 +14,13 @@ import {
 import { cn } from "../../lib/cn";
 import { formatBytes } from "../../lib/format";
 import type { StorageBenchmark, Telemetry } from "../../types";
-import type { TelemetryPoint } from "../../hooks/useTelemetry";
+import { useTelemetry, type TelemetryPoint } from "../../hooks/useTelemetry";
 import { Button } from "../ui/Button";
 
 interface TelemetryPanelProps {
   collapsed: boolean;
   onToggle: () => void;
-  telemetry: Telemetry;
-  history: TelemetryPoint[];
+  pid: number | null;
   benchmark: StorageBenchmark | null;
   benchmarkBusy: boolean;
   onBenchmark: () => void;
@@ -32,14 +31,16 @@ interface TelemetryPanelProps {
 export function TelemetryPanel({
   collapsed,
   onToggle,
-  telemetry,
-  history,
+  pid,
   benchmark,
   benchmarkBusy,
   onBenchmark,
   tokensGenerated,
   streaming,
 }: TelemetryPanelProps) {
+  // Sampling lives here so the once-a-second update repaints the panel, not the
+  // whole chat transcript above it.
+  const { telemetry, history } = useTelemetry(pid, true);
   const ramBytes = Math.min(
     telemetry.model_bytes,
     Math.round(telemetry.resident_ratio * telemetry.model_bytes),

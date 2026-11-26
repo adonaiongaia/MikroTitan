@@ -10,6 +10,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -88,6 +89,10 @@ pub struct ChatImportSummary {
 
 pub struct ChatStore {
     root: PathBuf,
+    /// Serializes writes. Saves run on the blocking pool, so the debounced
+    /// write and a stream-flush write can overlap; without this lock the older
+    /// snapshot could land after the newer one.
+    save_lock: Mutex<()>,
 }
 
 impl ChatStore {
@@ -95,7 +100,10 @@ impl ChatStore {
         let _ = fs::create_dir_all(&root);
         let _ = fs::create_dir_all(root.join("assets"));
         let _ = fs::create_dir_all(root.join("backups"));
-        Self { root }
+        Self {
+            root,
+            save_lock: Mutex::new(()),
+        }
     }
 
     pub fn list(&self) -> Vec<StoredSession> {
@@ -128,6 +136,10 @@ impl ChatStore {
     }
 
     pub fn save(&self, mut session: StoredSession) -> AppResult<StoredSession> {
+        let _save = self
+            .save_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         validate_id(&session.id)?;
         if session.schema_version > CURRENT_SCHEMA_VERSION {
             return Err(AppError::message(format!(

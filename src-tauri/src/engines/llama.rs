@@ -149,14 +149,6 @@ impl LlamaRunner {
 
 #[async_trait]
 impl<R: Runtime> EngineRunner<R> for LlamaRunner {
-    async fn probe(
-        &self,
-        app: &AppHandle<R>,
-        settings: &AppSettings,
-    ) -> AppResult<EngineProbe> {
-        Ok(self.probe_full(app, settings).await?.2)
-    }
-
     async fn spawn_process(
         &self,
         app: &AppHandle<R>,
@@ -242,13 +234,6 @@ impl<R: Runtime> EngineRunner<R> for LlamaRunner {
                     .await;
             }
         });
-
-        spawn_health_probe(
-            app.clone(),
-            pid,
-            settings.connect_host().to_string(),
-            settings.llama_port,
-        );
 
         let _ = bind_host;
         Ok(launch)
@@ -1045,7 +1030,12 @@ fn build_args(
     Ok((args, warnings))
 }
 
-fn spawn_health_probe<R: Runtime>(app: AppHandle<R>, pid: u32, host: String, port: u16) {
+pub(super) fn spawn_health_probe<R: Runtime>(
+    app: AppHandle<R>,
+    pid: u32,
+    host: String,
+    port: u16,
+) {
     tauri::async_runtime::spawn(async move {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(2))
@@ -1066,9 +1056,15 @@ fn spawn_health_probe<R: Runtime>(app: AppHandle<R>, pid: u32, host: String, por
             {
                 if response.status().is_success() {
                     if let Some(supervisor) = supervisor_handle(&app) {
-                        supervisor.mark_llama_ready(&app, pid).await;
+                        // The supervisor publishes the launch before this probe
+                        // starts, but a switch can still be in flight. Retry
+                        // until the active engine is the one we probed; ending
+                        // here would leave the app on "Loading model" while a
+                        // healthy server answers requests.
+                        if supervisor.mark_llama_ready(&app, pid).await {
+                            return;
+                        }
                     }
-                    return;
                 }
             }
             tokio::time::sleep(Duration::from_millis(700)).await;

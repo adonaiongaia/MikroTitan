@@ -24,7 +24,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
 use crate::{
     error::{AppError, AppResult},
@@ -1648,10 +1648,22 @@ pub fn inspect_gguf_companion(path: String) -> AppResult<GgufCompanionInfo> {
     inspect_gguf_metadata(&path)
 }
 
+/// Inspecting a model reads the header of every GGUF in the library, so the
+/// pairing scan runs on the blocking pool instead of the IPC thread.
 #[tauri::command]
-pub fn inspect_model_companions(
+pub async fn inspect_model_companions(
     store: State<'_, std::sync::Arc<SettingsStore>>,
     path: String,
+) -> AppResult<CompanionPairing> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || inspect_model_companions_snapshot(&store, &path))
+        .await
+        .map_err(|err| AppError::message(format!("The model inspection stopped: {err}")))?
+}
+
+fn inspect_model_companions_snapshot(
+    store: &SettingsStore,
+    path: &str,
 ) -> AppResult<CompanionPairing> {
     let settings = store.get();
     let root = expand_home(&settings.models_dir);
@@ -1686,9 +1698,18 @@ pub fn inspect_model_companions(
 }
 
 #[tauri::command]
-pub fn library_companions(
-    store: State<'_, std::sync::Arc<SettingsStore>>,
-) -> LibraryCompanions {
+pub async fn library_companions(app: AppHandle) -> LibraryCompanions {
+    let store = app.state::<std::sync::Arc<SettingsStore>>().inner().clone();
+    tauri::async_runtime::spawn_blocking(move || library_companions_snapshot(&store))
+        .await
+        .unwrap_or_else(|_| LibraryCompanions {
+            models: Vec::new(),
+            pairings: Vec::new(),
+            warnings: Vec::new(),
+        })
+}
+
+fn library_companions_snapshot(store: &SettingsStore) -> LibraryCompanions {
     let settings = store.get();
     let root = expand_home(&settings.models_dir);
     let paths = scan_gguf_files(&root);

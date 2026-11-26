@@ -15,7 +15,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::{
     error::{AppError, AppResult},
@@ -138,7 +138,7 @@ pub fn hardware_summary() -> HardwareSummary {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Telemetry {
     pub pid: Option<u32>,
     pub process_rss_bytes: u64,
@@ -323,11 +323,18 @@ fn npu_metrics() -> DeviceMetrics {
     DeviceMetrics::default()
 }
 
+/// Sampling reads `/proc` and sysfs, which can block behind a busy or wedged
+/// GPU driver. It runs on the blocking pool so a slow sample can never freeze
+/// the webview; the panel polls this once a second.
 #[tauri::command]
-pub fn get_telemetry(
-    store: State<'_, std::sync::Arc<SettingsStore>>,
-    pid: Option<u32>,
-) -> Telemetry {
+pub async fn get_telemetry(app: AppHandle, pid: Option<u32>) -> Telemetry {
+    let store = app.state::<std::sync::Arc<SettingsStore>>().inner().clone();
+    tauri::async_runtime::spawn_blocking(move || sample_telemetry(&store, pid))
+        .await
+        .unwrap_or_default()
+}
+
+fn sample_telemetry(store: &SettingsStore, pid: Option<u32>) -> Telemetry {
     let settings = store.get();
     let model_bytes = fs::metadata(expand_home(&settings.model_path))
         .map(|meta| meta.len())
@@ -1587,8 +1594,17 @@ fn scan_library_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Reading every GGUF header in the models folder is real disk work, so the
+/// library scan runs on the blocking pool instead of the IPC thread.
 #[tauri::command]
-pub fn library_models(store: State<'_, std::sync::Arc<SettingsStore>>) -> Vec<LibraryModel> {
+pub async fn library_models(app: AppHandle) -> Vec<LibraryModel> {
+    let store = app.state::<std::sync::Arc<SettingsStore>>().inner().clone();
+    tauri::async_runtime::spawn_blocking(move || library_models_snapshot(&store))
+        .await
+        .unwrap_or_default()
+}
+
+fn library_models_snapshot(store: &SettingsStore) -> Vec<LibraryModel> {
     let settings = store.get();
     let root = expand_home(&settings.models_dir);
     let mut files = Vec::new();

@@ -169,14 +169,6 @@ fn janas_layout(output: &ProbeOutput, settings: &AppSettings) -> (JanasLayout, V
 
 #[async_trait]
 impl<R: Runtime> EngineRunner<R> for JanasRunner {
-    async fn probe(
-        &self,
-        app: &AppHandle<R>,
-        settings: &AppSettings,
-    ) -> AppResult<EngineProbe> {
-        Ok(self.probe_full(app, settings).await?.2)
-    }
-
     async fn spawn_process(
         &self,
         app: &AppHandle<R>,

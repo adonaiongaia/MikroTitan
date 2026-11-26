@@ -55,6 +55,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- **Tauri 2.12.6 fixes the window freeze.** The lockfile now pins `tauri` 2.12.6, `tauri-runtime-wry` 2.12.5, `tauri-runtime` 2.12.4, `tauri-utils` 2.10.4 and `tauri-build`/`codegen`/`macros` 2.7.6. Tauri 2.12.6 fixes the webview-manager event-emit deadlock that could lock the window while the `tracing` feature was enabled. The AppImage was rebuilt, both engines start with the window responsive, and the chat input works.
 - Voice recording cleanup and start/cancel races: stopping, cancelling, closing the window, or failing after spawn now kills and reaps the capture child and joins its reader. The UI also guards the `encoding` state, waits out stale sessions, and cancels a backend whose owner unmounted while the start IPC was in flight.
 - Agent runs no longer fail every time with "The workspace root does not exist" after the selected folder is moved or deleted; the error names the path, and the workspace can be re-picked or cleared from the chat.
 - The Agent settings workspace X now clears a chat's pinned workspace, not just the global default, so a stale per-chat path can no longer survive the clear action.

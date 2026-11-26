@@ -67,10 +67,16 @@ fn probe_binary(path: String) -> BinaryProbe {
     settings::probe_binary(&path)
 }
 
+/// Walking the models folder touches disk, so it runs on the blocking pool.
 #[tauri::command]
-fn scan_local_models(store: State<'_, Arc<SettingsStore>>) -> Vec<LocalModel> {
-    let current = store.get();
-    settings::scan_models(&current.models_dir, Some(&current.model_path), 4)
+async fn scan_local_models(app: AppHandle) -> Vec<LocalModel> {
+    let store = app.state::<Arc<SettingsStore>>().inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let current = store.get();
+        settings::scan_models(&current.models_dir, Some(&current.model_path), 4)
+    })
+    .await
+    .unwrap_or_default()
 }
 
 #[tauri::command]
@@ -352,17 +358,26 @@ fn chat_tool_approval(
     engine.resolve_chat_approval(&request_id, &call_id, decision == "approve")
 }
 
+/// Chat files can be large, and the store is read on startup and written after
+/// every streamed turn. Both run on the blocking pool so serializing a big
+/// session never stalls the webview.
 #[tauri::command]
-fn chat_sessions_list(store: State<'_, Arc<ChatStore>>) -> Vec<StoredSession> {
-    store.list()
+async fn chat_sessions_list(app: AppHandle) -> Vec<StoredSession> {
+    let store = app.state::<Arc<ChatStore>>().inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.list())
+        .await
+        .unwrap_or_default()
 }
 
 #[tauri::command]
-fn chat_session_save(
+async fn chat_session_save(
     store: State<'_, Arc<ChatStore>>,
     session: StoredSession,
 ) -> AppResult<StoredSession> {
-    store.save(session)
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.save(session))
+        .await
+        .map_err(|err| AppError::message(format!("The chat could not be saved: {err}")))?
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -371,8 +386,14 @@ fn chat_session_delete(store: State<'_, Arc<ChatStore>>, id: String) -> AppResul
 }
 
 #[tauri::command]
-fn chat_asset_data_url(store: State<'_, Arc<ChatStore>>, asset: String) -> AppResult<String> {
-    store.asset_data_url(&asset)
+async fn chat_asset_data_url(
+    store: State<'_, Arc<ChatStore>>,
+    asset: String,
+) -> AppResult<String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.asset_data_url(&asset))
+        .await
+        .map_err(|err| AppError::message(format!("That image could not be opened: {err}")))?
 }
 
 #[tauri::command(rename_all = "snake_case")]

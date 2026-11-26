@@ -4,7 +4,7 @@
 
 **A dual-inference local AI desktop studio.** Run **Janas-LLM** models with SSD streaming so models larger than RAM stay usable, or run **GGUF** models with **llama.cpp** — on your own hardware, with no account and no telemetry.
 
-MikroTitan is a local AI studio with **agent mode**, a local document vault, **local voice input**, branching chat history, per-chat workspaces, system prompts and MCP tool scopes, crash-safe session storage, and three themes. It is built with **Tauri 2**, **Rust**, **React 18**, **TypeScript**, and **Tailwind CSS**, manages the `janas-server` and `llama-server` processes, proxies their OpenAI-compatible SSE streams into the webview, browses GGUF repositories on Hugging Face, and drives `janas-convert` / upstream `gguf2jns` with a live console.
+MikroTitan is a local AI studio with **agent mode**, a local document vault, **local voice input**, branching chat history, per-chat workspaces, system prompts and MCP tool scopes, crash-safe session storage, and three themes. It is built with **Tauri 2.12.6**, **Rust**, **React 18**, **TypeScript**, and **Tailwind CSS**, manages the `janas-server` and `llama-server` processes, proxies their OpenAI-compatible SSE streams into the webview, browses GGUF repositories on Hugging Face, and drives `janas-convert` / upstream `gguf2jns` with a live console.
 
 > **Independent, unofficial project.** MikroTitan is a community project. It is not affiliated with, sponsored by, or endorsed by the Janas project or by llama.cpp. The official Janas project lives at <https://github.com/prabanta-dev/janas>.
 
@@ -259,6 +259,7 @@ MCP servers run as local stdio processes. The app does not proxy their traffic, 
 - **Tested platform:** Linux x86-64, running the AppImage built below. This is the only bundle target in `tauri.conf.json`; the build and runtime checks below were run on it.
 - **Untested platforms:** the engine and provisioning modules contain macOS and Windows paths, but no macOS or Windows installer is configured or tested here. Treat those paths as unverified.
 - Rust 1.77.2+ and Node 18+.
+- **Tauri 2.12.6**, pinned in `src-tauri/Cargo.lock`. This release fixes the webview-manager event-emit deadlock that could freeze the window while the `tracing` feature was enabled; keep the lockfile at 2.12.6 or newer.
 - For voice input on Linux, at least one of `parec` (usually from `pulseaudio-utils`) or `pw-record` (usually from `pipewire-bin`). The app prefers `parec` and falls back to `pw-record`. Whisper itself is downloaded by the app on demand.
 - WebKitGTK 4.1 / GTK3 development packages:
 
@@ -316,7 +317,6 @@ The failed-update test in `src-tauri/src/engines/binary.rs` installs a deliberat
 ```rust
 #[async_trait]
 pub trait EngineRunner: Send + Sync {
-    async fn probe(&self, app: &AppHandle, settings: &AppSettings) -> AppResult<EngineProbe>;
     async fn spawn_process(&self, app: &AppHandle, settings: &AppSettings) -> AppResult<EngineLaunch>;
     async fn kill_process(&self, app: &AppHandle, launch: &EngineLaunch) -> AppResult<()>;
     async fn monitor_telemetry(&self, app: &AppHandle, launch: EngineLaunch) -> AppResult<()>;
@@ -453,17 +453,18 @@ The OpenAI-compatible `/v1/chat/completions` SSE proxy is reused for both engine
 
 ### Verification summary
 
-The **0.2.0** AppImage was built and inspected on Linux x86-64. `npm run build` (TypeScript + Vite), `cargo check`, the full Vitest suite and the full Rust suite pass for this revision; the manual runtime checks further down were recorded during 0.1.1 verification.
+The **0.2.0** AppImage was rebuilt against Tauri 2.12.6 and inspected on Linux x86-64. `npm run build` (TypeScript + Vite), `cargo check`, the full Vitest suite and the full Rust suite pass for this revision; the manual runtime checks further down were recorded during 0.1.1 verification.
 
 - `npm run appimage` — release build and AppImage bundling completed:
   - Artifact: `src-tauri/target/release/bundle/appimage/MikroTitan_0.2.0_amd64.AppImage`
   - Size: 171,211,256 bytes (163.28 MiB)
-  - SHA-256: `b9e574c4c549af2b15c30789b4a08147ce712e8ec95358f4821d42f95af2ce72`
+  - SHA-256: `7987b203eb408109f3f7fec91f4f08bba8f0c3853999200a6d07611686147c40`
   - Bundle checks: the desktop entry reports `Name=MikroTitan`, the running app's window title is **MikroTitan**, the bundled icon and `.DirIcon` match `src-tauri/icons/128x128.png` and `src-tauri/icons/128x128@2x.png`, and `usr/share/licenses/mikrotitan/LICENSE` plus `usr/share/doc/mikrotitan/THIRD_PARTY_NOTICES.md` match the repository files byte-for-byte. No `studio-for-janas` paths remain. No Janas binaries are bundled, and the WebKit media framework used by microphone capture is included.
 - **Screenshots:** regenerated against the 0.2.0 build with the new sidebar mark and the **MikroTitan** assistant reply heading, covering the per-chat draft/MCP badge, the agent run trace, and the Tools scope drawer.
 - `npm run check` / `npm run build` — TypeScript typecheck and production build passed for 0.2.0.
 - `npm test` — 81 Vitest tests pass across 6 files: persistent-store handling, RAG citations and budgets, context budgeting, chat-session normalization/branching, artifacts, and MCP scope/reconciliation.
-- `cargo test` — 246 tests pass, 0 failed, 2 ignored: the local two-target benchmark that needs both engines and models, and the network-dependent live-search smoke test.
+- `cargo test` — 249 tests pass, 0 failed, 2 ignored: the local two-target benchmark that needs both engines and models, and the network-dependent live-search smoke test.
+- **Tauri 2.12.6 smoke test:** the rebuilt AppImage launched, both engines reached Ready, and the window and chat input stayed responsive with no freeze.
 - **Document vault:** Rust tests cover stable chunking, hybrid ranking, incremental re-indexing, restart persistence, collection deletion, source removal, scanned-PDF handling, secret/heavy-directory skipping and index cancellation. Vitest covers `[D#]` linkification, citation lookup and ordering, deleted-collection pruning and retrieval-budget clamping. In the rebuilt AppImage, a collection was created, indexed, attached to a chat, retrieved as `[D1]` with the Docs row and source drawer, and the agent's `search_knowledge_base` answer kept its clickable citation after a reload.
 - **Voice input:** the AppImage opened the USB microphone as the Pulse/PipeWire default through `parec`, and a stop/transcription run against a virtual system default produced the expected transcript. The fallback was exercised with a PATH containing only `pw-record`; it selected `pw-record`, captured the system-default source, stopped cleanly and produced the same transcript. Closing while recording left no capture process or source-output. Rust tests cover WAV normalisation/resampling, transcript cleanup, language validation and backend preference.
 - **Agent resilience:** a scripted engine verified that Stop ends a stalled request immediately, and that a silent stream is ended by the 90 s idle timeout and a silent pre-stream request by the 180 s first-token timeout, each with an actionable error and an unlocked composer.

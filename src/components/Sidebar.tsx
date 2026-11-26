@@ -148,7 +148,8 @@ export function Sidebar({
               {engine.error}
             </p>
           ) : null}
-          {engine.adapterWarning ? (
+          {engine.adapterWarning &&
+          engine.active?.kind === engine.adapterWarning.engine ? (
             <p className="mt-2 text-[10px] leading-4 text-amber-300/80">
               {engine.adapterWarning.message}
             </p>

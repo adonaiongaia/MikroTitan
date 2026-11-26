@@ -171,14 +171,6 @@ pub struct AdapterWarningEvent {
 
 #[async_trait]
 pub trait EngineRunner<R: Runtime>: Send + Sync {
-    /// Run the binary's `--version` / `--help` before any launch and select a
-    /// CLI layout from what the binary actually advertises.
-    async fn probe(
-        &self,
-        app: &AppHandle<R>,
-        settings: &AppSettings,
-    ) -> AppResult<EngineProbe>;
-
     /// Start the engine and begin forwarding stdout/stderr.
     async fn spawn_process(
         &self,
@@ -341,26 +333,9 @@ impl<R: Runtime> EngineSupervisor<R> {
 
         let kind = target.expect("checked above");
         let runner = self.runner(kind);
-        let probe = match runner.probe(app, settings).await {
-            Ok(probe) => probe,
-            Err(err) => {
-                self.publish_start_failure(app, kind, settings, &err.to_string());
-                return Err(err);
-            }
-        };
-
-        if let Some(warning) = probe.warning.as_deref().filter(|text| !text.is_empty()) {
-            let _ = app.emit(
-                "engine://adapter-warning",
-                AdapterWarningEvent {
-                    engine: kind,
-                    message: warning.to_string(),
-                    version: probe.version.clone(),
-                    adapter: probe.adapter.clone(),
-                },
-            );
-        }
-
+        // `spawn_process` probes the binary and returns that probe with the
+        // launch, so probing here as well would run --version, --help and
+        // --list-devices twice on every engine start.
         let launch = match runner.spawn_process(app, settings).await {
             Ok(launch) => launch,
             Err(err) => {
@@ -368,6 +343,23 @@ impl<R: Runtime> EngineSupervisor<R> {
                 return Err(err);
             }
         };
+
+        if let Some(warning) = launch
+            .probe
+            .warning
+            .as_deref()
+            .filter(|text| !text.is_empty())
+        {
+            let _ = app.emit(
+                "engine://adapter-warning",
+                AdapterWarningEvent {
+                    engine: kind,
+                    message: warning.to_string(),
+                    version: launch.probe.version.clone(),
+                    adapter: launch.probe.adapter.clone(),
+                },
+            );
+        }
 
         let info = ActiveEngineInfo::from(&launch);
         *self.active.lock().await = Some(ActiveEngine {
@@ -392,6 +384,17 @@ impl<R: Runtime> EngineSupervisor<R> {
         };
         self.publish_snapshot(app, snapshot_from_launch(&launch, EngineStatus::LoadingModel, detail));
         self.publish_active(app, Some(info));
+
+        // Only after the launch is published: a fast health response must not
+        // be overwritten by the LoadingModel snapshot and strand the UI.
+        if kind == EngineKind::Llama {
+            llama::spawn_health_probe(
+                app.clone(),
+                launch.pid,
+                launch.host.clone(),
+                launch.port,
+            );
+        }
 
         let runner_for_monitor = runner.clone();
         let app_for_monitor = app.clone();
@@ -469,13 +472,16 @@ impl<R: Runtime> EngineSupervisor<R> {
         let _ = app.emit("engine://active", info);
     }
 
-    pub async fn mark_llama_ready(&self, app: &AppHandle<R>, pid: u32) {
+    /// Returns true when this PID was the active llama engine and `Ready` was
+    /// published. False means the switch has not published it yet (or another
+    /// engine replaced it), so a readiness probe should keep waiting.
+    pub async fn mark_llama_ready(&self, app: &AppHandle<R>, pid: u32) -> bool {
         let guard = self.active.lock().await;
         let Some(active) = guard.as_ref() else {
-            return;
+            return false;
         };
         if active.info.kind != EngineKind::Llama || active.info.pid != pid {
-            return;
+            return false;
         }
         let snapshot = snapshot_from_launch(
             &active.launch,
@@ -487,6 +493,7 @@ impl<R: Runtime> EngineSupervisor<R> {
         );
         drop(guard);
         self.publish_snapshot(app, snapshot);
+        true
     }
 
     pub async fn mark_llama_failed(&self, app: &AppHandle<R>, pid: u32, detail: impl Into<String>) {
@@ -565,6 +572,15 @@ impl<R: Runtime> EngineSupervisor<R> {
         if let Some(active) = active {
             let runner = self.runner(active.info.kind);
             let _ = runner.kill_process(app, &active.launch).await;
+            if pid_alive(active.launch.pid) {
+                // The runner failed to stop it; do not leave the port held.
+                signal_group(active.launch.pid, libc::SIGKILL);
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            if pid_alive(active.launch.pid) {
+                // Leave the pidfile so the next start retries the cleanup.
+                return;
+            }
         }
         remove_pidfile(app);
     }
@@ -688,6 +704,7 @@ pub fn cleanup_stale_processes<R: Runtime>(app: &AppHandle<R>) -> AppResult<()> 
     let pid_path = runtime.join(ENGINE_PID_FILE);
 
     if let Ok(raw) = fs::read_to_string(&pid_path) {
+        let mut keep_pidfile = false;
         if let Ok(record) = serde_json::from_str::<PidFile>(&raw) {
             if record.pid > 1 && pid_alive(record.pid) && process_matches(record.pid, &record.binary) {
                 signal_group(record.pid, libc::SIGTERM);
@@ -699,10 +716,21 @@ pub fn cleanup_stale_processes<R: Runtime>(app: &AppHandle<R>) -> AppResult<()> 
                 }
                 if pid_alive(record.pid) {
                     signal_group(record.pid, libc::SIGKILL);
+                    for _ in 0..4 {
+                        if !pid_alive(record.pid) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(150));
+                    }
                 }
+                // Keep the record when even SIGKILL did not stop it, so the
+                // next launch retries instead of forgetting the port holder.
+                keep_pidfile = pid_alive(record.pid);
             }
         }
-        let _ = fs::remove_file(&pid_path);
+        if !keep_pidfile {
+            let _ = fs::remove_file(&pid_path);
+        }
     }
 
     // A crash mid-install leaves a staging directory. Nothing else can be using
@@ -772,13 +800,50 @@ pub fn signal_group(pid: u32, signal: libc::c_int) {
     }
     #[cfg(unix)]
     unsafe {
-        // The child is started with process_group(0), so its PGID equals its
-        // PID and the whole tree (including helper threads/processes) is hit.
-        libc::kill(-(pid as i32), signal);
+        // New children are started with process_group(0), so their PGID
+        // equals their PID and the whole tree is hit. Older Janas children
+        // live in the app's own group, where `-pid` matches nothing: signal
+        // the PID as well or those engines survive every kill attempt. Only
+        // address the group when the PID really leads one, so an unrelated
+        // group that happens to share the number is never hit.
+        if libc::getpgid(pid as i32) == pid as i32 {
+            libc::kill(-(pid as i32), signal);
+        }
+        libc::kill(pid as i32, signal);
     }
     #[cfg(not(unix))]
     {
         let _ = (pid, signal);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod process_signal_tests {
+    use super::*;
+
+    /// The stale-engine reaper used to signal only `-pid`, which is a no-op
+    /// for a child spawned in the app's process group. That left old Janas
+    /// engines holding their port forever.
+    #[test]
+    fn signal_group_stops_a_child_that_is_not_a_group_leader() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let pgid = unsafe { libc::getpgid(pid as i32) };
+        assert_ne!(pgid, pid as i32, "the test child must not lead a group");
+
+        signal_group(pid, libc::SIGTERM);
+        for _ in 0..80 {
+            if child.try_wait().expect("wait for sleep").is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("signal_group left a non-group-leader child alive");
     }
 }
 
