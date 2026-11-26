@@ -376,13 +376,116 @@ pub fn normalize_janas_kv_cache(value: &str) -> String {
     }
 }
 
+/// The bundle identifier the app shipped with before the MikroTitan rename.
+/// Tauri derives the default config, data and cache folders from it.
+pub const LEGACY_IDENTIFIER: &str = "dev.janas.studio";
+
+/// The folder the previous identifier used beside `current`.
+pub fn legacy_sibling(current: &Path) -> Option<PathBuf> {
+    current
+        .parent()
+        .map(|parent| parent.join(LEGACY_IDENTIFIER))
+}
+
+/// Move the contents of the pre-rename profile into the renamed folder.
+///
+/// Entries the new profile already contains always win, so a second launch can
+/// never overwrite a live profile. The old folder is removed only when every
+/// entry moved, which keeps the migration non-destructive.
+pub fn migrate_legacy_dir(current: &Path) -> bool {
+    let Some(legacy) = legacy_sibling(current) else {
+        return false;
+    };
+    if legacy == current || !legacy.is_dir() || fs::create_dir_all(current).is_err() {
+        return false;
+    }
+    let Ok(entries) = fs::read_dir(&legacy) else {
+        return false;
+    };
+    let mut moved = false;
+    for entry in entries.flatten() {
+        let target = current.join(entry.file_name());
+        if target.exists() {
+            // The webview may have already created an empty folder here.
+            let reclaimable = target.is_dir()
+                && fs::read_dir(&target)
+                    .map(|mut entries| entries.next().is_none())
+                    .unwrap_or(false)
+                && fs::remove_dir(&target).is_ok();
+            if !reclaimable {
+                continue;
+            }
+        }
+        if fs::rename(entry.path(), &target).is_ok() {
+            moved = true;
+        }
+    }
+    let _ = fs::remove_dir(&legacy);
+    moved
+}
+
+fn remap_path(value: &mut String, from: &Path, to: &Path) {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let source = Path::new(trimmed);
+    let Ok(rest) = source.strip_prefix(from) else {
+        return;
+    };
+    // A path that still exists was intentionally left in the old profile (the
+    // new one already had that entry), so keep pointing at the real files.
+    if source.exists() {
+        return;
+    }
+    *value = to.join(rest).to_string_lossy().into_owned();
+}
+
+impl AppSettings {
+    /// Rewrite the absolute paths that pointed into the pre-rename data
+    /// folder. Paths the user chose elsewhere are left untouched.
+    pub fn remap_data_paths(&mut self, legacy_data_dir: &Path, data_dir: &Path) {
+        if legacy_data_dir == data_dir {
+            return;
+        }
+        for value in [
+            &mut self.models_dir,
+            &mut self.model_path,
+            &mut self.llama_model_path,
+            &mut self.llama_mmproj_path,
+            &mut self.llama_mtp_path,
+            &mut self.llama_draft_path,
+            &mut self.mtp_path,
+            &mut self.draft_path,
+            &mut self.ssd_cache_dir,
+        ] {
+            remap_path(value, legacy_data_dir, data_dir);
+        }
+        for bundle in &mut self.model_bundles {
+            for value in [
+                &mut bundle.main_model_path,
+                &mut bundle.mmproj_path,
+                &mut bundle.draft_model_path,
+            ] {
+                remap_path(value, legacy_data_dir, data_dir);
+            }
+        }
+    }
+}
+
 pub struct SettingsStore {
     path: PathBuf,
     settings: RwLock<AppSettings>,
 }
 
 impl SettingsStore {
-    pub fn load(config_dir: PathBuf, data_dir: PathBuf) -> AppResult<Self> {
+    /// `legacy_data_dir` is the folder the previous bundle identifier used.
+    /// Paths that profile saved are rewritten to `data_dir`.
+    pub fn load(
+        config_dir: PathBuf,
+        data_dir: PathBuf,
+        legacy_data_dir: Option<PathBuf>,
+    ) -> AppResult<Self> {
         fs::create_dir_all(&config_dir)?;
         let default_models = data_dir.join("models");
         fs::create_dir_all(&default_models)?;
@@ -402,6 +505,10 @@ impl SettingsStore {
         } else {
             defaults
         };
+
+        if let Some(legacy) = legacy_data_dir.as_deref() {
+            settings.remap_data_paths(legacy, &data_dir);
+        }
 
         if settings.models_dir.trim().is_empty() {
             settings.models_dir = default_models.to_string_lossy().to_string();
@@ -734,7 +841,7 @@ mod tests {
             crate::util::now_ms()
         ));
         let config = root.join("config");
-        let store = SettingsStore::load(config.clone(), root.join("data"))
+        let store = SettingsStore::load(config.clone(), root.join("data"), None)
             .expect("settings store should load");
         store.save(store.get()).expect("settings should save");
 

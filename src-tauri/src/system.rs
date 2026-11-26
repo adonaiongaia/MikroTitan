@@ -1709,11 +1709,24 @@ pub struct DownloadRecord {
 }
 
 fn manifest_path(root: &Path) -> PathBuf {
+    root.join(".mikrotitan").join("downloads.json")
+}
+
+/// Download records written before the rename live in `.janas`. They are still
+/// read so existing files keep verifying, and the next record written moves
+/// them into the MikroTitan folder.
+fn legacy_manifest_path(root: &Path) -> PathBuf {
     root.join(".janas").join("downloads.json")
 }
 
 pub fn read_download_manifest(root: &Path) -> Vec<DownloadRecord> {
-    fs::read_to_string(manifest_path(root))
+    let path = manifest_path(root);
+    let path = if path.is_file() {
+        path
+    } else {
+        legacy_manifest_path(root)
+    };
+    fs::read_to_string(path)
         .ok()
         .and_then(|raw| serde_json::from_str::<Vec<DownloadRecord>>(&raw).ok())
         .unwrap_or_default()

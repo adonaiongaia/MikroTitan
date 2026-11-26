@@ -556,11 +556,26 @@ fn main() {
         .setup(|app| {
             let config_dir = app.path().app_config_dir()?;
             let data_dir = app.path().app_data_dir()?;
+            let local_data_dir = app.path().app_local_data_dir()?;
+            // The MikroTitan rename changed the bundle identifier, and Tauri
+            // derives every default folder from it. Carry an existing profile
+            // over before the stores open, and keep the absolute paths it
+            // saved pointing at the moved files.
+            let data_dir_migrated = settings::migrate_legacy_dir(&data_dir);
+            settings::migrate_legacy_dir(&config_dir);
+            settings::migrate_legacy_dir(&local_data_dir);
+            let legacy_data_dir = data_dir_migrated
+                .then(|| settings::legacy_sibling(&data_dir))
+                .flatten();
             if let Ok(bin) = engines::managed_bin_dir(app.handle()) {
                 settings::set_managed_dir(bin);
             }
 
-            let store = Arc::new(SettingsStore::load(config_dir, data_dir.clone())?);
+            let store = Arc::new(SettingsStore::load(
+                config_dir,
+                data_dir.clone(),
+                legacy_data_dir,
+            )?);
             // WebKitGTK disables getUserMedia and denies permission requests by
             // default. Enable audio-only capture for this trusted app origin so
             // the Composer's microphone works on Linux without a sidecar.
@@ -574,7 +589,6 @@ fn main() {
             // The vault lives beside the chats in the *local* data directory, so
             // a roaming profile or a synced home never copies an index of the
             // user's documents to another machine.
-            let local_data_dir = app.path().app_local_data_dir()?;
             let knowledge = KnowledgeStore::load(local_data_dir.join("knowledge"));
             // Benchmark suites live beside the chats in the local data dir so
             // a roaming profile never copies hardware measurements between

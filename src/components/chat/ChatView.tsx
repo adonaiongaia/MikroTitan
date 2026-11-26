@@ -1535,22 +1535,38 @@ export function ChatView({
                 <AlertTriangle className="h-4 w-4 shrink-0 text-amber-400" />
                 <div className="min-w-0 flex-1">
                   <p className="text-xs font-medium text-amber-200">
-                    The {activeKind === "llama" ? "llama.cpp" : "Janas"} engine
-                    is not ready.
+                    {activeKind === null
+                      ? "No engine selected."
+                      : `The ${
+                          activeKind === "llama" ? "llama.cpp" : "Janas"
+                        } engine is not ready.`}
                   </p>
                   <p className="mt-0.5 truncate text-[10px] text-amber-200/60">
-                    {engine.snapshot.detail}
+                    {activeKind === null
+                      ? "Select an engine in the Engine panel, then start it."
+                      : engine.snapshot.detail}
                   </p>
                 </div>
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  busy={engine.busy}
-                  onClick={() => void engine.start()}
-                  icon={<Play className="h-3 w-3" />}
-                >
-                  Start engine
-                </Button>
+                {activeKind === null ? (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => setEngineCollapsed(false)}
+                    icon={<Cpu className="h-3 w-3" />}
+                  >
+                    Select engine
+                  </Button>
+                ) : (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    busy={engine.busy}
+                    onClick={() => void engine.start()}
+                    icon={<Play className="h-3 w-3" />}
+                  >
+                    Start engine
+                  </Button>
+                )}
               </div>
             ) : null}
 

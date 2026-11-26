@@ -2032,9 +2032,9 @@ mod real_suite {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "runs janas-server and llama-server against the local models"]
     async fn real_two_target_suite() {
-        let data_dir = home().join(".local/share/dev.janas.studio");
-        let config_dir = home().join(".config/dev.janas.studio");
-        let store = SettingsStore::load(config_dir, data_dir.clone())
+        let data_dir = home().join(".local/share/dev.mikrotitan.studio");
+        let config_dir = home().join(".config/dev.mikrotitan.studio");
+        let store = SettingsStore::load(config_dir, data_dir.clone(), None)
             .expect("load the real Studio settings");
         let mut settings = store.get();
 

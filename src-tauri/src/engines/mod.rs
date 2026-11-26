@@ -634,7 +634,7 @@ pub fn managed_bin_dir<R: Runtime>(app: &AppHandle<R>) -> AppResult<PathBuf> {
 
     let data = app.path().app_local_data_dir().map_err(|err| {
         AppError::message(format!(
-            "Could not resolve the app's local data directory: {err}. On Linux this is normally ~/.local/share/dev.janas.studio."
+            "Could not resolve the app's local data directory: {err}. On Linux this is normally ~/.local/share/dev.mikrotitan.studio."
         ))
     })?;
     let dir = data.join("bin");
