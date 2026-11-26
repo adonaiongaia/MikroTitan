@@ -458,7 +458,7 @@ The **0.2.0** AppImage was rebuilt against Tauri 2.12.6 and inspected on Linux x
 - `npm run appimage` — release build and AppImage bundling completed:
   - Artifact: `src-tauri/target/release/bundle/appimage/MikroTitan_0.2.0_amd64.AppImage`
   - Size: 171,211,256 bytes (163.28 MiB)
-  - SHA-256: `7987b203eb408109f3f7fec91f4f08bba8f0c3853999200a6d07611686147c40`
+  - SHA-256: `11268eab87f9806a0cda3cc75a43f6b779b0b2bd5745b9048bd3385186ec589b`
   - Bundle checks: the desktop entry reports `Name=MikroTitan`, the running app's window title is **MikroTitan**, the bundled icon and `.DirIcon` match `src-tauri/icons/128x128.png` and `src-tauri/icons/128x128@2x.png`, and `usr/share/licenses/mikrotitan/LICENSE` plus `usr/share/doc/mikrotitan/THIRD_PARTY_NOTICES.md` match the repository files byte-for-byte. No `studio-for-janas` paths remain. No Janas binaries are bundled, and the WebKit media framework used by microphone capture is included.
 - **Screenshots:** regenerated against the 0.2.0 build with the new sidebar mark and the **MikroTitan** assistant reply heading, covering the per-chat draft/MCP badge, the agent run trace, and the Tools scope drawer.
 - `npm run check` / `npm run build` — TypeScript typecheck and production build passed for 0.2.0.

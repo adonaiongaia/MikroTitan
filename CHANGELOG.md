@@ -37,6 +37,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Changed
 
+- **The assistant identifies as MikroTitan.** The core chat prompt and the agent prompt now introduce the assistant as **MikroTitan** instead of Janas. Janas remains the name of the Janas-LLM engine, its settings and its upstream tooling.
 - **The AppImage now bundles the WebKit media framework.** `bundleMediaFramework` is enabled so microphone capture works in the packaged app; this increases the artifact size.
 - **Agent settings now show the effective workspace.** The workspace control displays the path the next run will actually use (the chat override when present, otherwise the default) and the clear button clears both, instead of showing an empty default while a stale chat path still takes precedence.
 - **Workspace choices are validated when picked.** The folder dialog result is canonicalized by Rust before it is saved, so a path that disappears between selection and the next run is rejected at selection time instead of failing the run.

@@ -3031,7 +3031,7 @@ fn build_system_prompt(
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "(no workspace selected — file and shell tools are unavailable)".into());
     let mut prompt = format!(
-        "You are Janas Agent, an autonomous coding agent running locally on the user's machine.\n\n\
+        "You are MikroTitan Agent, an autonomous coding agent running locally on the user's machine.\n\n\
 Workspace root: {root}\n\n\
 Operating rules:\n\
 - Work iteratively: decide the next step, call tools, read each observation, then continue. You may call several tools in one turn.\n\

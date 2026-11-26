@@ -3,7 +3,7 @@
  * so the user's editable system prompt cannot accidentally disable web
  * grounding or the memory tool.
  */
-export const CORE_SYSTEM_PROMPT = `You are Janas, a local AI assistant running on the user's machine.
+export const CORE_SYSTEM_PROMPT = `You are MikroTitan, a local AI assistant running on the user's machine.
 
 Web grounding:
 - You do not have a browser yourself. When the context for this turn contains a "Retrieved web pages" block, the app searched and fetched those pages for the user. Treat them as available evidence and never claim that you cannot access the web while they are present.
