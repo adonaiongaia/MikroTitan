@@ -301,7 +301,7 @@ Build on **Ubuntu 22.04** (or another system with the same glibc 2.35 baseline a
 npm run appimage
 ```
 
-The build ends with `scripts/check-appimage-glibc.sh`, which extracts the AppImage and fails if any bundled ELF file needs a glibc newer than 2.35. For a local-only build on a newer host, `APPIMAGE_MAX_GLIBC=2.39 npm run appimage` overrides the guard; do not upload that artifact.
+The build ends with `scripts/check-appimage-glibc.sh`, which extracts the AppImage and fails if any bundled ELF file needs a glibc newer than 2.35. For a local-only build on a newer host, `APPIMAGE_MAX_GLIBC=2.39 npm run appimage` overrides the guard; do not upload that artifact. For a release build on a newer host, use the Docker target below.
 
 The artifact is written to:
 
@@ -312,6 +312,22 @@ src-tauri/target/release/bundle/appimage/MikroTitan_0.2.0_amd64.AppImage
 Run it with `chmod +x` and execute directly. The image bundles its WebKitGTK/GTK runtime libraries (verified with `ldd` on the extracted payload); a graphical Linux session with working display and GPU drivers is still required.
 
 For releases, run **Actions → Build AppImage** and set the release tag (for example `MikroTitan`) to replace that release's AppImage asset with the Ubuntu 22.04 build. Leave the tag empty to only produce a workflow artifact.
+
+### Build the AppImage with Docker (Ubuntu 22.04)
+
+If Docker is installed but the host is not Ubuntu 22.04, build the release artifact in a jammy container:
+
+```bash
+npm run appimage:docker
+```
+
+This uses `Dockerfile.appimage` and writes `release/MikroTitan_0.2.0_amd64.AppImage`. The first run installs the toolchain and compiles the Rust dependencies; later runs reuse the BuildKit Cargo cache. The container uses the same dependency set as the **Build AppImage** workflow, runs `scripts/check-appimage-glibc.sh` before the artifact leaves the build stage, and the wrapper checks the extracted file again on the host.
+
+Upload the local artifact to an existing release with the GitHub UI or:
+
+```bash
+gh release upload MikroTitan release/MikroTitan_0.2.0_amd64.AppImage --clobber
+```
 
 ### Dual-engine integration harness
 

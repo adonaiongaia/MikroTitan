@@ -12,7 +12,8 @@
     "check": "tsc --noEmit",
     "test": "vitest run",
     "tauri": "tauri",
-    "appimage": "bash scripts/build-appimage.sh"
+    "appimage": "bash scripts/build-appimage.sh",
+    "appimage:docker": "bash scripts/build-appimage-docker.sh"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.9.0",
