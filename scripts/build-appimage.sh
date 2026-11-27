@@ -34,10 +34,11 @@ fi
 
 # linuxdeploy's GTK plugin resolves runtime directories through pkg-config.
 # The local stubs intentionally carry no install paths, so put corrected
-# multiarch metadata ahead of them for the bundling step.
-export PKG_CONFIG_PATH="$ROOT/scripts/appimage-pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+# multiarch metadata ahead of them for the bundling step. On a normal build
+# host such as the Ubuntu 22.04 CI runner, the system metadata is already
+# correct and must not be shadowed by these stubs.
 if [[ -d "$ROOT/.tools/pkgconfig" ]]; then
-  export PKG_CONFIG_PATH="$PKG_CONFIG_PATH:$ROOT/.tools/pkgconfig"
+  export PKG_CONFIG_PATH="$ROOT/scripts/appimage-pkgconfig:$ROOT/.tools/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 fi
 
 GTK_LIBDIR="/usr/lib/x86_64-linux-gnu"
@@ -73,6 +74,11 @@ if [[ -e "$APPDIR/usr/bin/fake-llama-server" ]]; then
   echo "Refusing to leave the test-only fake-llama-server in the AppDir" >&2
   exit 1
 fi
+
+# A build on a newer distribution raises the AppImage's glibc requirement,
+# which makes it unusable on older supported systems. Refuse to hand back an
+# artifact that cannot run on the Ubuntu 22.04 baseline.
+bash "$ROOT/scripts/check-appimage-glibc.sh" "$ARTIFACT"
 
 echo
 echo "AppImage built successfully:"

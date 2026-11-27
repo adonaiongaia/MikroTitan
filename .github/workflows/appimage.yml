@@ -1,0 +1,79 @@
+name: Build AppImage
+
+# An AppImage does not bundle glibc, so its minimum glibc is fixed by the
+# machine that built it. Ubuntu 22.04 provides WebKitGTK 4.1 and glibc 2.35,
+# which is the oldest baseline AppImageHub still tests. Building on a newer
+# distribution raises the requirement to that host's glibc and the AppImage
+# then fails to start on older, still-supported systems.
+#
+# Run this from Actions -> Build AppImage. Set the release tag (for example
+# "MikroTitan") to replace that release's AppImage asset; leave it empty to
+# only build and download the workflow artifact.
+#
+# ubuntu-22.04 is deprecated but still offered through April 2027 and is the
+# simplest way to get a jammy userspace here. When it retires, move this job
+# to an ubuntu:22.04 container.
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag to upload the AppImage to (empty = build only)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  appimage:
+    name: AppImage (Ubuntu 22.04, glibc 2.35)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            file \
+            pkg-config \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            patchelf \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-alsa \
+            gstreamer1.0-pipewire
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build AppImage
+        run: npm run appimage
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MikroTitan-appimage
+          path: src-tauri/target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+
+      - name: Replace release asset
+        if: ${{ inputs.release_tag != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          gh release upload "$RELEASE_TAG" \
+            src-tauri/target/release/bundle/appimage/*.AppImage \
+            --clobber --repo "$GITHUB_REPOSITORY"
