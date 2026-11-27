@@ -382,18 +382,21 @@ fn guard_cpu_only_target(
 const LAST_GOOD_VULKAN_KV_OFFLOAD_BUILD: u64 = 12_236;
 
 /// llama.cpp's Vulkan backend cannot schedule the KV cache of a
-/// sliding-window (hybrid) model when that cache lives in GPU memory:
+/// sliding-window or recurrent-hybrid model when that cache lives in GPU
+/// memory:
 ///
 /// `pre-allocated tensor (cache_k_l1 (view)) in a buffer (Vulkan0) that cannot
 /// run the operation (SET_ROWS)`
 ///
 /// The scheduler calls `GGML_ABORT`, so the server dies with SIGABRT before it
-/// binds the port and the app only sees an immediate exit. No KV flag avoids
-/// it, and `-nkvo` is not a free workaround: it leaves attention on the CPU
-/// while the weights stay on the GPU. On the Vulkan-only hosts this affects,
-/// running the whole model on the CPU measured roughly twice the throughput of
-/// that split (`--device none`), so the adapter drops GPU offload instead.
-/// Returns the warning that describes the substitution.
+/// binds the port and the app only sees an immediate exit. Qwen3.8 is one such
+/// hybrid model: its GGUF has recurrent layers and a full-attention interval
+/// instead of a sliding-window size. No KV flag avoids the abort, and `-nkvo`
+/// is not a free workaround: it leaves attention on the CPU while the weights
+/// stay on the GPU. On the Vulkan-only hosts this affects, running the whole
+/// model on the CPU measured roughly twice the throughput of that split
+/// (`--device none`), so the adapter drops GPU offload instead. Returns the
+/// warning that describes the substitution.
 fn guard_vulkan_swa_kv_cache(
     args: &mut Vec<String>,
     settings: &AppSettings,
@@ -430,7 +433,7 @@ fn guard_vulkan_swa_kv_cache(
         return None;
     }
     let model = settings::expand_home(settings.llama_model_path.trim());
-    if !crate::gguf::has_sliding_window(&model.to_string_lossy()) {
+    if !crate::gguf::has_vulkan_kv_cache_risk(&model.to_string_lossy()) {
         return None;
     }
 
@@ -444,10 +447,10 @@ fn guard_vulkan_swa_kv_cache(
     }
     Some(match used_cpu {
         true => format!(
-            "llama.cpp's Vulkan backend aborts while reserving the KV cache of sliding-window (hybrid) models when that cache is offloaded to the GPU (upstream issue #29082; b{LAST_GOOD_VULKAN_KV_OFFLOAD_BUILD} is the last known-good build). This launch runs the model on the CPU with `--device none`. Add `-nkvo` to Extra llama arguments to keep the weights on the GPU with a host KV cache, or `-kvo` to force GPU KV offload."
+            "llama.cpp's Vulkan backend aborts while reserving the KV cache of sliding-window or recurrent-hybrid models when that cache is offloaded to the GPU (upstream issue #29082; b{LAST_GOOD_VULKAN_KV_OFFLOAD_BUILD} is the last known-good build). This launch runs the model on the CPU with `--device none`. Add `-nkvo` to Extra llama arguments to keep the weights on the GPU with a host KV cache, or `-kvo` to force GPU KV offload."
         ),
         false => format!(
-            "llama.cpp's Vulkan backend aborts while reserving the KV cache of sliding-window (hybrid) models when that cache is offloaded to the GPU (upstream issue #29082; b{LAST_GOOD_VULKAN_KV_OFFLOAD_BUILD} is the last known-good build). This launch keeps the KV cache in system RAM with `-nkvo`. Add `-kvo` to Extra llama arguments to force GPU KV offload."
+            "llama.cpp's Vulkan backend aborts while reserving the KV cache of sliding-window or recurrent-hybrid models when that cache is offloaded to the GPU (upstream issue #29082; b{LAST_GOOD_VULKAN_KV_OFFLOAD_BUILD} is the last known-good build). This launch keeps the KV cache in system RAM with `-nkvo`. Add `-kvo` to Extra llama arguments to force GPU KV offload."
         ),
     })
 }
@@ -1213,6 +1216,21 @@ mod tests {
         std::fs::write(path, bytes).expect("write gguf");
     }
 
+    fn write_hybrid_gguf(path: &Path) {
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend(3u32.to_le_bytes());
+        bytes.extend(0u64.to_le_bytes());
+        bytes.extend(1u64.to_le_bytes());
+        let key = b"qwen35.attention.recurrent_layers";
+        bytes.extend((key.len() as u64).to_le_bytes());
+        bytes.extend(key);
+        bytes.extend(9u32.to_le_bytes()); // array
+        bytes.extend(7u32.to_le_bytes()); // bool
+        bytes.extend(4u64.to_le_bytes());
+        bytes.extend([1u8, 1, 1, 0]);
+        std::fs::write(path, bytes).expect("write hybrid gguf");
+    }
+
     fn vulkan_probe(build: u64) -> ProbeOutput {
         ProbeOutput {
             version_line: Some(format!("version: 1.0.0-dev (build {build}, commit a956a852c)")),
@@ -1243,6 +1261,28 @@ mod tests {
         let warning = warning.expect("warning");
         assert!(warning.contains("#29082"));
         assert!(warning.contains("--device none"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn vulkan_hybrid_models_keep_the_kv_cache_on_the_host() {
+        let path = std::env::temp_dir().join(format!(
+            "janas-llama-hybrid-{}.gguf",
+            std::process::id()
+        ));
+        write_hybrid_gguf(&path);
+        let mut settings = AppSettings::default();
+        settings.llama_model_path = path.to_string_lossy().to_string();
+        settings.llama_gpu_layers = 36;
+
+        let mut args = vec!["--model".to_string(), "model.gguf".to_string()];
+        let warning = guard_vulkan_swa_kv_cache(&mut args, &settings, &vulkan_probe(12_387));
+
+        assert_eq!(
+            args[args.len() - 2..].to_vec(),
+            vec!["--device".to_string(), "none".to_string()]
+        );
+        assert!(warning.expect("warning").contains("#29082"));
         let _ = std::fs::remove_file(path);
     }
 
