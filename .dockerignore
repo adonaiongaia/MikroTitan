@@ -1,0 +1,15 @@
+.git
+.github
+.freebuff
+.cloud-attachments
+.tools
+node_modules
+dist
+release
+src-tauri/target
+docs
+*.AppImage
+*.log
+.env
+.env.*
+.frozen*.png
