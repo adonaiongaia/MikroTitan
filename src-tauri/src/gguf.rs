@@ -47,9 +47,12 @@ pub struct GgufModelInfo {
     pub architecture: Option<String>,
     /// The transformer block count (`block_count`) declared by the model.
     pub layer_count: Option<u32>,
-    /// The model declares a sliding-window attention size, which is how hybrid
-    /// architectures describe their local-attention layers.
+    /// The model declares a sliding-window attention size, which is how some
+    /// hybrid architectures describe their local-attention layers.
     pub sliding_window: bool,
+    /// The model mixes recurrent and full-attention layers (for example
+    /// Qwen3.8), so its KV cache must stay on the host for the Vulkan build.
+    pub hybrid_attention: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -65,6 +68,7 @@ struct Metadata {
     name: Option<String>,
     chat_template: Option<String>,
     sliding_window: bool,
+    hybrid_attention: bool,
 }
 
 /// Read only the metadata header of a GGUF model.
@@ -102,6 +106,7 @@ pub fn inspect(path: &str) -> AppResult<GgufModelInfo> {
         architecture: metadata.architecture,
         layer_count: metadata.layer_count,
         sliding_window: metadata.sliding_window,
+        hybrid_attention: metadata.hybrid_attention,
     })
 }
 
@@ -111,13 +116,15 @@ pub fn layer_count(path: &str) -> Option<u32> {
     inspect(path).ok().and_then(|info| info.layer_count)
 }
 
-/// True when the model declares a sliding-window attention size. Hybrid
-/// architectures (Gemma 3, Qwen3-Next and similar) store a non-zero
-/// `<architecture>.attention.sliding_window`; the llama.cpp Vulkan backend
-/// cannot schedule that KV cache in a GPU buffer, so the launch adapter keeps
-/// it on the host.
-pub fn has_sliding_window(path: &str) -> bool {
-    inspect(path).map(|info| info.sliding_window).unwrap_or(false)
+/// True when the model's KV cache cannot be scheduled in a Vulkan buffer by
+/// the llama.cpp backend. Sliding-window models declare
+/// `<architecture>.attention.sliding_window`; hybrid models such as Qwen3.8
+/// declare recurrent layers and a full-attention interval instead. Both need
+/// the launch adapter to keep the KV cache on the host.
+pub fn has_vulkan_kv_cache_risk(path: &str) -> bool {
+    inspect(path)
+        .map(|info| info.sliding_window || info.hybrid_attention)
+        .unwrap_or(false)
 }
 
 /// Read the small pieces of GGUF metadata the model-library badges need. A
@@ -207,6 +214,18 @@ fn read_metadata<R: Read + Seek>(reader: &mut R) -> Result<Metadata, String> {
                     }
                 }
             }
+            continue;
+        }
+
+        if key == "full_attention_interval" || key.ends_with(".full_attention_interval") {
+            if read_unsigned_value(reader, value_type)?.unwrap_or(0) > 0 {
+                metadata.hybrid_attention = true;
+            }
+            continue;
+        }
+
+        if key == "attention.recurrent_layers" || key.ends_with(".attention.recurrent_layers") {
+            metadata.hybrid_attention |= read_recurrent_layers(reader, value_type)?;
             continue;
         }
 
@@ -322,6 +341,42 @@ fn read_unsigned_value<R: Read + Seek>(
             Ok(None)
         }
     }
+}
+
+/// Read a `recurrent_layers` array. A non-empty bool array with at least one
+/// true entry marks the model as hybrid; index arrays are treated the same way
+/// because their presence means some layers use recurrent attention.
+fn read_recurrent_layers<R: Read + Seek>(
+    reader: &mut R,
+    value_type: u32,
+) -> Result<bool, String> {
+    if value_type != TYPE_ARRAY {
+        skip_value(reader, value_type, 0)?;
+        return Ok(false);
+    }
+
+    let inner_type = read_u32(reader)?;
+    let count = read_u64(reader)?;
+    if count > MAX_ARRAY_ENTRIES {
+        return Err(format!(
+            "recurrent layer array declares an unreasonable {count} entries"
+        ));
+    }
+
+    if inner_type == TYPE_BOOL || inner_type == TYPE_UINT8 {
+        let mut any = false;
+        for _ in 0..count {
+            if read_u8(reader)? != 0 {
+                any = true;
+            }
+        }
+        return Ok(any);
+    }
+
+    for _ in 0..count {
+        skip_value(reader, inner_type, 1)?;
+    }
+    Ok(count > 0)
 }
 
 fn read_sized<R: Read>(reader: &mut R, max: u64, label: &str) -> Result<Vec<u8>, String> {
@@ -475,6 +530,38 @@ mod tests {
 
         let metadata = read_metadata(&mut Cursor::new(bytes)).unwrap();
         assert!(!metadata.sliding_window);
+        assert!(!metadata.hybrid_attention);
+    }
+
+    #[test]
+    fn detects_hybrid_attention_from_recurrent_layers() {
+        let mut bytes = header(2);
+        push_key(&mut bytes, "qwen35.block_count");
+        bytes.extend(TYPE_UINT32.to_le_bytes());
+        bytes.extend(32u32.to_le_bytes());
+        push_key(&mut bytes, "qwen35.attention.recurrent_layers");
+        bytes.extend(TYPE_ARRAY.to_le_bytes());
+        bytes.extend(TYPE_BOOL.to_le_bytes());
+        bytes.extend(4u64.to_le_bytes());
+        bytes.extend([1u8, 1, 1, 0]);
+
+        let metadata = read_metadata(&mut Cursor::new(bytes)).unwrap();
+        assert!(metadata.hybrid_attention);
+        assert!(!metadata.sliding_window);
+    }
+
+    #[test]
+    fn detects_hybrid_attention_from_full_attention_interval() {
+        let mut bytes = header(2);
+        push_key(&mut bytes, "qwen35.block_count");
+        bytes.extend(TYPE_UINT32.to_le_bytes());
+        bytes.extend(32u32.to_le_bytes());
+        push_key(&mut bytes, "qwen35.full_attention_interval");
+        bytes.extend(TYPE_UINT32.to_le_bytes());
+        bytes.extend(4u32.to_le_bytes());
+
+        let metadata = read_metadata(&mut Cursor::new(bytes)).unwrap();
+        assert!(metadata.hybrid_attention);
     }
 
     #[test]

@@ -104,13 +104,13 @@ Before launch, the backend asynchronously runs `{binary} --version` and `{binary
 
 ##### Vulkan KV-cache guard
 
-llama.cpp's Vulkan backend cannot schedule the KV cache of a sliding-window (hybrid) model while that cache lives in a GPU buffer. Builds after b12236 abort inside the scheduler before the server binds its port:
+llama.cpp's Vulkan backend cannot schedule the KV cache of a sliding-window or recurrent-hybrid model while that cache lives in a GPU buffer. Qwen3.8 (`qwen35`) is one example: it declares recurrent layers and a full-attention interval instead of a sliding-window size. Builds after b12236 abort inside the scheduler before the server binds its port:
 
 ```text
 ggml-backend.cpp:1358: pre-allocated tensor (cache_k_l1 (view)) in a buffer (Vulkan0) that cannot run the operation (SET_ROWS)
 ```
 
-The process dies with `SIGABRT`, which the app only sees as an immediate exit. Upstream issue #29082 tracks the regression. The probe therefore also runs `--list-devices` (skipped when the build does not advertise it), and the launch adapter falls back to CPU execution (`--device none`) when all of these hold: the build advertises `-nkvo`, a Vulkan device is available, GPU layers are requested, the build is newer than b12236, and the selected GGUF declares `<architecture>.attention.sliding_window`.
+The process dies with `SIGABRT`, which the app only sees as an immediate exit. Upstream issue #29082 tracks the regression. The probe therefore also runs `--list-devices` (skipped when the build does not advertise it), and the launch adapter falls back to CPU execution (`--device none`) when all of these hold: the build advertises `-nkvo`, a Vulkan device is available, GPU layers are requested, the build is newer than b12236, and the selected GGUF declares sliding-window or hybrid recurrent attention (`<architecture>.attention.sliding_window`, `<architecture>.attention.recurrent_layers`, or a nonzero `<architecture>.full_attention_interval`).
 
 `-nkvo` is not a free substitute here: it leaves attention on the CPU while the weights stay on the GPU. Measured on a Radeon 660M iGPU with a 4 B Q5_K_M sliding-window model, that split produced 6.7 tok/s against 14.2 tok/s for a full CPU launch and 17.1 tok/s for b12236 with GPU KV offload, so a CPU launch is the safer automatic default. The substitution emits an `engine://adapter-warning` that names the issue and both overrides: `-nkvo` in **Extra llama arguments** keeps the weights on the GPU with a host KV cache (better when the model is larger than RAM), and `-kvo` forces GPU KV offload back on. Any explicit `--device`, `-nkvo` or `-kvo` in the extra arguments disables the fallback. Full-attention models, CPU-only launches, CUDA/ROCm/Metal hosts and b12236 and older are untouched.
 
