@@ -201,6 +201,8 @@ impl<R: Runtime> EngineRunner<R> for JanasRunner {
             started_at_ms: snapshot.started_at_ms.unwrap_or_else(now_ms),
             probe,
             metrics_enabled: false,
+            // Janas owns its own device selection; the GPU ladder is llama-only.
+            fallbacks: Vec::new(),
             exit_rx: None,
         };
         write_pidfile(app, &launch);

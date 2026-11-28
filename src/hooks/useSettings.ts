@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 
 import { api } from "../lib/api";
 import { errorMessage } from "../lib/format";
+import { normalizeSettings } from "../lib/llamaHardening";
 import type { AppSettings } from "../types";
 
 export function useSettings() {
@@ -12,7 +13,7 @@ export function useSettings() {
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      setSettings(await api.getSettings());
+      setSettings(normalizeSettings(await api.getSettings()));
       setError(null);
     } catch (err) {
       setError(errorMessage(err));
@@ -26,7 +27,7 @@ export function useSettings() {
   }, [refresh]);
 
   const save = useCallback(async (next: AppSettings) => {
-    const saved = await api.saveSettings(next);
+    const saved = normalizeSettings(await api.saveSettings(next));
     setSettings(saved);
     setError(null);
     return saved;

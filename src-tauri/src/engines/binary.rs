@@ -23,14 +23,14 @@ use std::{
 };
 
 use futures_util::StreamExt;
-use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tokio::{io::AsyncWriteExt, sync::Mutex};
 use uuid::Uuid;
 
 use crate::{
     error::{AppError, AppResult},
-    util::truncate_line,
+    util::{now_ms, truncate_line},
 };
 
 use super::{managed_bin_dir, managed_binary_path, run_cli_probe, EngineKind, EngineSupervisor};
@@ -67,6 +67,94 @@ pub struct ManagedBinaryProbe {
     pub version: Option<String>,
     pub build: Option<u64>,
     pub message: String,
+}
+
+/// A marker for a binary that has been installed since the last successful
+/// model launch. The install-time probe runs `--version` and `--help`, which
+/// cannot catch a regression that only appears when ggml reserves its buffers.
+/// Until `/health` answers once, this marker keeps the update on probation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UnverifiedUpdate {
+    /// The version line reported right after installation.
+    pub version: Option<String>,
+    pub installed_at_ms: u64,
+}
+
+fn unverified_marker_path<R: Runtime>(
+    app: &AppHandle<R>,
+    kind: EngineKind,
+) -> AppResult<PathBuf> {
+    let dir = managed_bin_dir(app)?.join(".runtime");
+    fs::create_dir_all(&dir)
+        .map_err(|err| super::io_error("Could not create the engine runtime folder", &dir, err))?;
+    Ok(dir.join(format!("{}-unverified-update.json", kind.storage_name())))
+}
+
+/// Record that this binary has not yet survived a real model launch.
+/// Best-effort: a read-only or full disk must never fail an install that
+/// otherwise passed verification.
+pub fn mark_unverified_update<R: Runtime>(
+    app: &AppHandle<R>,
+    kind: EngineKind,
+    version: Option<String>,
+) {
+    let Ok(path) = unverified_marker_path(app, kind) else {
+        return;
+    };
+    let payload = UnverifiedUpdate {
+        version,
+        installed_at_ms: now_ms(),
+    };
+    if let Ok(json) = serde_json::to_vec_pretty(&payload) {
+        let _ = fs::write(&path, json);
+    }
+}
+
+/// Called once `/health` returns 200 for a real model. From then on the binary
+/// is trusted and a later crash is reported instead of silently rolled back.
+pub fn clear_unverified_update<R: Runtime>(app: &AppHandle<R>, kind: EngineKind) {
+    if let Ok(path) = unverified_marker_path(app, kind) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+pub fn unverified_update<R: Runtime>(
+    app: &AppHandle<R>,
+    kind: EngineKind,
+) -> Option<UnverifiedUpdate> {
+    let path = unverified_marker_path(app, kind).ok()?;
+    let raw = fs::read_to_string(&path).ok()?;
+    // A marker that exists but cannot be parsed still means "on probation".
+    Some(serde_json::from_str(&raw).unwrap_or_default())
+}
+
+pub fn has_rollback_backup<R: Runtime>(app: &AppHandle<R>, kind: EngineKind) -> bool {
+    managed_binary_path(app, kind)
+        .map(|path| super::backup_path(&path).is_file())
+        .unwrap_or(false)
+}
+
+/// Restore the previous binary without a command round-trip. Used by the
+/// crash-loop watchdog after an unverified update dies during model load.
+pub async fn auto_rollback<R: Runtime>(
+    app: &AppHandle<R>,
+    kind: EngineKind,
+) -> AppResult<BinaryInstallResult> {
+    let manager = app
+        .try_state::<Arc<BinaryManager>>()
+        .map(|state| state.inner().clone())
+        .ok_or_else(|| AppError::message("The binary manager is not available."))?;
+    let supervisor = app
+        .try_state::<Arc<EngineSupervisor<R>>>()
+        .map(|state| state.inner().clone())
+        .ok_or_else(|| AppError::message("The engine supervisor is not available."))?;
+    rollback(
+        app.clone(),
+        manager,
+        supervisor,
+        kind.storage_name().to_string(),
+    )
+    .await
 }
 
 pub struct BinaryManager {
@@ -276,6 +364,9 @@ async fn install_inner(
     let verification = verify_installed(&prepared.target, bin).await;
     match verification {
         Ok(version) => {
+            // Accepted by the probe, but not yet proven against a real model:
+            // mark it so the watchdog can undo a runtime regression once.
+            mark_unverified_update(app, kind, version.clone());
             emit_progress(
                 app,
                 kind,
@@ -330,10 +421,10 @@ async fn install_inner(
     }
 }
 
-async fn rollback(
-    app: AppHandle,
+async fn rollback<R: Runtime>(
+    app: AppHandle<R>,
     manager: Arc<BinaryManager>,
-    supervisor: Arc<EngineSupervisor>,
+    supervisor: Arc<EngineSupervisor<R>>,
     engine_type: String,
 ) -> AppResult<BinaryInstallResult> {
     let kind = parse_engine_type(&engine_type)?;
@@ -359,6 +450,9 @@ async fn rollback(
     let verification = verify_installed(&prepared.target, &bin).await;
     match verification {
         Ok(version) => {
+            // The restored build is the one that already worked, so it is not
+            // on probation and must not be rolled back again.
+            clear_unverified_update(&app, kind);
             let bin_for_cleanup = bin.clone();
             let prepared_for_cleanup = prepared.clone();
             let _ = tokio::task::spawn_blocking(move || {
@@ -547,8 +641,8 @@ pub(crate) async fn download_file(
     Ok(())
 }
 
-fn emit_progress(
-    app: &AppHandle,
+fn emit_progress<R: Runtime>(
+    app: &AppHandle<R>,
     kind: EngineKind,
     phase: &str,
     downloaded: u64,

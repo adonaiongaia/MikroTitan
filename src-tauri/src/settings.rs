@@ -107,6 +107,15 @@ pub struct AppSettings {
     pub llama_cpu_threads: u32,
     /// Additional llama-server flags, parsed with shell-word rules.
     pub llama_extra_args: String,
+    /// Which llama.cpp release automatic setup installs. "baseline" pins the
+    /// tested `KNOWN_GOOD_LLAMA_TAG` (or a `compat.json` recommendation),
+    /// "latest" tracks upstream releases.
+    pub llama_update_channel: String,
+    /// Not persisted: the GPU rung the supervisor selected for this launch.
+    /// "auto" is the requested full-GPU launch, "host-kv" retries with
+    /// `-nkvo`, "cpu" retries with `--device none`.
+    #[serde(skip)]
+    pub llama_launch_step: String,
     /// Janas: request/keep the SSD streaming path when the build advertises it.
     pub ssd_streaming: bool,
     /// Janas: optional SSD cache directory, when the build advertises it.
@@ -180,6 +189,8 @@ impl Default for AppSettings {
             llama_direct_cpu_moe: false,
             llama_cpu_threads: 0,
             llama_extra_args: String::new(),
+            llama_update_channel: "baseline".into(),
+            llama_launch_step: "auto".into(),
             ssd_streaming: false,
             ssd_cache_dir: String::new(),
             top_k: 40,
@@ -272,6 +283,8 @@ impl AppSettings {
             self.active_bundle_id.clear();
         }
         self.llama_extra_args = self.llama_extra_args.trim().to_string();
+        self.llama_update_channel = normalize_llama_update_channel(&self.llama_update_channel);
+        self.llama_launch_step = normalize_llama_launch_step(&self.llama_launch_step);
         self.ssd_cache_dir = self.ssd_cache_dir.trim().to_string();
         self.hf_token = self.hf_token.trim().to_string();
         // Tokens never contain whitespace. Strip line breaks and spaces from a
@@ -337,6 +350,26 @@ pub fn normalize_llama_mtp_mode(value: &str) -> String {
     match value.trim().to_ascii_lowercase().as_str() {
         "off" | "none" | "no" => "off".into(),
         "mtp" | "file" | "on" | "draft-mtp" => "mtp".into(),
+        _ => "auto".into(),
+    }
+}
+
+/// Which upstream release the automatic setup installs. Anything unrecognized
+/// (including a settings file written before this field existed) stays on the
+/// tested baseline instead of silently jumping to a daily build.
+pub fn normalize_llama_update_channel(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "latest" | "upstream" | "nightly" => "latest".into(),
+        _ => "baseline".into(),
+    }
+}
+
+/// The GPU fallback rung is chosen by the supervisor, never by the user, so
+/// anything unfamiliar falls back to the requested full-GPU launch.
+pub fn normalize_llama_launch_step(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "host-kv" => "host-kv".into(),
+        "cpu" => "cpu".into(),
         _ => "auto".into(),
     }
 }
