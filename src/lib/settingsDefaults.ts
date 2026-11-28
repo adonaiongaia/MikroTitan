@@ -56,4 +56,9 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   voice_activation: "toggle",
   voice_auto_send: false,
   voice_strip_non_speech: true,
+  gateway_enabled: false,
+  gateway_port: 11_435,
+  gateway_auto_switch_models: true,
+  gateway_inject_memory: false,
+  gateway_default_rag_collections: [],
 };

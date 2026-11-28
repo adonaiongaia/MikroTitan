@@ -1604,7 +1604,7 @@ pub async fn library_models(app: AppHandle) -> Vec<LibraryModel> {
         .unwrap_or_default()
 }
 
-fn library_models_snapshot(store: &SettingsStore) -> Vec<LibraryModel> {
+pub(crate) fn library_models_snapshot(store: &SettingsStore) -> Vec<LibraryModel> {
     let settings = store.get();
     let root = expand_home(&settings.models_dir);
     let mut files = Vec::new();

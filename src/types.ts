@@ -248,6 +248,33 @@ export interface AppSettings {
   voice_auto_send: boolean;
   /** Drop annotations such as [BLANK_AUDIO] or (music). */
   voice_strip_non_speech: boolean;
+  /** Expose the loopback OpenAI-compatible gateway. */
+  gateway_enabled: boolean;
+  /** Loopback port; defaults to 11435. */
+  gateway_port: number;
+  /** Let a request's `model` switch the loaded engine and model. */
+  gateway_auto_switch_models: boolean;
+  /** Add Memory Bank facts to external gateway requests. */
+  gateway_inject_memory: boolean;
+  /** Document Vault collections injected into external gateway requests. */
+  gateway_default_rag_collections: string[];
+}
+
+/** State of the loopback OpenAI-compatible gateway. */
+export interface GatewayStatus {
+  running: boolean;
+  /** Origin of the server, for example http://127.0.0.1:11435. */
+  url: string;
+  /** OpenAI base URL external clients paste into their configuration. */
+  api_base: string;
+  port: number;
+  active_engine: EngineKind | null;
+  active_model: string | null;
+  request_count: number;
+  last_error: string | null;
+  /** Non-fatal warning about the last request's context enrichment. */
+  last_context_warning: string | null;
+  started_at_ms: number | null;
 }
 
 export interface WhisperModelStatus {

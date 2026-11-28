@@ -21,6 +21,7 @@ import type {
   DownloadRequest,
   DownloadStarted,
   EngineSnapshot,
+  GatewayStatus,
   GgufModelInfo,
   HfModel,
   HfQuant,
@@ -63,6 +64,7 @@ export const Events = {
   engineBinaryProgress: "engine://binary-progress",
   whisperProgress: "whisper://progress",
   engineSetupStatus: "setup://status",
+  gatewayStatus: "gateway://status",
   chatDelta: "chat://delta",
   chatDone: "chat://done",
   chatError: "chat://error",
@@ -123,6 +125,10 @@ export const api = {
     invoke<SetupReport>("get_engine_setup_status"),
   rerunEngineSetup: () =>
     invoke<SetupReport>("rerun_engine_setup"),
+
+  startGateway: () => invoke<GatewayStatus>("start_gateway"),
+  stopGateway: () => invoke<GatewayStatus>("stop_gateway"),
+  getGatewayStatus: () => invoke<GatewayStatus>("get_gateway_status"),
 
   streamChat: (request: ChatRequestPayload) =>
     invoke<void>("stream_chat", { request }),

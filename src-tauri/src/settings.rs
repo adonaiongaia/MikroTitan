@@ -139,6 +139,17 @@ pub struct AppSettings {
     pub voice_auto_send: bool,
     /// Drop Whisper annotations such as [BLANK_AUDIO] or (music).
     pub voice_strip_non_speech: bool,
+    /// Expose the loopback OpenAI-compatible gateway to external clients.
+    pub gateway_enabled: bool,
+    /// The gateway's loopback port. Kept separate from both engine ports so a
+    /// client configuration never follows the engine across a switch.
+    pub gateway_port: u16,
+    /// Let an incoming `model` name switch the engine and model.
+    pub gateway_auto_switch_models: bool,
+    /// Add Memory Bank facts to external gateway requests.
+    pub gateway_inject_memory: bool,
+    /// Document Vault collections injected into external gateway requests.
+    pub gateway_default_rag_collections: Vec<String>,
     /// Per-launch environment overrides. This is deliberately not serialized:
     /// the benchmark runner puts `JANAS_ATTN=float` and similar target flags on
     /// a cloned AppSettings so a measurement never rewrites saved settings.
@@ -202,6 +213,11 @@ impl Default for AppSettings {
             voice_activation: "toggle".into(),
             voice_auto_send: false,
             voice_strip_non_speech: true,
+            gateway_enabled: false,
+            gateway_port: DEFAULT_GATEWAY_PORT,
+            gateway_auto_switch_models: true,
+            gateway_inject_memory: false,
+            gateway_default_rag_collections: Vec::new(),
             launch_env: Vec::new(),
         }
     }
@@ -304,6 +320,21 @@ impl AppSettings {
             "hold" => "hold".into(),
             _ => "toggle".into(),
         };
+        if self.gateway_port == 0 {
+            self.gateway_port = DEFAULT_GATEWAY_PORT;
+        }
+        self.gateway_port = self.gateway_port.clamp(1, 65_535);
+        let mut collections: Vec<String> = Vec::new();
+        for id in self.gateway_default_rag_collections.drain(..) {
+            let id = id.trim();
+            if !id.is_empty() && !collections.iter().any(|existing| existing == id) {
+                collections.push(id.to_string());
+            }
+            if collections.len() >= 64 {
+                break;
+            }
+        }
+        self.gateway_default_rag_collections = collections;
     }
 
     /// Align the offload setting with the layers the selected model actually
@@ -320,6 +351,10 @@ impl AppSettings {
         }
     }
 }
+
+/// The default loopback port for the external OpenAI-compatible gateway. It is
+/// intentionally not 8080/8081, so it never collides with either engine.
+pub const DEFAULT_GATEWAY_PORT: u16 = 11_435;
 
 pub const KV_CACHE_TYPES: [&str; 9] = [
     "f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1",

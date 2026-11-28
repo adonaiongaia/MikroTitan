@@ -12,6 +12,7 @@ mod engines;
 #[cfg(test)]
 mod dual_engine_harness;
 mod error;
+mod gateway;
 mod gguf;
 mod huggingface;
 mod linux_media;
@@ -584,12 +585,12 @@ fn main() {
             }
             app.manage(artifact_frame::ArtifactFrames::default());
             let port = store.get().port;
-            let memory = MemoryStore::load(data_dir.join("memory.json"));
+            let memory = Arc::new(MemoryStore::load(data_dir.join("memory.json")));
             let chat_store = ChatStore::load(data_dir.join("chat-sessions"));
             // The vault lives beside the chats in the *local* data directory, so
             // a roaming profile or a synced home never copies an index of the
             // user's documents to another machine.
-            let knowledge = KnowledgeStore::load(local_data_dir.join("knowledge"));
+            let knowledge = Arc::new(KnowledgeStore::load(local_data_dir.join("knowledge")));
             // Benchmark suites live beside the chats in the local data dir so
             // a roaming profile never copies hardware measurements between
             // machines with different drives.
@@ -601,11 +602,11 @@ fn main() {
             let binaries = Arc::new(BinaryManager::new());
             let provisioner = Arc::new(Provisioner::new());
 
-            app.manage(store);
+            app.manage(store.clone());
             app.manage(Arc::new(benchmarks));
             app.manage(Arc::new(chat_store));
-            app.manage(Arc::new(knowledge));
-            app.manage(Arc::new(memory));
+            app.manage(knowledge.clone());
+            app.manage(memory.clone());
             app.manage(engine);
             app.manage(supervisor.clone());
             app.manage(binaries.clone());
@@ -620,6 +621,34 @@ fn main() {
             app.manage(Arc::new(agent::ApprovalRuleStore::load(
                 data_dir.join("agent-approvals.json"),
             )));
+
+            // The gateway is a loopback-only HTTP server. It is managed before
+            // the async boot so RunEvent::Exit can always stop it, and it is
+            // started here when the user left it enabled.
+            let gateway_manager = Arc::new(gateway::GatewayManager::new());
+            app.manage(gateway_manager.clone());
+            let gateway_enabled = store.get().gateway_enabled;
+            if gateway_enabled {
+                let app_for_gateway = app.handle().clone();
+                let gateway_for_boot = gateway_manager.clone();
+                let store_for_gateway = store.clone();
+                let supervisor_for_gateway = supervisor.clone();
+                let memory_for_gateway = memory.clone();
+                let knowledge_for_gateway = knowledge.clone();
+                tauri::async_runtime::spawn(async move {
+                    // A busy port must not abort the studio's boot; the status
+                    // event carries the bind error to the Settings card.
+                    let _ = gateway_for_boot
+                        .start(
+                            &app_for_gateway,
+                            store_for_gateway,
+                            supervisor_for_gateway,
+                            memory_for_gateway,
+                            knowledge_for_gateway,
+                        )
+                        .await;
+                });
+            }
 
             // Provisioning is intentionally silent and off the UI thread. The
             // report is available immediately via get_engine_setup_status and
@@ -718,6 +747,9 @@ fn main() {
             system::library_disk,
             system::verify_local_model,
             system::delete_local_model,
+            gateway::start_gateway,
+            gateway::stop_gateway,
+            gateway::get_gateway_status,
             companions::inspect_gguf_companion,
             companions::inspect_model_companions,
             companions::library_companions,
@@ -750,6 +782,9 @@ fn main() {
 
     app.run(|app_handle, event| {
         if let tauri::RunEvent::Exit = event {
+            if let Some(gateway) = app_handle.try_state::<Arc<gateway::GatewayManager>>() {
+                gateway.inner().stop_blocking();
+            }
             if let Some(supervisor) = app_handle.try_state::<Arc<EngineSupervisor>>() {
                 supervisor.inner().shutdown_blocking(app_handle);
             }

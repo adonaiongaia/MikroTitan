@@ -1771,7 +1771,7 @@ fn request_output_reserve(context_window: usize, requested_max: Option<u32>) -> 
     requested.clamp(512, half)
 }
 
-fn request_prompt_budget(context_window: usize, requested_max: Option<u32>) -> usize {
+pub(crate) fn request_prompt_budget(context_window: usize, requested_max: Option<u32>) -> usize {
     context_window
         .saturating_sub(request_output_reserve(context_window, requested_max))
         .saturating_sub(RETRY_REQUEST_OVERHEAD)
@@ -1912,7 +1912,7 @@ fn clip_retry_text(text: &str, max_tokens: usize) -> String {
     )
 }
 
-fn context_limit_from_error(body: &str) -> Option<u32> {
+pub(crate) fn context_limit_from_error(body: &str) -> Option<u32> {
     let lower = body.to_ascii_lowercase();
     for marker in ["\"n_ctx\"", "context size (", "context ("] {
         let Some(start) = lower.find(marker) else {
@@ -1997,7 +1997,7 @@ fn pinned_budget_error(
 /// attached context are dropped. Pinned turns are counted as essentials and
 /// are never dropped. Tool-call fragments are omitted because a partial
 /// assistant/tool pair is not valid chat history.
-fn trim_messages_to_context(
+pub(crate) fn trim_messages_to_context(
     messages: &[serde_json::Value],
     pinned: &[bool],
     pinned_system: bool,

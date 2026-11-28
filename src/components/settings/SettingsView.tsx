@@ -35,6 +35,7 @@ import { Button } from "../ui/Button";
 import { GpuOffloadControl } from "../ui/GpuOffloadControl";
 import { EngineLogsPanel } from "./EngineLogsPanel";
 import { ChatHistoryPanel } from "./ChatHistoryPanel";
+import { GatewayPanel } from "./GatewayPanel";
 import { SetupPanel } from "./SetupPanel";
 import { ThemePicker } from "./ThemePicker";
 import { VoiceSettings } from "./VoiceSettings";
@@ -351,6 +352,13 @@ export function SettingsView({ engine }: SettingsViewProps) {
         </Section>
 
         <VoiceSettings form={form} update={update} onError={setError} />
+
+        <GatewayPanel
+          form={form}
+          update={update}
+          save={save}
+          onError={setError}
+        />
 
         <SetupPanel />
 
