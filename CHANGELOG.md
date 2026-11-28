@@ -4,6 +4,24 @@ All notable changes to MikroTitan are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses semantic versioning. Release tags use the `janas-studio-vX.Y.Z` form; the early unversioned `janas-studio` tag predates that convention.
 
+## [Unreleased]
+
+### Added
+
+- **A tested llama.cpp release channel.** Automatic engine setup now resolves a pinned, verified baseline (`b12236`) instead of whatever daily tag upstream published last. Settings → Automatic engine setup offers **Verified baseline** and **Latest upstream** per machine; the choice is saved as `llama_update_channel`, takes effect on the next setup retry, and an older settings file or an unrecognised value resolves to the baseline rather than silently opting into a daily build.
+- **An optional compatibility manifest.** A `compat.json` at the repository root is fetched during setup with a three-second timeout and ignored completely when it is unavailable, so an offline start or a 404 behaves exactly like a release without it. It can recommend a different baseline tag, block release tags the resolver must skip, and move the last build whose Vulkan KV offload is trusted, so a fixed upstream build can be re-enabled without an app update. The setup report records whether the manifest was applied, the tag it recommended, the baseline tag the channel asked for, and which blocked tags were skipped.
+- **A GPU launch fallback ladder.** If `llama-server` exits before `/health` answers, the supervisor relaunches one rung down — full GPU offload, then host KV cache (`-nkvo`, weights on the GPU), then full CPU (`--device none`) — using only the flags the probed build advertises. The engine panel shows the active rung in a dismissible banner.
+- **Probation and automatic rollback for a llama.cpp update.** A newly installed build is marked unverified until a real model reaches `/health`. If it crashes during model load before that, the previous binary is restored once from `.bak` and the banner names the version that came back.
+
+### Fixed
+
+- **The Vulkan KV-cache abort on hybrid models.** llama.cpp's Vulkan backend aborts with `SET_ROWS` while reserving the KV cache of sliding-window and recurrent-hybrid models when that cache lives in GPU memory (upstream issue #29082), which is the failure Qwen3.8 hit. The adapter now detects the combination (a Vulkan build newer than the trusted limit plus a model with the risky cache layout) and launches with `--device none`, which measured roughly twice the throughput of an `-nkvo` split on the affected Vulkan-only hosts; a build without `--device` falls back to `-nkvo`. KV-cache and device flags set in Extra llama arguments always win, and the warning tells the user not to add `-kvo`, which reproduces the abort.
+- **Adapter warnings are no longer one message.** `engine://adapter-warning` now carries a kind — adapter adjustment, GPU fallback rung or automatic rollback — and the panel words each one differently instead of presenting a recovery as a launch note.
+
+### Changed
+
+- **Automatic engine setup reports the release decisions it made:** the active channel, the baseline tag it requested, whether `compat.json` was applied, the last build whose Vulkan KV offload is trusted, and the blocked tags it skipped, so "why this build?" is answerable from Settings.
+
 ## [0.2.0] - 2026-11-25
 
 ### Added

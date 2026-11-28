@@ -486,13 +486,13 @@ The **0.2.0** AppImage was rebuilt against Tauri 2.12.6 and inspected on Linux x
 
 - `npm run appimage` — release build and AppImage bundling completed:
   - Artifact: `src-tauri/target/release/bundle/appimage/MikroTitan_0.2.0_amd64.AppImage`
-  - Size: 171,211,256 bytes (163.28 MiB)
-  - SHA-256: `11268eab87f9806a0cda3cc75a43f6b779b0b2bd5745b9048bd3385186ec589b`
+  - Size: 94,923,256 bytes (90.53 MiB)
+  - SHA-256: `1609b82c0c5fa361f12eb6f5e1b8107b7c9ff9a95e8202727b7b0a03a68a962e`
   - Bundle checks: the desktop entry reports `Name=MikroTitan`, the running app's window title is **MikroTitan**, the bundled icon and `.DirIcon` match `src-tauri/icons/128x128.png` and `src-tauri/icons/128x128@2x.png`, and `usr/share/licenses/mikrotitan/LICENSE` plus `usr/share/doc/mikrotitan/THIRD_PARTY_NOTICES.md` match the repository files byte-for-byte. No `studio-for-janas` paths remain. No Janas binaries are bundled, and the WebKit media framework used by microphone capture is included.
 - **Screenshots:** regenerated against the 0.2.0 build with the new sidebar mark and the **MikroTitan** assistant reply heading, covering the per-chat draft/MCP badge, the agent run trace, and the Tools scope drawer.
 - `npm run check` / `npm run build` — TypeScript typecheck and production build passed for 0.2.0.
-- `npm test` — 81 Vitest tests pass across 6 files: persistent-store handling, RAG citations and budgets, context budgeting, chat-session normalization/branching, artifacts, and MCP scope/reconciliation.
-- `cargo test` — 249 tests pass, 0 failed, 2 ignored: the local two-target benchmark that needs both engines and models, and the network-dependent live-search smoke test.
+- `npm test` — 91 Vitest tests pass across 7 files: persistent-store handling, llama.cpp channel and compatibility-manifest normalization, RAG citations and budgets, context budgeting, chat-session normalization/branching, artifacts, and MCP scope/reconciliation.
+- `cargo test` — 263 tests pass, 0 failed, 2 ignored: the local two-target benchmark that needs both engines and models, and the network-dependent live-search smoke test.
 - **Tauri 2.12.6 smoke test:** the rebuilt AppImage launched, both engines reached Ready, and the window and chat input stayed responsive with no freeze.
 - **Document vault:** Rust tests cover stable chunking, hybrid ranking, incremental re-indexing, restart persistence, collection deletion, source removal, scanned-PDF handling, secret/heavy-directory skipping and index cancellation. Vitest covers `[D#]` linkification, citation lookup and ordering, deleted-collection pruning and retrieval-budget clamping. In the rebuilt AppImage, a collection was created, indexed, attached to a chat, retrieved as `[D1]` with the Docs row and source drawer, and the agent's `search_knowledge_base` answer kept its clickable citation after a reload.
 - **Voice input:** the AppImage opened the USB microphone as the Pulse/PipeWire default through `parec`, and a stop/transcription run against a virtual system default produced the expected transcript. The fallback was exercised with a PATH containing only `pw-record`; it selected `pw-record`, captured the system-default source, stopped cleanly and produced the same transcript. Closing while recording left no capture process or source-output. Rust tests cover WAV normalisation/resampling, transcript cleanup, language validation and backend preference.
