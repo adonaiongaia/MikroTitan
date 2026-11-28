@@ -27,17 +27,21 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock,
+    },
     time::{Duration, Instant},
 };
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
     error::{AppError, AppResult},
+    settings::{self, SettingsStore},
     util::{now_ms, truncate_line},
 };
 
@@ -53,6 +57,29 @@ const LLAMA_REPO: &str = "ggml-org/llama.cpp";
 const JANAS_REPO: &str = "prabanta-dev/janas";
 const GITHUB_API: &str = "https://api.github.com";
 const RELEASE_LIST_LIMIT: usize = 30;
+
+/// The last llama.cpp release this app was tested against. Automatic setup
+/// installs it by default so onboarding does not depend on whatever daily tag
+/// upstream published an hour ago. Settings → Automatic engine setup can opt
+/// into "latest" per user.
+pub const KNOWN_GOOD_LLAMA_TAG: &str = "b12236";
+
+/// Optional, community-maintained escape hatch. It is fetched with a short
+/// timeout and ignored entirely when it is missing, so an offline start or a
+/// 404 behaves exactly like a release without it.
+const COMPAT_MANIFEST_URL: &str =
+    "https://raw.githubusercontent.com/adonaiongaia/MikroTitan/main/compat.json";
+const COMPAT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Set from `compat.json`'s `vulkan_broken_above_build` and read by the llama
+/// adapter, so a fixed upstream build can be re-enabled without an app update.
+static VULKAN_KV_OFFLOAD_LIMIT: AtomicU64 = AtomicU64::new(
+    crate::engines::llama::LAST_GOOD_VULKAN_KV_OFFLOAD_BUILD,
+);
+
+pub fn vulkan_kv_offload_limit() -> u64 {
+    VULKAN_KV_OFFLOAD_LIMIT.load(Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -126,6 +153,20 @@ pub struct SetupReport {
     pub janas_release: Option<ReleaseChoice>,
     pub binaries: Vec<ProvisionedBinary>,
     pub warnings: Vec<String>,
+    /// "baseline" (pinned KNOWN_GOOD_LLAMA_TAG) or "latest" (upstream HEAD).
+    pub llama_update_channel: String,
+    /// True when a `compat.json` manifest was fetched and applied this run.
+    pub compat_applied: bool,
+    /// A manifest-recommended tag that overrides [KNOWN_GOOD_LLAMA_TAG].
+    pub compat_recommended_tag: Option<String>,
+    /// Tags the manifest marks as broken.
+    pub blocked_llama_tags: Vec<String>,
+    /// Broken tags that automatic resolution actually skipped.
+    pub skipped_llama_tags: Vec<String>,
+    /// The tag the baseline channel asked for (manifest override or KNOWN_GOOD).
+    pub llama_baseline_tag: String,
+    /// Last llama.cpp build whose Vulkan KV offload is trusted.
+    pub vulkan_kv_offload_limit: u64,
 }
 
 impl Default for SetupReport {
@@ -141,6 +182,13 @@ impl Default for SetupReport {
             janas_release: None,
             binaries: Vec::new(),
             warnings: Vec::new(),
+            llama_update_channel: "baseline".into(),
+            compat_applied: false,
+            compat_recommended_tag: None,
+            blocked_llama_tags: Vec::new(),
+            skipped_llama_tags: Vec::new(),
+            llama_baseline_tag: KNOWN_GOOD_LLAMA_TAG.into(),
+            vulkan_kv_offload_limit: vulkan_kv_offload_limit(),
         }
     }
 }
@@ -220,9 +268,34 @@ impl Provisioner {
                 .push(format!("Janas cache task failed: {err}")),
         }
 
-        let (llama, llama_release) =
-            provision_llama(app, manager, supervisor.clone(), &platform, force, &mut report.warnings)
-                .await;
+        // The pinned baseline is resolved before any download starts, so the
+        // report always says which tag the channel asked for even when the
+        // network (or a manifest block) forces a different release.
+        let channel = llama_update_channel(app);
+        let rules = fetch_compat_rules().await;
+        apply_compat_rules(&rules);
+        report.llama_update_channel = channel.clone();
+        report.compat_applied = rules.source_available;
+        report.compat_recommended_tag = rules.recommended_tag.clone();
+        report.blocked_llama_tags = rules.blocked_tags.clone();
+        report.llama_baseline_tag = rules
+            .recommended_tag
+            .clone()
+            .unwrap_or_else(|| KNOWN_GOOD_LLAMA_TAG.to_string());
+        report.vulkan_kv_offload_limit = vulkan_kv_offload_limit();
+
+        let (llama, llama_release) = provision_llama(
+            app,
+            manager,
+            supervisor.clone(),
+            &platform,
+            force,
+            &mut report.warnings,
+            &channel,
+            &rules,
+            &mut report.skipped_llama_tags,
+        )
+        .await;
         report.llama_release = llama_release;
         report.binaries.push(llama);
 
@@ -263,6 +336,15 @@ fn overall_status(binaries: &[ProvisionedBinary]) -> SetupStatus {
     }
 }
 
+fn llama_update_channel(app: &AppHandle) -> String {
+    app.try_state::<Arc<SettingsStore>>()
+        .map(|store| {
+            settings::normalize_llama_update_channel(&store.get().llama_update_channel)
+        })
+        .unwrap_or_else(|| "baseline".into())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn provision_llama(
     app: &AppHandle,
     manager: Arc<BinaryManager>,
@@ -270,6 +352,9 @@ async fn provision_llama(
     profile: &PlatformProfile,
     force: bool,
     warnings: &mut Vec<String>,
+    channel: &str,
+    rules: &CompatRules,
+    skipped: &mut Vec<String>,
 ) -> (ProvisionedBinary, Option<ReleaseChoice>) {
     let path = match managed_binary_path(app, EngineKind::Llama) {
         Ok(path) => path,
@@ -289,7 +374,14 @@ async fn provision_llama(
         None
     };
 
-    let resolution = resolve_llama_release(profile).await;
+    let resolution = resolve_llama_release(profile, channel, rules).await;
+    if let Ok(value) = &resolution {
+        for tag in &value.skipped {
+            if !skipped.contains(tag) {
+                skipped.push(tag.clone());
+            }
+        }
+    }
     if existing && !force {
         if let Some(probe) = existing_probe {
             let message = match &resolution {
@@ -1331,6 +1423,100 @@ struct LlamaResolution {
     candidates: Vec<AssetCandidate>,
     stable_tag: String,
     fallback: bool,
+    /// Broken tags the resolver walked past on the way to this release.
+    skipped: Vec<String>,
+}
+
+/// The optional remote compatibility manifest. Every field is optional so a
+/// single-purpose file (for example only `blocked_llama_tags`) is valid.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct CompatManifest {
+    #[serde(default)]
+    pub recommended_llama_tag: Option<String>,
+    #[serde(default)]
+    pub blocked_llama_tags: Vec<String>,
+    /// Highest build whose Vulkan KV offload is still trusted.
+    #[serde(default)]
+    pub vulkan_broken_above_build: Option<u64>,
+}
+
+/// Normalized, validated view of [CompatManifest].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompatRules {
+    /// True only when the manifest was fetched and parsed.
+    pub source_available: bool,
+    pub recommended_tag: Option<String>,
+    pub blocked_tags: Vec<String>,
+    pub vulkan_limit: Option<u64>,
+}
+
+/// Pure normalization so tests can exercise the manifest contract without a
+/// network or a process-wide atomic.
+fn compat_rules_from(manifest: &CompatManifest) -> CompatRules {
+    let mut blocked_tags: Vec<String> = Vec::new();
+    for tag in &manifest.blocked_llama_tags {
+        let tag = tag.trim().to_string();
+        if !tag.is_empty() && !blocked_tags.contains(&tag) {
+            blocked_tags.push(tag);
+        }
+    }
+    CompatRules {
+        source_available: true,
+        recommended_tag: manifest
+            .recommended_llama_tag
+            .as_ref()
+            .map(|tag| tag.trim().to_string())
+            .filter(|tag| !tag.is_empty()),
+        blocked_tags,
+        vulkan_limit: manifest.vulkan_broken_above_build.filter(|value| *value > 0),
+    }
+}
+
+fn is_blocked_tag(rules: &CompatRules, tag: &str) -> bool {
+    rules
+        .blocked_tags
+        .iter()
+        .any(|blocked| blocked.eq_ignore_ascii_case(tag.trim()))
+}
+
+fn apply_compat_rules(rules: &CompatRules) {
+    if let Some(limit) = rules.vulkan_limit {
+        VULKAN_KV_OFFLOAD_LIMIT.store(limit, Ordering::Relaxed);
+    }
+}
+
+async fn fetch_compat_rules() -> CompatRules {
+    let fetched = tokio::time::timeout(COMPAT_TIMEOUT, fetch_compat_manifest()).await;
+    match fetched {
+        Ok(Ok(Some(manifest))) => compat_rules_from(&manifest),
+        // Offline, slow, 404 or malformed: the pinned baseline is still a
+        // valid answer, so the caller never sees an error.
+        _ => CompatRules::default(),
+    }
+}
+
+async fn fetch_compat_manifest() -> AppResult<Option<CompatManifest>> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(COMPAT_TIMEOUT)
+        .user_agent("Studio-for-Janas/0.1")
+        .build()
+        .map_err(|err| AppError::message(format!("Could not build the manifest client: {err}")))?;
+    let response = client
+        .get(COMPAT_MANIFEST_URL)
+        .send()
+        .await
+        .map_err(|err| AppError::message(format!("Could not fetch compat.json: {err}")))?;
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+    let body = response
+        .text()
+        .await
+        .map_err(|err| AppError::message(format!("Could not read compat.json: {err}")))?;
+    serde_json::from_str(&body)
+        .map(Some)
+        .map_err(|err| AppError::message(format!("Could not parse compat.json: {err}")))
 }
 
 impl LlamaResolution {
@@ -1392,6 +1578,20 @@ async fn fetch_latest_release(repo: &str) -> AppResult<GhRelease> {
     github_json(&format!("repos/{repo}/releases/latest")).await
 }
 
+async fn fetch_release_by_tag(repo: &str, tag: &str) -> AppResult<GhRelease> {
+    // Tags are interpolated into a URL path; refuse anything that could escape
+    // it instead of relying on reqwest to encode the slash.
+    if !tag
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_'))
+    {
+        return Err(AppError::message(format!(
+            "The release tag \"{tag}\" contains characters this app will not request."
+        )));
+    }
+    github_json(&format!("repos/{repo}/releases/tags/{tag}")).await
+}
+
 async fn fetch_release_list(repo: &str) -> AppResult<Vec<GhRelease>> {
     github_json(&format!(
         "repos/{repo}/releases?per_page={RELEASE_LIST_LIMIT}"
@@ -1399,41 +1599,127 @@ async fn fetch_release_list(repo: &str) -> AppResult<Vec<GhRelease>> {
     .await
 }
 
-async fn resolve_llama_release(profile: &PlatformProfile) -> AppResult<LlamaResolution> {
-    let stable = fetch_latest_release(LLAMA_REPO).await?;
-    let stable_tag = stable.tag_name.clone();
-    if let Some(candidates) = select_llama_candidates(&stable, profile) {
-        return Ok(LlamaResolution {
-            release: stable,
-            candidates,
-            stable_tag,
-            fallback: false,
-        });
+/// Resolve the release to install.
+///
+/// `channel` is "baseline" (pin `KNOWN_GOOD_LLAMA_TAG`, or the manifest's
+/// recommendation) or "latest" (track upstream). Every path filters
+/// `blocked_llama_tags`, and every fall-through is recorded in `skipped` so
+/// the setup report can explain why a different tag was installed.
+async fn resolve_llama_release(
+    profile: &PlatformProfile,
+    channel: &str,
+    rules: &CompatRules,
+) -> AppResult<LlamaResolution> {
+    let baseline = rules
+        .recommended_tag
+        .clone()
+        .unwrap_or_else(|| KNOWN_GOOD_LLAMA_TAG.to_string());
+    let requested_tag = if channel == "latest" {
+        "latest".to_string()
+    } else {
+        baseline.clone()
+    };
+    let mut skipped = Vec::new();
+    let mut ordered: Vec<GhRelease> = Vec::new();
+    let mut first_error: Option<String> = None;
+
+    // Fast path: the pinned baseline still publishes a matching asset. This is
+    // one API call for the common case instead of a full release listing.
+    if channel != "latest" {
+        match fetch_release_by_tag(LLAMA_REPO, &baseline).await {
+            Ok(release) => {
+                if is_blocked_tag(rules, &release.tag_name) {
+                    skipped.push(release.tag_name.clone());
+                } else if let Some(candidates) = select_llama_candidates(&release, profile) {
+                    return Ok(LlamaResolution {
+                        release,
+                        candidates,
+                        stable_tag: baseline,
+                        fallback: false,
+                        skipped,
+                    });
+                } else {
+                    push_release(&mut ordered, release);
+                }
+            }
+            Err(err) => first_error = Some(err.to_string()),
+        }
     }
 
-    // The current llama.cpp stable release can contain only a nightly-tag.txt
-    // pointer while the actual platform builds live under prerelease tags.
-    // Prefer a stable asset whenever one exists, then use the newest release
-    // that actually contains a matching build.
-    let releases = fetch_release_list(LLAMA_REPO).await?;
-    for release in releases {
-        if release.draft || release.tag_name == stable_tag {
+    if let Ok(latest) = fetch_latest_release(LLAMA_REPO).await {
+        push_release(&mut ordered, latest);
+    }
+
+    // A stable release can contain only a nightly-tag.txt pointer while the
+    // platform builds live under prerelease tags, and a blocked tag can remove
+    // the newest release entirely. Walk the list before giving up.
+    if let Ok(releases) = fetch_release_list(LLAMA_REPO).await {
+        for release in releases {
+            if !release.draft {
+                push_release(&mut ordered, release);
+            }
+        }
+    }
+
+    if ordered.is_empty() {
+        return Err(AppError::message(first_error.unwrap_or_else(|| {
+            "The GitHub release list was empty.".to_string()
+        })));
+    }
+
+    match choose_resolution(ordered, profile, &requested_tag, rules, skipped) {
+        Ok(resolution) => Ok(resolution),
+        Err(skipped) => Err(AppError::message(format!(
+            "No llama.cpp release (including {requested_tag}) has a build for {} {}.{}",
+            profile.os,
+            profile.arch,
+            if skipped.is_empty() {
+                String::new()
+            } else {
+                format!(" Skipped blocked tags: {}.", skipped.join(", "))
+            }
+        ))),
+    }
+}
+
+/// Pick the first usable release, never a tag `compat.json` blocks. Split out
+/// from the network path so tag filtering is unit-testable.
+fn choose_resolution(
+    ordered: Vec<GhRelease>,
+    profile: &PlatformProfile,
+    requested_tag: &str,
+    rules: &CompatRules,
+    mut skipped: Vec<String>,
+) -> Result<LlamaResolution, Vec<String>> {
+    for release in ordered {
+        if is_blocked_tag(rules, &release.tag_name) {
+            if !skipped.contains(&release.tag_name) {
+                skipped.push(release.tag_name.clone());
+            }
             continue;
         }
         if let Some(candidates) = select_llama_candidates(&release, profile) {
+            let fallback = release.tag_name.as_str() != requested_tag;
             return Ok(LlamaResolution {
                 release,
                 candidates,
-                stable_tag,
-                fallback: true,
+                stable_tag: requested_tag.to_string(),
+                fallback,
+                skipped,
             });
         }
     }
+    Err(skipped)
+}
 
-    Err(AppError::message(format!(
-        "The latest stable tag is {stable_tag}, but it has no build for {} {}. No newer release has a matching asset either.",
-        profile.os, profile.arch
-    )))
+fn push_release(ordered: &mut Vec<GhRelease>, release: GhRelease) {
+    if ordered
+        .iter()
+        .any(|existing| existing.tag_name == release.tag_name)
+    {
+        return;
+    }
+    ordered.push(release);
 }
 
 async fn resolve_janas_release(
@@ -1683,6 +1969,77 @@ mod tests {
                 .unwrap_or_default(),
             preferred_backend: backend.unwrap_or("cpu").into(),
         }
+    }
+
+    #[test]
+    fn compat_manifest_is_optional_and_normalized() {
+        // No manifest: nothing is overridden and no tag is blocked.
+        assert_eq!(
+            compat_rules_from(&CompatManifest::default()),
+            CompatRules {
+                source_available: true,
+                ..CompatRules::default()
+            }
+        );
+
+        let rules = compat_rules_from(&CompatManifest {
+            recommended_llama_tag: Some("  b12900 ".into()),
+            blocked_llama_tags: vec![" b13000 ".into(), String::new(), "b13000".into()],
+            vulkan_broken_above_build: Some(12_500),
+        });
+        assert_eq!(rules.recommended_tag.as_deref(), Some("b12900"));
+        assert_eq!(rules.blocked_tags, vec!["b13000".to_string()]);
+        assert_eq!(rules.vulkan_limit, Some(12_500));
+
+        // A zero would disable the Vulkan KV guard entirely, so it is ignored.
+        let zero = compat_rules_from(&CompatManifest {
+            vulkan_broken_above_build: Some(0),
+            ..CompatManifest::default()
+        });
+        assert_eq!(zero.vulkan_limit, None);
+    }
+
+    #[test]
+    fn blocked_llama_tags_are_skipped_and_reported() {
+        let rules = compat_rules_from(&CompatManifest {
+            blocked_llama_tags: vec!["b13000".into(), "b12900".into()],
+            ..CompatManifest::default()
+        });
+        let machine = profile("linux", "x86_64", Some("vulkan"));
+        let ordered = vec![
+            release("b13000", &["llama-b13000-bin-ubuntu-vulkan-x64.tar.gz"]),
+            release("b12900", &["llama-b12900-bin-ubuntu-vulkan-x64.tar.gz"]),
+            release("b12800", &["llama-b12800-bin-ubuntu-x64.tar.gz"]),
+        ];
+
+        let chosen = choose_resolution(ordered, &machine, "b13000", &rules, Vec::new())
+            .expect("a non-blocked release should remain");
+        assert_eq!(chosen.release.tag_name, "b12800");
+        assert_eq!(
+            chosen.skipped,
+            vec!["b13000".to_string(), "b12900".to_string()]
+        );
+        assert!(chosen.fallback, "the pinned tag was skipped");
+    }
+
+    #[test]
+    fn blocked_newest_release_falls_back_to_the_pinned_baseline() {
+        let rules = compat_rules_from(&CompatManifest {
+            blocked_llama_tags: vec!["b13000".into()],
+            ..CompatManifest::default()
+        });
+        let machine = profile("linux", "x86_64", None);
+        let ordered = vec![
+            release("b13000", &["llama-b13000-bin-ubuntu-x64.tar.gz"]),
+            release(KNOWN_GOOD_LLAMA_TAG, &["llama-b12236-bin-ubuntu-x64.tar.gz"]),
+        ];
+
+        let chosen = choose_resolution(ordered, &machine, KNOWN_GOOD_LLAMA_TAG, &rules, Vec::new())
+            .expect("the baseline should be usable");
+        assert_eq!(chosen.release.tag_name, KNOWN_GOOD_LLAMA_TAG);
+        assert_eq!(chosen.stable_tag, KNOWN_GOOD_LLAMA_TAG);
+        assert_eq!(chosen.skipped, vec!["b13000".to_string()]);
+        assert!(!chosen.fallback);
     }
 
     #[test]

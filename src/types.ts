@@ -52,11 +52,27 @@ export interface EngineTelemetry {
   sampled_at_ms: number;
 }
 
+/** Which llama.cpp release automatic setup installs. */
+export type LlamaUpdateChannel = "baseline" | "latest";
+
+/** A GPU launch rung the supervisor can fall back to after a crash. */
+export type EngineFallbackStep = "host-kv" | "cpu";
+
+export type AdapterWarningKind = "adapter" | "fallback" | "auto-rollback";
+
 export interface AdapterWarningEvent {
   engine: EngineKind;
   message: string;
   version: string | null;
   adapter: string;
+  /** Why the warning was raised. Absent on older backends. */
+  kind?: AdapterWarningKind;
+  /** Set when this warning describes a fallback rung. */
+  step?: EngineFallbackStep | null;
+  /** The newly installed version that failed its first real launch. */
+  failed_version?: string | null;
+  /** The version an automatic rollback restored. */
+  restored_version?: string | null;
 }
 
 export interface BinaryProgress {
@@ -139,6 +155,20 @@ export interface SetupReport {
   janas_release: SetupRelease | null;
   binaries: SetupBinary[];
   warnings: string[];
+  /** Channel used for this run: the tested baseline or upstream latest. */
+  llama_update_channel: LlamaUpdateChannel;
+  /** True when a remote compat.json was fetched and applied. */
+  compat_applied: boolean;
+  /** Tag the manifest recommends instead of the built-in baseline. */
+  compat_recommended_tag: string | null;
+  /** Tags compat.json marks as broken. */
+  blocked_llama_tags: string[];
+  /** Broken tags resolution actually skipped this run. */
+  skipped_llama_tags: string[];
+  /** The tag the baseline channel asked for. */
+  llama_baseline_tag: string;
+  /** Highest llama.cpp build whose Vulkan KV offload is trusted. */
+  vulkan_kv_offload_limit: number | null;
 }
 
 export interface AppSettings {
@@ -197,6 +227,8 @@ export interface AppSettings {
   /** llama.cpp only: max CPU threads for direct MoE compute; 0 = default. */
   llama_cpu_threads: number;
   llama_extra_args: string;
+  /** Which llama.cpp release automatic setup installs. */
+  llama_update_channel: LlamaUpdateChannel;
   ssd_streaming: boolean;
   ssd_cache_dir: string;
   top_k: number;

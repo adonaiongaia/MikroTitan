@@ -44,6 +44,7 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   llama_direct_cpu_moe: false,
   llama_cpu_threads: 0,
   llama_extra_args: "",
+  llama_update_channel: "baseline",
   ssd_streaming: false,
   ssd_cache_dir: "",
   top_k: 40,

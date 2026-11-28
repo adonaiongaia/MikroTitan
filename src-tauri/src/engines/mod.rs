@@ -12,7 +12,10 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, RwLock,
+    },
     time::Duration,
 };
 
@@ -109,6 +112,11 @@ pub struct EngineLaunch {
     /// True when the binary can expose Prometheus metrics and the adapter
     /// enabled them. Janas reports through `/proc` only for now.
     pub metrics_enabled: bool,
+    /// Fallback rungs still available for this process. The supervisor walks
+    /// them only when the child exits before `/health` answers, so a binary
+    /// that cannot host a GPU KV cache never leaves the app with a dead
+    /// engine. Empty means this launch is already the safest rung.
+    pub fallbacks: Vec<FallbackStep>,
     /// Resolves when the child has been reaped. `None` for Janas, whose
     /// lifecycle is owned by the existing `EngineManager`.
     pub exit_rx: Option<watch::Receiver<Option<i32>>>,
@@ -167,6 +175,66 @@ pub struct AdapterWarningEvent {
     pub message: String,
     pub version: Option<String>,
     pub adapter: String,
+    /// Why the warning was raised. Older UI builds can ignore this and keep
+    /// rendering `message` alone.
+    pub kind: WarningKind,
+    /// Set when this warning describes a GPU fallback rung.
+    pub step: Option<FallbackStep>,
+    /// The newly installed version that failed its first real launch.
+    pub failed_version: Option<String>,
+    /// The version the automatic rollback restored.
+    pub restored_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WarningKind {
+    /// The adapter chose a safer flag layout before launching.
+    Adapter,
+    /// A runtime crash moved the launch one rung down the GPU ladder.
+    Fallback,
+    /// An unverified update crashed and the previous binary was restored.
+    AutoRollback,
+}
+
+/// One rung of the GPU launch ladder. `spawn_process` reports the rungs that
+/// are still untried; the supervisor re-launches with the first one when the
+/// child dies before it is ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FallbackStep {
+    /// Keep the weights on the GPU and move the KV cache to system RAM.
+    HostKv,
+    /// Give up on offload and run the whole model on the CPU.
+    Cpu,
+}
+
+impl FallbackStep {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HostKv => "host-kv",
+            Self::Cpu => "cpu",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::HostKv => "host KV split (-nkvo)",
+            Self::Cpu => "full CPU (--device none)",
+        }
+    }
+
+    /// The one flag that gets the user back to the previous behaviour.
+    pub fn override_hint(self) -> &'static str {
+        match self {
+            Self::HostKv => {
+                "Add `-kvo` to Extra llama arguments to force GPU KV offload (sliding-window and hybrid models abort), or `--device` to pin a specific device."
+            }
+            Self::Cpu => {
+                "Add `-nkvo` to Extra llama arguments to keep the weights on the GPU, or `--device` to pin a specific device."
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -192,6 +260,12 @@ pub trait EngineRunner<R: Runtime>: Send + Sync {
 struct ActiveEngine {
     info: ActiveEngineInfo,
     launch: EngineLaunch,
+    /// Flipped by the health probe. A child that exits before this is a
+    /// startup failure, not a normal stop.
+    ready: Arc<AtomicBool>,
+    /// The settings this launch used. A retry must reproduce the same model,
+    /// port and flags even if the user edits the form in between.
+    settings: AppSettings,
 }
 
 pub struct EngineSupervisor<R: Runtime = tauri::Wry> {
@@ -350,13 +424,17 @@ impl<R: Runtime> EngineSupervisor<R> {
             .as_deref()
             .filter(|text| !text.is_empty())
         {
-            let _ = app.emit(
-                "engine://adapter-warning",
+            self.emit_adapter_warning(
+                app,
                 AdapterWarningEvent {
                     engine: kind,
                     message: warning.to_string(),
                     version: launch.probe.version.clone(),
                     adapter: launch.probe.adapter.clone(),
+                    kind: WarningKind::Adapter,
+                    step: None,
+                    failed_version: None,
+                    restored_version: None,
                 },
             );
         }
@@ -365,6 +443,8 @@ impl<R: Runtime> EngineSupervisor<R> {
         *self.active.lock().await = Some(ActiveEngine {
             info: info.clone(),
             launch: launch.clone(),
+            ready: Arc::new(AtomicBool::new(false)),
+            settings: settings.clone(),
         });
         self.set_preferred(kind);
 
@@ -491,7 +571,11 @@ impl<R: Runtime> EngineSupervisor<R> {
                 active.launch.host, active.launch.port
             ),
         );
+        active.ready.store(true, Ordering::SeqCst);
         drop(guard);
+        // The update just proved itself against a real model, so the crash-loop
+        // watchdog must not roll it back on a later, unrelated exit.
+        binary::clear_unverified_update(app, EngineKind::Llama);
         self.publish_snapshot(app, snapshot);
         true
     }
@@ -536,6 +620,15 @@ impl<R: Runtime> EngineSupervisor<R> {
         drop(guard);
 
         remove_pidfile(app);
+
+        // A startup crash is recoverable: an unverified update is rolled back,
+        // and a GPU launch steps down the fallback ladder. Both paths publish
+        // their own status, so returning early is what keeps a stale "exited"
+        // snapshot from overwriting the replacement launch.
+        if self.recover_llama(app, &active, code).await {
+            return true;
+        }
+
         self.publish_active(app, None);
         let detail = match code {
             Some(0) => format!("{} exited cleanly.", active.info.kind.label()),
@@ -566,6 +659,121 @@ impl<R: Runtime> EngineSupervisor<R> {
         true
     }
 
+    /// Keep llama.cpp usable after it dies before `/health` ever answers.
+    ///
+    /// Two protections share this path:
+    ///
+    /// 1. A binary installed by an update that has never reached `Ready` is
+    ///    treated as a regression and swapped back to `.bak` once.
+    /// 2. Otherwise the launch moves one rung down the GPU ladder.
+    ///
+    /// Returns true when a replacement launch was started. Deliberately
+    /// conservative: user-supplied flags and clean exits never trigger it.
+    async fn recover_llama(
+        &self,
+        app: &AppHandle<R>,
+        active: &ActiveEngine,
+        code: Option<i32>,
+    ) -> bool {
+        if active.info.kind != EngineKind::Llama
+            || active.ready.load(Ordering::SeqCst)
+            || code == Some(0)
+        {
+            return false;
+        }
+        let exit = match code {
+            Some(code) => format!("code {code}"),
+            None => "a signal".to_string(),
+        };
+        let mut settings = active.settings.clone();
+        let marker = binary::unverified_update(app, EngineKind::Llama);
+        let backup = binary::has_rollback_backup(app, EngineKind::Llama);
+
+        if should_auto_rollback(marker.is_some(), backup, &settings.llama_extra_args) {
+            match binary::auto_rollback(app, EngineKind::Llama).await {
+                Ok(result) => {
+                    let failed = marker.and_then(|marker| marker.version);
+                    let restored = result.version.clone();
+                    settings.llama_launch_step = "auto".into();
+                    let message = format!(
+                        "The updated llama-server{} exited before it was ready ({exit}) and was rolled back automatically{}. Restarting with the previous build. Dismiss this warning once it is running, or install a different release in Settings → Automatic engine setup.",
+                        failed
+                            .as_deref()
+                            .map(|version| format!(" ({version})"))
+                            .unwrap_or_default(),
+                        restored
+                            .as_deref()
+                            .map(|version| format!(" to {version}"))
+                            .unwrap_or_default(),
+                    );
+                    self.emit_adapter_warning(
+                        app,
+                        AdapterWarningEvent {
+                            engine: EngineKind::Llama,
+                            message,
+                            version: restored.clone(),
+                            adapter: active.launch.probe.adapter.clone(),
+                            kind: WarningKind::AutoRollback,
+                            step: None,
+                            failed_version: failed,
+                            restored_version: restored,
+                        },
+                    );
+                    return self
+                        .switch(app, &settings, Some(EngineKind::Llama))
+                        .await
+                        .is_ok();
+                }
+                Err(err) => {
+                    self.emit_adapter_warning(
+                        app,
+                        AdapterWarningEvent {
+                            engine: EngineKind::Llama,
+                            message: format!(
+                                "The updated llama-server failed during startup ({exit}) but the automatic rollback did not complete: {err}. Reinstall a known-good release in Settings → Automatic engine setup."
+                            ),
+                            version: active.launch.probe.version.clone(),
+                            adapter: active.launch.probe.adapter.clone(),
+                            kind: WarningKind::AutoRollback,
+                            step: None,
+                            failed_version: marker.and_then(|marker| marker.version),
+                            restored_version: None,
+                        },
+                    );
+                }
+            }
+        }
+
+        let Some(step) = active.launch.fallbacks.first().copied() else {
+            return false;
+        };
+        settings.llama_launch_step = step.as_str().into();
+        self.emit_adapter_warning(
+            app,
+            AdapterWarningEvent {
+                engine: EngineKind::Llama,
+                message: format!(
+                    "The GPU launch of llama-server exited before it became ready ({exit}). Retrying with the {} fallback. {}",
+                    step.label(),
+                    step.override_hint()
+                ),
+                version: active.launch.probe.version.clone(),
+                adapter: active.launch.probe.adapter.clone(),
+                kind: WarningKind::Fallback,
+                step: Some(step),
+                failed_version: None,
+                restored_version: None,
+            },
+        );
+        self.switch(app, &settings, Some(EngineKind::Llama))
+            .await
+            .is_ok()
+    }
+
+    fn emit_adapter_warning(&self, app: &AppHandle<R>, event: AdapterWarningEvent) {
+        let _ = app.emit("engine://adapter-warning", event);
+    }
+
     pub async fn shutdown(&self, app: &AppHandle<R>) {
         let _switch = self.switch_lock.lock().await;
         let active = self.active.lock().await.take();
@@ -591,6 +799,14 @@ impl<R: Runtime> EngineSupervisor<R> {
             tokio::time::timeout(Duration::from_secs(12), self.shutdown(&app)).await
         });
     }
+}
+
+/// An automatic rollback is only safe when the failing binary has never proved
+/// itself, a previous build really exists to restore, and the exit cannot be
+/// explained by flags the user typed. A crash caused by Extra llama arguments
+/// must never discard the update silently.
+fn should_auto_rollback(unverified_update: bool, has_backup: bool, extra_args: &str) -> bool {
+    unverified_update && has_backup && extra_args.trim().is_empty()
 }
 
 fn snapshot_from_launch(
@@ -1142,6 +1358,42 @@ pub fn io_error(action: &str, path: &Path, err: std::io::Error) -> AppError {
             path.display()
         )),
         _ => AppError::message(format!("{action}: {}: {err}", path.display())),
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    #[test]
+    fn auto_rollback_needs_an_unverified_update_a_backup_and_no_user_flags() {
+        assert!(should_auto_rollback(true, true, ""));
+        assert!(should_auto_rollback(true, true, "   "));
+        // No update on probation, or nothing to restore.
+        assert!(!should_auto_rollback(false, true, ""));
+        assert!(!should_auto_rollback(true, false, ""));
+        // Flags the user typed could explain the crash on their own.
+        assert!(!should_auto_rollback(true, true, "-nkvo"));
+    }
+
+    #[test]
+    fn hardening_payloads_keep_their_wire_names() {
+        assert_eq!(
+            serde_json::to_string(&FallbackStep::HostKv).unwrap(),
+            "\"host-kv\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FallbackStep::Cpu).unwrap(),
+            "\"cpu\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WarningKind::AutoRollback).unwrap(),
+            "\"auto-rollback\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WarningKind::Adapter).unwrap(),
+            "\"adapter\""
+        );
     }
 }
 

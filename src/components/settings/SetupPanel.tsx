@@ -5,14 +5,19 @@ import {
   CheckCircle2,
   Cpu,
   Download,
+  FlaskConical,
   HardDrive,
   RefreshCw,
+  ShieldCheck,
 } from "lucide-react";
 
 import { api, Events } from "../../lib/api";
 import { cn } from "../../lib/cn";
 import { errorMessage } from "../../lib/format";
+import { normalizeSettings, normalizeSetupReport } from "../../lib/llamaHardening";
 import type {
+  AppSettings,
+  LlamaUpdateChannel,
   SetupBinary,
   SetupReport,
   SetupStatus,
@@ -26,6 +31,26 @@ const STATUS_STYLES: Record<SetupStatus, string> = {
   degraded: "border-amber-400/20 bg-amber-400/5 text-amber-300",
   failed: "border-rose-400/20 bg-rose-400/5 text-rose-300",
 };
+
+const CHANNELS: Array<{
+  value: LlamaUpdateChannel;
+  label: string;
+  hint: string;
+  icon: typeof ShieldCheck;
+}> = [
+  {
+    value: "baseline",
+    label: "Verified baseline",
+    hint: "The tested llama.cpp tag, minus any release compat.json blocks.",
+    icon: ShieldCheck,
+  },
+  {
+    value: "latest",
+    label: "Latest upstream",
+    hint: "Newest GitHub release. Blocked tags are still skipped.",
+    icon: FlaskConical,
+  },
+];
 
 function componentTone(status: SetupBinary["status"]): string {
   switch (status) {
@@ -58,6 +83,8 @@ function backendLabel(backend: string) {
 
 export function SetupPanel() {
   const [report, setReport] = useState<SetupReport | null>(null);
+  const [settings, setSettings] = useState<AppSettings | null>(null);
+  const [channelBusy, setChannelBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -68,15 +95,22 @@ export function SetupPanel() {
     void api
       .getEngineSetupStatus()
       .then((next) => {
-        if (!disposed) setReport(next);
+        if (!disposed) setReport(normalizeSetupReport(next));
       })
       .catch((err) => {
         if (!disposed) setError(errorMessage(err));
       });
 
+    void api
+      .getSettings()
+      .then((next) => {
+        if (!disposed) setSettings(normalizeSettings(next));
+      })
+      .catch(() => undefined);
+
     void listen<SetupReport>(Events.engineSetupStatus, (event) => {
       if (!disposed) {
-        setReport(event.payload);
+        setReport(normalizeSetupReport(event.payload));
         setBusy(false);
       }
     })
@@ -96,7 +130,7 @@ export function SetupPanel() {
     setBusy(true);
     setError(null);
     try {
-      setReport(await api.rerunEngineSetup());
+      setReport(normalizeSetupReport(await api.rerunEngineSetup()));
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -104,8 +138,30 @@ export function SetupPanel() {
     }
   };
 
+  const selectChannel = async (next: LlamaUpdateChannel) => {
+    if (!settings || channelBusy || settings.llama_update_channel === next) {
+      return;
+    }
+    const previous = settings;
+    setChannelBusy(true);
+    setError(null);
+    const optimistic = { ...settings, llama_update_channel: next };
+    setSettings(optimistic);
+    try {
+      setSettings(normalizeSettings(await api.saveSettings(optimistic)));
+    } catch (err) {
+      setSettings(previous);
+      setError(errorMessage(err));
+    } finally {
+      setChannelBusy(false);
+    }
+  };
+
   const status = report?.status ?? "idle";
   const platform = report?.platform;
+  const channel =
+    settings?.llama_update_channel ?? report?.llama_update_channel ?? "baseline";
+  const channelHint = CHANNELS.find((option) => option.value === channel)?.hint;
   const gpuLabel = platform?.gpus.length
     ? platform.gpus
         .map((gpu) => `${gpu.name} (${backendLabel(gpu.backend)})`)
@@ -152,6 +208,57 @@ export function SetupPanel() {
         </div>
       </div>
 
+      <div className="mt-3 rounded-xl border border-white/5 bg-white/[0.02] px-2.5 py-2.5">
+        <div className="flex items-center justify-between gap-2">
+          <p className="text-[10px] font-medium text-slate-300">
+            llama.cpp release channel
+          </p>
+          <span className="text-[8.5px] uppercase tracking-wider text-slate-600">
+            applies on retry
+          </span>
+        </div>
+        <div className="mt-2 grid grid-cols-2 gap-1.5">
+          {CHANNELS.map((option) => {
+            const Icon = option.icon;
+            const active = channel === option.value;
+            return (
+              <button
+                key={option.value}
+                type="button"
+                aria-pressed={active}
+                disabled={!settings || channelBusy}
+                onClick={() => void selectChannel(option.value)}
+                className={cn(
+                  "rounded-lg border px-2 py-1.5 text-left transition disabled:opacity-50",
+                  active
+                    ? "border-acid-400/40 bg-acid-400/10"
+                    : "border-white/10 bg-white/[0.02] hover:bg-white/[0.05]",
+                )}
+              >
+                <span className="flex items-center gap-1.5 text-[10px] font-medium text-slate-200">
+                  <Icon
+                    className={cn(
+                      "h-3 w-3",
+                      active ? "text-acid-300" : "text-slate-500",
+                    )}
+                  />
+                  {option.label}
+                </span>
+                <span className="mt-0.5 block text-[8.5px] leading-4 text-slate-600">
+                  {option.hint}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+        {channelHint ? (
+          <p className="mt-1.5 text-[9px] leading-4 text-slate-600">
+            {channelHint} Switching channels persists immediately; press{" "}
+            <span className="text-slate-400">Retry setup</span> to install it.
+          </p>
+        ) : null}
+      </div>
+
       {error ? (
         <div className="mt-3 flex items-start gap-2 rounded-lg border border-rose-400/20 bg-rose-500/5 px-3 py-2 text-[10px] leading-4 text-rose-300">
           <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
@@ -164,6 +271,33 @@ export function SetupPanel() {
           <p className="mt-3 text-[10.5px] leading-5 text-slate-400">
             {report.message}
           </p>
+
+          <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[9px]">
+            {report.compat_applied ? (
+              <span className="inline-flex items-center gap-1 rounded-full border border-emerald-400/20 bg-emerald-400/5 px-2 py-0.5 text-emerald-300">
+                <ShieldCheck className="h-2.5 w-2.5" />
+                compat.json active
+              </span>
+            ) : null}
+            <span className="text-slate-600">
+              baseline {report.llama_baseline_tag || "—"}
+            </span>
+            {report.compat_recommended_tag ? (
+              <span className="text-slate-600">
+                recommended {report.compat_recommended_tag}
+              </span>
+            ) : null}
+            {report.skipped_llama_tags.length ? (
+              <span className="text-amber-300">
+                skipped {report.skipped_llama_tags.join(", ")}
+              </span>
+            ) : null}
+            {report.vulkan_kv_offload_limit != null ? (
+              <span className="text-slate-600">
+                Vulkan KV limit b{report.vulkan_kv_offload_limit}
+              </span>
+            ) : null}
+          </div>
 
           {platform ? (
             <div className="mt-3 grid gap-2 text-[10px] sm:grid-cols-2">
@@ -192,7 +326,7 @@ export function SetupPanel() {
                   {report.llama_release ? (
                     <p className="mt-0.5 truncate text-[9px] text-slate-600">
                       llama.cpp {report.llama_release.tag}
-                      {report.llama_release.fallback ? " (nightly fallback)" : ""}
+                      {report.llama_release.fallback ? " (fallback release)" : ""}
                     </p>
                   ) : null}
                 </div>

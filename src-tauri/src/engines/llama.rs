@@ -24,17 +24,126 @@ use super::{
     advertises, apply_library_path, combine_warnings, managed_bin_dir, managed_binary_path,
     pid_alive, probe_spawn_error, process_counters, run_cli_probe, signal_group,
     spawn_log_reader, wait_for_exit, write_pidfile, EngineKind, EngineLaunch,
-    EngineProbe, EngineRunner, EngineSupervisor, EngineTelemetry, ProbeOutput,
+    EngineProbe, EngineRunner, EngineSupervisor, EngineTelemetry, FallbackStep, ProbeOutput,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FlashSyntax {
     /// This build has no `--flash-attn` flag.
+    #[default]
     None,
     /// Old builds accept a bare `--flash-attn` switch.
     Bare,
     /// Current builds accept `--flash-attn on|off|auto`.
     Choice,
+}
+
+/// Everything the adapter can learn from one `--help` snapshot.
+///
+/// This is deliberately a pure value: parsing help text is the part of the
+/// adapter that breaks when upstream renames flags, so it is exercised against
+/// captured snapshots from several llama.cpp eras instead of a live binary.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HelpCapabilities {
+    pub model_flag: Option<&'static str>,
+    pub ctx_flag: Option<&'static str>,
+    pub ngl_flag: Option<&'static str>,
+    pub flash: FlashSyntax,
+    pub kv_cache: bool,
+    pub metrics: bool,
+    pub jinja: bool,
+    pub top_k: bool,
+    pub alias: bool,
+    pub mmproj_flag: Option<&'static str>,
+    pub moe_cache: bool,
+    pub spec_type: bool,
+    pub draft_model_flag: Option<&'static str>,
+    pub draft_device_flag: Option<&'static str>,
+    pub draft_ngl_flag: Option<&'static str>,
+    pub draft_max_flag: Option<&'static str>,
+    pub draft_min_flag: Option<&'static str>,
+    pub draft_p_min_flag: Option<&'static str>,
+    /// `--device`/`-dev`: the only reliable way to pin a launch to the CPU.
+    pub device_flag: Option<&'static str>,
+    /// `-nkvo`/`--no-kv-offload`: keep the KV cache in system RAM.
+    pub kv_offload_off: bool,
+    pub list_devices: bool,
+}
+
+/// First exact flag token the help text advertises, in preference order.
+/// Token matching avoids the classic `-c` inside `--cache-type-k` mistake.
+fn first_flag(help: &str, flags: &[&'static str]) -> Option<&'static str> {
+    flags.iter().copied().find(|flag| advertises(help, flag))
+}
+
+/// Decode a `--help` snapshot. A build that printed no help text gets the
+/// modern layout, which is what every current release uses, and the caller
+/// adds a warning so the assumption stays visible.
+pub fn help_capabilities(help: &str, build: Option<u64>) -> HelpCapabilities {
+    if help.trim().is_empty() {
+        return HelpCapabilities {
+            model_flag: Some("--model"),
+            ctx_flag: Some("--ctx-size"),
+            ngl_flag: Some("--n-gpu-layers"),
+            flash: if build.map(|value| value >= 6_000).unwrap_or(false) {
+                FlashSyntax::Choice
+            } else {
+                FlashSyntax::None
+            },
+            mmproj_flag: Some("--mmproj"),
+            ..HelpCapabilities::default()
+        };
+    }
+
+    let flash = if advertises(help, "--flash-attn") || advertises(help, "-fa") {
+        let anchor = help.find("--flash-attn").or_else(|| help.find("-fa"));
+        // Only inspect the block that belongs to the flag: a later option's
+        // description must not be mistaken for this flag's argument list.
+        let block: String = anchor
+            .map(|index| &help[index..])
+            .unwrap_or_default()
+            .chars()
+            .take(160)
+            .collect();
+        let choices = block.contains("on|off|auto")
+            || block.contains("on\\|off\\|auto")
+            || block.contains("[on");
+        if choices {
+            FlashSyntax::Choice
+        } else {
+            FlashSyntax::Bare
+        }
+    } else {
+        FlashSyntax::None
+    };
+
+    HelpCapabilities {
+        model_flag: first_flag(help, &["--model", "-m"]),
+        ctx_flag: first_flag(help, &["--ctx-size", "-c", "--ctx"]),
+        ngl_flag: first_flag(help, &["--n-gpu-layers", "--gpu-layers", "-ngl"]),
+        flash,
+        kv_cache: advertises(help, "--cache-type-k") && advertises(help, "--cache-type-v"),
+        metrics: advertises(help, "--metrics"),
+        jinja: advertises(help, "--jinja"),
+        top_k: advertises(help, "--top-k"),
+        alias: advertises(help, "--alias"),
+        mmproj_flag: first_flag(help, &["--mmproj", "-mm"]),
+        moe_cache: advertises(help, "--moe-cache-mib")
+            && advertises(help, "--moe-cache-cpu-share"),
+        spec_type: advertises(help, "--spec-type"),
+        draft_model_flag: first_flag(help, &["--spec-draft-model", "--model-draft", "-md"]),
+        draft_device_flag: first_flag(help, &["--spec-draft-device", "--device-draft"]),
+        draft_ngl_flag: first_flag(
+            help,
+            &["--spec-draft-ngl", "--gpu-layers-draft", "--n-gpu-layers-draft"],
+        ),
+        draft_max_flag: first_flag(help, &["--draft-max"]),
+        draft_min_flag: first_flag(help, &["--draft-min"]),
+        draft_p_min_flag: first_flag(help, &["--draft-p-min"]),
+        device_flag: first_flag(help, &["--device", "-dev"]),
+        kv_offload_off: advertises(help, "-nkvo") || advertises(help, "--no-kv-offload"),
+        list_devices: advertises(help, "--list-devices"),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -162,9 +271,20 @@ impl<R: Runtime> EngineRunner<R> for LlamaRunner {
         if let Some(warning) = guard_cpu_only_target(&mut args, settings, &output) {
             build_warnings.push(warning);
         }
+        // A known-broken Vulkan KV-cache combination skips straight to the
+        // safe rung: spending a crash cycle to rediscover what the model
+        // metadata already says would only slow the launch down.
+        let mut pinned_to_cpu = false;
         if let Some(warning) = guard_vulkan_swa_kv_cache(&mut args, settings, &output) {
+            pinned_to_cpu = pins_cpu(&args);
             build_warnings.push(warning);
         }
+        apply_launch_step(&mut args, settings, &layout);
+        let fallbacks = if pinned_to_cpu {
+            Vec::new()
+        } else {
+            fallback_steps(settings, &output)
+        };
         let context_window = if layout.ctx_flag.is_some() {
             settings.llama_ctx_size.clamp(512, 1_048_576)
         } else {
@@ -213,6 +333,7 @@ impl<R: Runtime> EngineRunner<R> for LlamaRunner {
             started_at_ms: now_ms(),
             probe,
             metrics_enabled: layout.metrics,
+            fallbacks,
             exit_rx: Some(exit_rx),
         };
         write_pidfile(app, &launch);
@@ -379,7 +500,7 @@ fn guard_cpu_only_target(
 /// Last llama.cpp build whose Vulkan path scheduled the KV cache of
 /// sliding-window models correctly. Newer builds abort in `ggml_backend_sched`
 /// before the server can answer `/health`; upstream issue #29082 tracks it.
-const LAST_GOOD_VULKAN_KV_OFFLOAD_BUILD: u64 = 12_236;
+pub const LAST_GOOD_VULKAN_KV_OFFLOAD_BUILD: u64 = 12_236;
 
 /// llama.cpp's Vulkan backend cannot schedule the KV cache of a
 /// sliding-window or recurrent-hybrid model when that cache lives in GPU
@@ -411,11 +532,10 @@ fn guard_vulkan_swa_kv_cache(
     if settings.llama_gpu_layers <= 0 {
         return None;
     }
-    let risky = output
-        .build
-        .map(|build| build > LAST_GOOD_VULKAN_KV_OFFLOAD_BUILD)
-        .unwrap_or(true);
-    if !risky {
+    // The limit comes from `compat.json` when it is reachable, so a build that
+    // upstream fixes does not need an app release to become usable again.
+    let limit = crate::provision::vulkan_kv_offload_limit();
+    if output.build.map(|build| build <= limit).unwrap_or(false) {
         return None;
     }
     // The user's own KV-cache or device flags always win over this fallback.
@@ -447,12 +567,93 @@ fn guard_vulkan_swa_kv_cache(
     }
     Some(match used_cpu {
         true => format!(
-            "llama.cpp's Vulkan backend aborts while reserving the KV cache of sliding-window or recurrent-hybrid models when that cache is offloaded to the GPU (upstream issue #29082; b{LAST_GOOD_VULKAN_KV_OFFLOAD_BUILD} is the last known-good build). This launch runs the model on the CPU with `--device none`. Add `-nkvo` to Extra llama arguments to keep the weights on the GPU with a host KV cache, or `-kvo` to force GPU KV offload."
+            "llama.cpp's Vulkan backend aborts while reserving the KV cache of sliding-window or recurrent-hybrid models when that cache is offloaded to the GPU (upstream issue #29082; b{limit} is the last known-good build). This launch runs the model on the CPU with `--device none`. Add `-nkvo` to Extra llama arguments to keep the weights on the GPU with a host KV cache. Do not add `-kvo`: forcing GPU KV offload reproduces this abort for this model."
         ),
         false => format!(
-            "llama.cpp's Vulkan backend aborts while reserving the KV cache of sliding-window or recurrent-hybrid models when that cache is offloaded to the GPU (upstream issue #29082; b{LAST_GOOD_VULKAN_KV_OFFLOAD_BUILD} is the last known-good build). This launch keeps the KV cache in system RAM with `-nkvo`. Add `-kvo` to Extra llama arguments to force GPU KV offload."
+            "llama.cpp's Vulkan backend aborts while reserving the KV cache of sliding-window or recurrent-hybrid models when that cache is offloaded to the GPU (upstream issue #29082; b{limit} is the last known-good build). This launch keeps the KV cache in system RAM with `-nkvo`. Do not add `-kvo`: forcing GPU KV offload reproduces this abort for this model."
         ),
     })
+}
+
+/// True when the argument list already pins the launch to the CPU.
+fn pins_cpu(args: &[String]) -> bool {
+    args.windows(2)
+        .any(|pair| pair[0] == "--device" && pair[1] == "none")
+}
+
+/// The GPU rungs still worth trying for this launch, in order.
+///
+/// Step 1 is the launch itself (full GPU). When it dies before `/health`
+/// answers, the supervisor retries with the first step here:
+///
+/// 1. `-nkvo`: weights stay on the GPU, the KV cache moves to system RAM.
+/// 2. `--device none`: the whole model runs on the CPU.
+///
+/// A user who set `--device`, `-nkvo` or `-kvo` in Extra llama arguments has
+/// already made this decision, so the ladder stays out of the way.
+fn fallback_steps(settings: &AppSettings, output: &ProbeOutput) -> Vec<FallbackStep> {
+    let step = settings.llama_launch_step.as_str();
+    if step == "cpu" {
+        return Vec::new();
+    }
+    if settings.llama_gpu_layers <= 0 || !reports_gpu_device(&output.devices) {
+        return Vec::new();
+    }
+    if sets_extra_flag(
+        &settings.llama_extra_args,
+        &[
+            "--device",
+            "-dev",
+            "-nkvo",
+            "--no-kv-offload",
+            "-kvo",
+            "--kv-offload",
+        ],
+    ) {
+        return Vec::new();
+    }
+    let host_kv = advertises(&output.help_text, "-nkvo")
+        || advertises(&output.help_text, "--no-kv-offload");
+    let cpu = advertises(&output.help_text, "--device");
+    let mut steps = Vec::new();
+    if step != "host-kv" && host_kv {
+        steps.push(FallbackStep::HostKv);
+    }
+    if cpu {
+        steps.push(FallbackStep::Cpu);
+    }
+    steps
+}
+
+/// Rewrite the already-built argument list for the selected rung. Doing it
+/// here, rather than appending a second `--n-gpu-layers`, keeps the launch
+/// command honest in the engine log.
+fn apply_launch_step(args: &mut Vec<String>, settings: &AppSettings, layout: &LlamaLayout) {
+    match settings.llama_launch_step.as_str() {
+        "host-kv" => {
+            if !args.iter().any(|argument| argument == "-nkvo") {
+                args.push("-nkvo".into());
+            }
+        }
+        "cpu" => force_cpu_launch(args, layout),
+        _ => {}
+    }
+}
+
+fn force_cpu_launch(args: &mut Vec<String>, layout: &LlamaLayout) {
+    if let Some(flag) = layout.ngl_flag {
+        match args.iter().position(|argument| argument == flag) {
+            Some(index) if index + 1 < args.len() => args[index + 1] = "0".into(),
+            _ => {
+                args.push(flag.into());
+                args.push("0".into());
+            }
+        }
+    }
+    if !pins_cpu(args) {
+        args.push("--device".into());
+        args.push("none".into());
+    }
 }
 
 fn bind_host(settings: &AppSettings) -> String {
@@ -469,6 +670,7 @@ fn layout_for(output: &ProbeOutput, settings: &AppSettings) -> (LlamaLayout, Vec
     let help_missing = help.trim().is_empty();
     let build = output.build;
     let legacy = build.map(|value| value < 3_000).unwrap_or(false);
+    let caps = help_capabilities(help, build);
     let mut warnings = Vec::new();
 
     if help_missing {
@@ -488,15 +690,7 @@ fn layout_for(output: &ProbeOutput, settings: &AppSettings) -> (LlamaLayout, Vec
         _ => {}
     }
 
-    let mmproj_flag = if advertises(help, "--mmproj") {
-        Some("--mmproj")
-    } else if advertises(help, "-mm") {
-        Some("-mm")
-    } else if help_missing {
-        Some("--mmproj")
-    } else {
-        None
-    };
+    let mmproj_flag = caps.mmproj_flag;
     if mmproj_flag.is_none() && !settings.llama_mmproj_path.trim().is_empty() {
         warnings.push(
             "This llama-server build does not advertise `--mmproj`; the selected vision projector will not be loaded, so image input will stay unavailable. Update llama.cpp or remove the projector path."
@@ -535,98 +729,41 @@ fn layout_for(output: &ProbeOutput, settings: &AppSettings) -> (LlamaLayout, Vec
         );
     }
 
-    let model_flag = if advertises(help, "--model") || help_missing {
-        "--model"
-    } else if advertises(help, "-m") {
-        "-m"
-    } else {
-        warnings.push(
-            "Neither `--model` nor `-m` was found in the help text; using `--model` and falling back to the server's error if the build differs."
-                .into(),
-        );
-        "--model"
+    let model_flag = match caps.model_flag {
+        Some(flag) => flag,
+        None => {
+            warnings.push(
+                "Neither `--model` nor `-m` was found in the help text; using `--model` and falling back to the server's error if the build differs."
+                    .into(),
+            );
+            "--model"
+        }
     };
-    let ctx_flag = if advertises(help, "--ctx-size") {
-        Some("--ctx-size")
-    } else if advertises(help, "-c") {
-        Some("-c")
-    } else if help_missing {
-        Some("--ctx-size")
-    } else {
+    let ctx_flag = caps.ctx_flag;
+    if ctx_flag.is_none() {
         warnings.push(
             "No context-size flag was advertised; the context value is left to the binary's default."
                 .into(),
         );
-        None
-    };
-    let ngl_flag = if advertises(help, "--n-gpu-layers") {
-        Some("--n-gpu-layers")
-    } else if advertises(help, "--gpu-layers") {
-        Some("--gpu-layers")
-    } else if advertises(help, "-ngl") {
-        Some("-ngl")
-    } else if help_missing {
-        Some("--n-gpu-layers")
-    } else {
+    }
+    let ngl_flag = caps.ngl_flag;
+    if ngl_flag.is_none() {
         warnings.push(
             "No GPU-layer flag was advertised; GPU offload is disabled for this build."
                 .into(),
         );
-        None
-    };
-    let flash = if advertises(help, "--flash-attn") || advertises(help, "-fa") {
-        let tail = help
-            .find("--flash-attn")
-            .map(|index| &help[index..])
-            .unwrap_or_default();
-        let choices = tail.contains("on|off|auto")
-            || tail.contains("on\\|off\\|auto")
-            || tail.contains("[on")
-            || (build.map(|value| value >= 6_000).unwrap_or(false) && help_missing);
-        if choices {
-            FlashSyntax::Choice
-        } else {
-            FlashSyntax::Bare
-        }
-    } else if help_missing && build.map(|value| value >= 6_000).unwrap_or(false) {
-        FlashSyntax::Choice
-    } else {
-        FlashSyntax::None
-    };
-    let kv_cache =
-        advertises(help, "--cache-type-k") && advertises(help, "--cache-type-v");
-    let metrics = advertises(help, "--metrics");
-    let jinja = advertises(help, "--jinja");
-    let top_k = advertises(help, "--top-k");
-    let alias = advertises(help, "--alias");
-    let moe_cache_cpu_share = advertises(help, "--moe-cache-mib")
-        && advertises(help, "--moe-cache-cpu-share");
-    let spec_type = advertises(help, "--spec-type");
-    let draft_model_flag = if advertises(help, "--spec-draft-model") {
-        Some("--spec-draft-model")
-    } else if advertises(help, "--model-draft") {
-        Some("--model-draft")
-    } else if advertises(help, "-md") {
-        Some("-md")
-    } else {
-        None
-    };
-    let draft_device_flag = if advertises(help, "--spec-draft-device") {
-        Some("--spec-draft-device")
-    } else if advertises(help, "--device-draft") {
-        Some("--device-draft")
-    } else {
-        None
-    };
-    let draft_ngl_flag = if advertises(help, "--spec-draft-ngl") {
-        Some("--spec-draft-ngl")
-    } else if advertises(help, "--gpu-layers-draft") {
-        Some("--gpu-layers-draft")
-    } else if advertises(help, "--n-gpu-layers-draft") {
-        Some("--n-gpu-layers-draft")
-    } else {
-        None
-    };
+    }
+    let flash = caps.flash;
+    let kv_cache = caps.kv_cache;
+    let metrics = caps.metrics;
+    let jinja = caps.jinja;
+    let top_k = caps.top_k;
+    let alias = caps.alias;
+    let moe_cache_cpu_share = caps.moe_cache;
+    let spec_type = caps.spec_type;
+    let draft_model_flag = caps.draft_model_flag;
+    let draft_device_flag = caps.draft_device_flag;
+    let draft_ngl_flag = caps.draft_ngl_flag;
     if settings::normalize_llama_mtp_mode(&settings.llama_mtp_mode) == "mtp" && !spec_type {
         warnings.push(
             "This llama-server build does not advertise `--spec-type`, so MTP heads cannot be enabled. Update llama.cpp or use a plain draft model."
@@ -653,9 +790,9 @@ fn layout_for(output: &ProbeOutput, settings: &AppSettings) -> (LlamaLayout, Vec
 
     // Only emit draft tuning flags the probed build advertises. `--draft-max`
     // shipped alongside speculative decoding; older builds stop at the model.
-    let draft_max_flag = advertises(help, "--draft-max").then_some("--draft-max");
-    let draft_min_flag = advertises(help, "--draft-min").then_some("--draft-min");
-    let draft_p_min_flag = advertises(help, "--draft-p-min").then_some("--draft-p-min");
+    let draft_max_flag = caps.draft_max_flag;
+    let draft_min_flag = caps.draft_min_flag;
+    let draft_p_min_flag = caps.draft_p_min_flag;
     if draft_configured && draft_max_flag.is_none() {
         warnings.push(
             "This llama-server build does not advertise `--draft-max`, `--draft-min` or `--draft-p-min`; speculative draft length settings will be ignored."
@@ -1377,6 +1514,185 @@ mod tests {
         let mut cpu_probe = vulkan_probe(12_387);
         cpu_probe.devices = "Available devices:\n  CUDA0: NVIDIA GeForce RTX 3090".into();
         assert!(guard_vulkan_swa_kv_cache(&mut args, &settings, &cpu_probe).is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn modern_help() -> &'static str {
+        // Captured shape of a b12xxx `llama-server --help`.
+        "usage: llama-server [options]\n\n  -m, --model FILE\n  -c, --ctx-size N\n  -ngl, --n-gpu-layers N\n  -fa, --flash-attn [on|off|auto]\n  -ctk, --cache-type-k TYPE\n  -ctv, --cache-type-v TYPE\n  -kvo, --kv-offload\n  -nkvo, --no-kv-offload\n  -dev, --device DEVICE\n  --list-devices\n  --spec-type TYPE\n  --spec-draft-model FILE\n  --spec-draft-device DEVICE\n  --spec-draft-ngl N\n  --draft-max N\n  --draft-min N\n  --draft-p-min P\n  --cpu-moe\n  --moe-cache-mib N\n  --moe-cache-cpu-share F\n  --metrics\n  --jinja\n  --top-k N\n  --alias STR\n  -mm, --mmproj FILE\n"
+    }
+
+    #[test]
+    fn help_snapshots_are_parsed_across_eras() {
+        // Legacy b1xxx: short flags only, no KV or speculation options.
+        let legacy = help_capabilities(
+            "usage: llama-server [options]\n  -m, --model FNAME\n  -md, --model-draft FNAME\n  -c, --ctx N\n  -ngl, --n-gpu-layers N\n",
+            Some(1_800),
+        );
+        assert_eq!(legacy.model_flag, Some("--model"));
+        assert_eq!(legacy.ctx_flag, Some("-c"));
+        // The long spelling is preferred when the line advertises both.
+        assert_eq!(legacy.ngl_flag, Some("--n-gpu-layers"));
+        assert_eq!(legacy.draft_model_flag, Some("--model-draft"));
+        assert_eq!(legacy.flash, FlashSyntax::None);
+        assert!(!legacy.kv_cache);
+
+        // A transitional build that spells the context flag `--ctx` and uses
+        // `--model-draft` for speculation.
+        let old_modern = help_capabilities(
+            "usage: llama-server [options]\n  -m, --model FILE\n  --ctx N\n  -ngl, --gpu-layers N\n  -md, --model-draft FILE\n  --metrics\n",
+            Some(4_200),
+        );
+        assert_eq!(old_modern.ctx_flag, Some("--ctx"));
+        assert_eq!(old_modern.ngl_flag, Some("--gpu-layers"));
+        assert_eq!(old_modern.draft_model_flag, Some("--model-draft"));
+        assert_eq!(old_modern.flash, FlashSyntax::None);
+        assert!(old_modern.metrics);
+
+        // Transitional b6xxx: bare `--flash-attn`, no KV cache flags.
+        let transitional = help_capabilities(
+            "usage: llama-server [options]\n  -m, --model FNAME\n  -c, --ctx-size N\n  -ngl, --n-gpu-layers N\n  -fa, --flash-attn\n  --model-draft FNAME\n  --metrics\n  --jinja\n  -mm, --mmproj FILE\n",
+            Some(6_000),
+        );
+        assert_eq!(transitional.flash, FlashSyntax::Bare);
+        assert_eq!(transitional.draft_model_flag, Some("--model-draft"));
+        assert_eq!(transitional.mmproj_flag, Some("--mmproj"));
+        assert!(!transitional.kv_cache);
+        assert!(!transitional.spec_type);
+
+        // Modern b12xxx: choice flash syntax, KV/device flags, spec + MoE.
+        let modern = help_capabilities(modern_help(), Some(12_728));
+        assert_eq!(modern.model_flag, Some("--model"));
+        assert_eq!(modern.ctx_flag, Some("--ctx-size"));
+        assert_eq!(modern.ngl_flag, Some("--n-gpu-layers"));
+        assert_eq!(modern.flash, FlashSyntax::Choice);
+        assert!(modern.kv_cache);
+        assert!(modern.metrics);
+        assert!(modern.jinja);
+        assert!(modern.top_k);
+        assert!(modern.alias);
+        assert_eq!(modern.mmproj_flag, Some("--mmproj"));
+        assert!(modern.moe_cache);
+        assert!(modern.spec_type);
+        assert_eq!(modern.draft_model_flag, Some("--spec-draft-model"));
+        assert_eq!(modern.draft_device_flag, Some("--spec-draft-device"));
+        assert_eq!(modern.draft_ngl_flag, Some("--spec-draft-ngl"));
+        assert_eq!(modern.draft_max_flag, Some("--draft-max"));
+        assert_eq!(modern.draft_min_flag, Some("--draft-min"));
+        assert_eq!(modern.draft_p_min_flag, Some("--draft-p-min"));
+        assert_eq!(modern.device_flag, Some("--device"));
+        assert!(modern.kv_offload_off);
+        assert!(modern.list_devices);
+
+        // Missing help text still yields a launchable modern layout.
+        let blank = help_capabilities("", Some(12_728));
+        assert_eq!(blank.model_flag, Some("--model"));
+        assert_eq!(blank.flash, FlashSyntax::Choice);
+        assert_eq!(blank.mmproj_flag, Some("--mmproj"));
+        assert_eq!(blank.device_flag, None);
+
+        let output = ProbeOutput {
+            build: Some(12_728),
+            help_text: modern_help().into(),
+            ..ProbeOutput::default()
+        };
+        let (layout, warnings) = layout_for(&output, &AppSettings::default());
+        assert_eq!(layout.ctx_flag, Some("--ctx-size"));
+        assert_eq!(layout.flash, FlashSyntax::Choice);
+        assert!(layout.spec_type);
+        assert!(layout.moe_cache_cpu_share);
+        assert!(
+            !warnings.iter().any(|warning| warning.contains("No GPU-layer flag")),
+            "the ladder needs the modern GPU flag to be detected"
+        );
+    }
+
+    #[test]
+    fn gpu_ladder_steps_down_from_host_kv_to_cpu() {
+        let output = vulkan_probe(12_387);
+        let mut settings = AppSettings::default();
+        settings.llama_gpu_layers = 32;
+
+        assert_eq!(
+            fallback_steps(&settings, &output),
+            vec![FallbackStep::HostKv, FallbackStep::Cpu]
+        );
+
+        settings.llama_launch_step = "host-kv".into();
+        assert_eq!(fallback_steps(&settings, &output), vec![FallbackStep::Cpu]);
+
+        settings.llama_launch_step = "cpu".into();
+        assert!(fallback_steps(&settings, &output).is_empty());
+
+        // A build without `-nkvo` skips straight to the CPU rung.
+        settings.llama_launch_step = "auto".into();
+        let mut no_host_kv = vulkan_probe(12_387);
+        no_host_kv.help_text = "--model\n-dev, --device DEVICE\n-ngl, --n-gpu-layers N".into();
+        assert_eq!(fallback_steps(&settings, &no_host_kv), vec![FallbackStep::Cpu]);
+
+        // An explicit placement or KV flag means the user owns the decision.
+        for flag in ["-kvo", "-nkvo", "--device Vulkan0", "-dev=Vulkan0"] {
+            settings.llama_extra_args = flag.into();
+            assert!(
+                fallback_steps(&settings, &output).is_empty(),
+                "{flag} should disable the ladder"
+            );
+        }
+
+        // A CPU launch has nothing to fall back from.
+        settings.llama_extra_args.clear();
+        settings.llama_gpu_layers = 0;
+        assert!(fallback_steps(&settings, &output).is_empty());
+    }
+
+    #[test]
+    fn launch_step_rewrites_the_offload_flag_in_place() {
+        let mut settings = AppSettings::default();
+        settings.llama_gpu_layers = 32;
+        let output = ProbeOutput {
+            build: Some(12_728),
+            help_text: modern_help().into(),
+            ..ProbeOutput::default()
+        };
+        let (layout, _) = layout_for(&output, &settings);
+
+        settings.llama_launch_step = "host-kv".into();
+        let mut args = vec!["--n-gpu-layers".to_string(), "32".to_string()];
+        apply_launch_step(&mut args, &settings, &layout);
+        assert_eq!(args.last().map(String::as_str), Some("-nkvo"));
+
+        settings.llama_launch_step = "cpu".into();
+        let mut args = vec!["--n-gpu-layers".to_string(), "32".to_string()];
+        apply_launch_step(&mut args, &settings, &layout);
+        let joined = args.join(" ");
+        assert!(joined.contains("--n-gpu-layers 0"), "{joined}");
+        assert!(joined.contains("--device none"), "{joined}");
+        assert!(!joined.contains("--n-gpu-layers 32"), "{joined}");
+
+        // Running the same step twice must not duplicate the device flag.
+        apply_launch_step(&mut args, &settings, &layout);
+        assert_eq!(
+            args.iter().filter(|argument| *argument == "--device").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn vulkan_guard_never_recommends_gpu_kv_offload_for_hybrid_models() {
+        let path = std::env::temp_dir().join(format!(
+            "janas-llama-hybrid-warning-{}.gguf",
+            std::process::id()
+        ));
+        write_hybrid_gguf(&path);
+        let mut settings = AppSettings::default();
+        settings.llama_model_path = path.to_string_lossy().to_string();
+        settings.llama_gpu_layers = 36;
+
+        let mut args = vec!["--model".to_string()];
+        let warning = guard_vulkan_swa_kv_cache(&mut args, &settings, &vulkan_probe(12_387))
+            .expect("warning");
+        assert!(warning.contains("Do not add `-kvo`"), "{warning}");
+        assert!(!warning.contains("or `-kvo`"), "{warning}");
         let _ = std::fs::remove_file(path);
     }
 

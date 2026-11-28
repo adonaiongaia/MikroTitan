@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import {
+  AlertTriangle,
   Bot,
   ChevronDown,
   ChevronLeft,
@@ -23,10 +24,15 @@ import {
 import { api } from "../../lib/api";
 import { cn } from "../../lib/cn";
 import { basename, errorMessage, formatBytes } from "../../lib/format";
+import {
+  adapterWarningView,
+  fallbackLabel,
+} from "../../lib/llamaHardening";
 import { shortcutLabel } from "../../lib/shortcuts";
 import { useBackendCapabilities } from "../../hooks/useBackendCapabilities";
 import { SAMPLING_PARAMETERS } from "../../lib/backendCapabilities";
 import type {
+  AdapterWarningEvent,
   AgentPreferences,
   AppSettings,
   ChatUsage,
@@ -55,6 +61,10 @@ interface EnginePanelProps {
   engineRunning: boolean;
   engineBusy: boolean;
   engineStatus: EngineStatus;
+  /** Adapter defaults, GPU fallbacks and auto-rollbacks raised by the backend. */
+  adapterWarning: AdapterWarningEvent | null;
+  onDismissAdapterWarning: () => void;
+  onOpenEngineSetup: () => void;
   onSwitchEngine: (engine: EngineKind) => Promise<void>;
   onApplyEngineSettings: (patch: Partial<AppSettings>) => Promise<void>;
   onRestartEngine: () => Promise<void>;
@@ -172,6 +182,9 @@ export function EnginePanel({
   engineRunning,
   engineBusy,
   engineStatus,
+  adapterWarning,
+  onDismissAdapterWarning,
+  onOpenEngineSetup,
   onSwitchEngine,
   onApplyEngineSettings,
   onRestartEngine,
@@ -229,6 +242,11 @@ export function EnginePanel({
   const hiddenParameters = SAMPLING_PARAMETERS.filter(
     (parameter) => capabilities[parameter.key] === false,
   );
+  const adapterNotice = adapterWarning
+    ? adapterWarningView(adapterWarning)
+    : null;
+  const fallbackStep =
+    adapterNotice?.kind === "fallback" ? (adapterWarning?.step ?? null) : null;
 
   if (collapsed) {
     return (
@@ -310,6 +328,68 @@ export function EnginePanel({
       </div>
 
       <div className="min-h-0 flex-1 space-y-5 overflow-y-auto px-4 py-4">
+        {adapterNotice ? (
+          <div
+            className={cn(
+              "rounded-xl border px-3 py-2.5",
+              adapterNotice.kind === "auto-rollback"
+                ? "border-rose-400/25 bg-rose-500/5"
+                : "border-amber-400/20 bg-amber-400/5",
+            )}
+            role="status"
+          >
+            <div className="flex items-start gap-2">
+              <AlertTriangle
+                className={cn(
+                  "mt-0.5 h-3.5 w-3.5 shrink-0",
+                  adapterNotice.kind === "auto-rollback"
+                    ? "text-rose-300"
+                    : "text-amber-300",
+                )}
+              />
+              <div className="min-w-0 flex-1">
+                <p
+                  className={cn(
+                    "text-[10.5px] font-medium",
+                    adapterNotice.kind === "auto-rollback"
+                      ? "text-rose-200"
+                      : "text-amber-200",
+                  )}
+                >
+                  {adapterNotice.title}
+                </p>
+                <p className="mt-1 text-[9.5px] leading-4 text-slate-400">
+                  {adapterNotice.detail}
+                </p>
+                {adapterNotice.hint ? (
+                  <p className="mt-1 text-[9px] leading-4 text-slate-600">
+                    {adapterNotice.hint}
+                  </p>
+                ) : null}
+                {adapterNotice.showSettings ? (
+                  <button
+                    type="button"
+                    onClick={onOpenEngineSetup}
+                    className="mt-1.5 text-[9px] font-medium text-acid-300 underline-offset-2 transition hover:underline"
+                  >
+                    Open Automatic engine setup
+                  </button>
+                ) : null}
+              </div>
+              {adapterNotice.dismissible ? (
+                <button
+                  type="button"
+                  onClick={onDismissAdapterWarning}
+                  aria-label="Dismiss llama.cpp warning"
+                  className="rounded p-0.5 text-slate-500 transition hover:bg-white/5 hover:text-slate-200"
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
+
         <TokenTicker
           usage={usage}
           elapsedMs={elapsedMs}
@@ -349,6 +429,12 @@ export function EnginePanel({
               </button>
             ))}
           </div>
+          {fallbackStep ? (
+            <span className="inline-flex items-center gap-1 rounded-full border border-amber-400/25 bg-amber-400/5 px-2 py-0.5 text-[9px] text-amber-200">
+              <Zap className="h-2.5 w-2.5" />
+              {fallbackLabel(fallbackStep)}
+            </span>
+          ) : null}
           <p className="text-[10px] leading-4 text-slate-600">
             Starting one engine stops the other first, so they never contend for
             the same GPU or model lock.

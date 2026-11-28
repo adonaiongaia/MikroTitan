@@ -1,0 +1,14 @@
+{
+
+  "schema_version": 1,
+
+  "recommended_llama_tag": null,
+
+  "blocked_llama_tags": [],
+
+  "vulkan_broken_above_build": 12236,
+
+  "notes": "Default baseline compatibility rules for MikroTitan"
+
+}
+

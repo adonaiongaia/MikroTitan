@@ -1784,6 +1784,9 @@ export function ChatView({
         engineRunning={engine.snapshot.pid !== null}
         engineBusy={engine.busy}
         engineStatus={engine.snapshot.status}
+        adapterWarning={engine.adapterWarning}
+        onDismissAdapterWarning={engine.clearAdapterWarning}
+        onOpenEngineSetup={onOpenSettings}
         onSwitchEngine={switchEngine}
         onApplyEngineSettings={applyEngineSettings}
         onRestartEngine={restartEngine}
